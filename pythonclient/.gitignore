@@ -1,3 +1,39 @@
+# Python virtual environments
+ibkr_env/
+venv/
+env/
+.env/
+.venv/
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Log files
+*.log
+logs/
+
+# Local configuration
+.env
+config.local.py
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
 *.pyc
 tags
 __pycache__/*
@@ -7,8 +43,6 @@ log.*
 core
 *.xml
 MANIFEST
-dist
-build
 .idea
 *.egg-info
 /.tox/

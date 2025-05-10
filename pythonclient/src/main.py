@@ -1,5 +1,5 @@
 """
-Main script for stock analysis and strategy backtesting.
+Main script for stock analysis and strategy backtesting with paper trading.
 """
 import asyncio
 import logging
@@ -69,6 +69,8 @@ async def main():
     parser.add_argument('--force-refresh', action='store_true', help='Force refresh of historical data')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--client-id', type=int, help='Client ID for IBKR connection (default: random)')
+    parser.add_argument('--paper', action='store_true', help='Use paper trading account (default: True)')
+    parser.add_argument('--live', action='store_true', help='Use live trading account (WARNING: This will execute real trades)')
     
     # Add strategy specific parameters
     parser.add_argument('--risk-per-trade', type=float, default=500.0, help='Risk per trade in dollars (default: 500)')
@@ -85,7 +87,20 @@ async def main():
     else:
         logging.getLogger().setLevel(logging.INFO)
     
-    logger.info("="*50)
+    # Determine paper trading mode
+    paper_mode = not args.live  # Default to paper trading unless --live is specified
+    
+    # Print trading mode banner
+    logger.info("="*80)
+    if paper_mode:
+        logger.info("PAPER TRADING MODE")
+        logger.info("This is a simulation - no real trades will be executed")
+    else:
+        logger.warning("LIVE TRADING MODE")
+        logger.warning("WARNING: This will execute real trades with real money")
+        logger.warning("Please ensure you understand the risks involved")
+    logger.info("="*80)
+    
     logger.info(f"Starting analysis for {args.symbol}")
     logger.info(f"Parameters: duration={args.duration}, bar_size={args.bar_size}, strategy={args.strategy}")
     if args.strategy in ['groq', 'groq_bos']:
@@ -94,7 +109,7 @@ async def main():
         logger.info(f"Momentum Strategy Parameters: risk_per_trade=${args.risk_per_trade}, rebalance_period={args.rebalance_period}d")
     elif args.strategy == 'vwap':
         logger.info(f"VWAP Strategy Parameters: risk_per_trade=${args.risk_per_trade}, threshold={args.vwap_threshold}, max_duration={args.max_duration}h")
-    logger.info("="*50)
+    logger.info("="*80)
     
     # Initialize connection
     client_id = args.client_id if args.client_id is not None else random.randint(1, 1000)
@@ -103,7 +118,7 @@ async def main():
     
     try:
         logger.info("Attempting to connect to IBKR Gateway...")
-        if not await connection.connect(client_id=client_id):
+        if not await connection.connect(client_id=client_id, paper=paper_mode):
             logger.error("Failed to connect to IBKR Gateway after multiple attempts")
             return
             
@@ -179,13 +194,17 @@ async def main():
             elif args.strategy == 'groq':
                 strategy = GroqRecommendationsStrategy(
                     risk_per_trade=args.risk_per_trade,
-                    max_duration_hours=args.max_duration
+                    max_duration_hours=args.max_duration,
+                    paper_trading=args.paper
                 )
+                strategy.set_ib_client(connection.client)  # Pass IBKR client
             elif args.strategy == 'groq_bos':
                 strategy = GroqBreakOfStructureStrategy(
                     risk_per_trade=args.risk_per_trade,
-                    max_duration_hours=args.max_duration
+                    max_duration_hours=args.max_duration,
+                    paper_trading=args.paper
                 )
+                strategy.set_ib_client(connection.client)  # Pass IBKR client
             elif args.strategy == 'momentum':
                 strategy = CrossSectionalMomentumStrategy(
                     risk_per_trade=args.risk_per_trade,
@@ -204,7 +223,7 @@ async def main():
             logger.info("Calculating technical indicators...")
             df = strategy.calculate_indicators(df)
             logger.info("Running backtest...")
-            results = strategy.backtest(df)
+            results = await strategy.backtest(df, symbol=args.symbol)  # Await async backtest
             
             logger.info("\nBacktest Results:")
             logger.info(f"Initial Capital: ${results['initial_capital']:,.2f}")
@@ -301,4 +320,4 @@ async def main():
         logger.info("="*50)
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())
