@@ -23,8 +23,22 @@ class StrategyBase(ABC):
         pass
         
     @abstractmethod
-    def backtest(self, df: pd.DataFrame, initial_capital: float = 100000) -> Dict:
-        """Run backtest on historical data"""
+    async def backtest(self, df: pd.DataFrame, initial_capital: float = 100000, symbol: str = 'MSFT') -> Dict:
+        """Run backtest on historical data
+        
+        Args:
+            df: DataFrame with historical price data
+            initial_capital: Starting capital for the backtest
+            symbol: Trading symbol for the backtest
+            
+        Returns:
+            Dict containing backtest results including:
+            - initial_capital: Starting capital
+            - final_capital: Ending capital
+            - return_pct: Percentage return
+            - total_trades: Number of trades executed
+            - trades: List of trade details
+        """
         pass
         
     def get_name(self) -> str:

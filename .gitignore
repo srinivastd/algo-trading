@@ -63,3 +63,5 @@ pythonclient/ibkr_env/lib/python3.12/site-packages/ibapi/tag_value.py
 pythonclient/ibkr_env/lib/python3.12/site-packages/ibapi/ticktype.py
 pythonclient/ibkr_env/lib/python3.12/site-packages/ibapi/utils.py
 pythonclient/ibkr_env/lib/python3.12/site-packages/ibapi/wrapper.py
+pythonclient/src/PatternWatcher.py
+pythonclient/src/ibkr/pattern_watcher.py

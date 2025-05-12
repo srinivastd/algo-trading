@@ -1,3 +1,7 @@
+"""
+Trading strategy implementations for stock analysis.
+Version 1.2
+"""
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -5,7 +9,7 @@ from typing import Dict, List, Tuple, Optional
 from .base import StrategyBase
 import logging
 from pytz import timezone
-from ibkr.connection import IBKRConnection  # Changed from ibkr.client import IBKRClient
+from ibkr.connection import IBKRConnection
 import asyncio
 from ib_insync import MarketOrder, StopOrder, LimitOrder
 
@@ -14,13 +18,22 @@ logger = logging.getLogger(__name__)
 class GroqRecommendationsStrategy(StrategyBase):
     """Strategy based on supply/demand zones with optimized ADX and duration, with paper trading support"""
     
-    def __init__(self, risk_per_trade: float = 3000, max_duration_hours: float = 12.0, paper_trading: bool = True):
+    def __init__(self, risk_per_trade: float = 3000, max_duration_hours: float = 12.0, paper_trading: bool = True,
+                 stop_loss_pct: float = 1.0, target_pct: float = 4.0):
         super().__init__("Groq Recommendations Strategy")
         self.risk_per_trade = risk_per_trade
         self.max_duration_hours = max_duration_hours
         self.paper_trading = paper_trading
+        self.stop_loss_pct = stop_loss_pct  # Stop loss percentage
+        self.target_pct = target_pct  # Target profit percentage
         self.ib_client = None  # Will be set by main.py
-        logger.info(f"Initialized {self.name} with risk_per_trade=${risk_per_trade}, max_duration={max_duration_hours}h, paper_trading={paper_trading}")
+        logger.info(f"Initialized {self.name} with risk_per_trade=${risk_per_trade}, max_duration={max_duration_hours}h, "
+                   f"stop_loss={stop_loss_pct}%, target={target_pct}%, paper_trading={paper_trading}")
+
+    def set_ib_client(self, ib_client):
+        """Set the IBKR client for trading"""
+        self.ib_client = ib_client
+        logger.info("IBKR client set for trading")
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         eastern = timezone('America/New_York')
@@ -105,6 +118,32 @@ class GroqRecommendationsStrategy(StrategyBase):
         logger.info(f"Generated {len(signals[signals['signal'] != 0])} signals")
         return signals
         
+    async def generate_realtime_signals(self, df: pd.DataFrame) -> int:
+        """Generate a single signal based on the latest data in real-time."""
+        if len(df) < 5:
+            return 0
+        
+        df = self.calculate_indicators(df)
+        supply_zones, demand_zones = self.identify_zones(df)
+        current_price = df['close'].iloc[-1]
+        current_time = df.index[-1]
+        
+        for zone_time, zone_high, zone_low in supply_zones:
+            if ((current_time - zone_time) < timedelta(hours=24) and 
+                current_price > zone_high and
+                df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):
+                logger.debug(f"Realtime short signal at {current_time}, price: {current_price:.2f}")
+                return -1
+                
+        for zone_time, zone_high, zone_low in demand_zones:
+            if ((current_time - zone_time) < timedelta(hours=24) and 
+                current_price < zone_low and
+                df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):
+                logger.debug(f"Realtime long signal at {current_time}, price: {current_price:.2f}")
+                return 1
+                
+        return 0
+        
     async def execute_trade(self, symbol: str, signal: int, entry_price: float, shares: int, stop_loss: float, target: float) -> Dict:
         if not self.ib_client:
             logger.error("IBKR client not initialized")
@@ -115,8 +154,7 @@ class GroqRecommendationsStrategy(StrategyBase):
             action='BUY' if signal == 1 else 'SELL',
             quantity=shares,
             order_type='LMT',
-            limit_price=entry_price,
-            paper=self.paper_trading
+            limit_price=entry_price
         )
         
         if order_id:
@@ -127,8 +165,7 @@ class GroqRecommendationsStrategy(StrategyBase):
                 quantity=shares,
                 order_type='STP',
                 aux_price=stop_loss,
-                parent_id=order_id,
-                paper=self.paper_trading
+                parent_id=order_id
             )
             target_order_id = await self.ib_client.place_order(
                 symbol=symbol,
@@ -136,19 +173,23 @@ class GroqRecommendationsStrategy(StrategyBase):
                 quantity=shares,
                 order_type='LMT',
                 limit_price=target,
-                parent_id=order_id,
-                paper=self.paper_trading
+                parent_id=order_id
             )
-            logger.info(f"Placed paper trade: {('Long' if signal == 1 else 'Short')} {symbol}, Entry: ${entry_price:.2f}, Stop: ${stop_loss:.2f}, Target: ${target:.2f}")
+            logger.info(f"Placed {'paper' if self.paper_trading else 'live'} trade: {('Long' if signal == 1 else 'Short')} {symbol}, Entry: ${entry_price:.2f}, Stop: ${stop_loss:.2f}, Target: ${target:.2f}")
             return {
                 'status': 'success',
                 'order_id': order_id,
                 'stop_order_id': stop_order_id,
                 'target_order_id': target_order_id
             }
-        return {'status': 'error', 'message': 'Order placement failed'}
+        else:
+            return {
+                'status': 'error',
+                'message': 'Failed to place order'
+            }
 
     async def backtest(self, df: pd.DataFrame, initial_capital: float = 100000, symbol: str = 'MSFT') -> Dict:
+        """Run a backtest on historical data"""
         signals = self.generate_signals(df)
         capital = initial_capital
         position = 0
@@ -161,8 +202,9 @@ class GroqRecommendationsStrategy(StrategyBase):
                 entry_time = df.index[i]
                 is_long = signals['signal'].iloc[i] == 1
                 
-                stop_loss = entry_price * 0.99 if is_long else entry_price * 1.01
-                target = entry_price * 1.03 if is_long else entry_price * 0.97
+                # Calculate stop loss and target based on configured percentages
+                stop_loss = entry_price * (1 - self.stop_loss_pct/100) if is_long else entry_price * (1 + self.stop_loss_pct/100)
+                target = entry_price * (1 + self.target_pct/100) if is_long else entry_price * (1 - self.target_pct/100)
                 
                 risk_per_share = abs(entry_price - stop_loss)
                 if risk_per_share <= 0:
@@ -176,6 +218,7 @@ class GroqRecommendationsStrategy(StrategyBase):
                     risk_per_share = entry_price * 0.01
                     self.risk_per_trade = shares * risk_per_share
                 
+                # Attempt paper trading if enabled and IB client is available
                 if self.ib_client and self.paper_trading:
                     trade_result = await self.execute_trade(symbol, signals['signal'].iloc[i], entry_price, shares, stop_loss, target)
                     if trade_result['status'] == 'success':
@@ -183,7 +226,7 @@ class GroqRecommendationsStrategy(StrategyBase):
                         trades.append({
                             'entry_date': entry_time,
                             'entry_price': entry_price,
-                            'shares': shares,
+                            'shares': abs(shares),
                             'stop_loss': stop_loss,
                             'target': target,
                             'type': 'LONG' if is_long else 'SHORT',
@@ -195,81 +238,101 @@ class GroqRecommendationsStrategy(StrategyBase):
                             'stop_order_id': trade_result['stop_order_id'],
                             'target_order_id': trade_result['target_order_id']
                         }
-                        logger.debug(f"Entered {('Long' if is_long else 'Short')} at ${entry_price:.2f}, shares: {shares}")
+                        logger.debug(f"Entered {trades[-1]['type']} at ${entry_price:.2f}, shares: {shares} via paper trading")
                     else:
-                        logger.error(f"Trade execution failed: {trade_result['message']}")
-                        continue
+                        logger.warning(f"Paper trade failed: {trade_result['message']}. Falling back to simulation.")
+                        # Fall back to simulation if paper trading fails
+                        position = shares if is_long else -shares
+                        trades.append({
+                            'entry_date': entry_time,
+                            'entry_price': entry_price,
+                            'shares': abs(shares),
+                            'stop_loss': stop_loss,
+                            'target': target,
+                            'type': 'LONG' if is_long else 'SHORT'
+                        })
+                        logger.debug(f"Simulated entry {trades[-1]['type']} at ${entry_price:.2f}, shares: {shares}")
                 else:
+                    # Default to simulation (Version 1.1 logic)
                     position = shares if is_long else -shares
                     trades.append({
                         'entry_date': entry_time,
                         'entry_price': entry_price,
-                        'shares': shares,
+                        'shares': abs(shares),
                         'stop_loss': stop_loss,
                         'target': target,
                         'type': 'LONG' if is_long else 'SHORT'
                     })
-                    logger.debug(f"Simulated entry {('Long' if is_long else 'Short')} at ${entry_price:.2f}, shares: {shares}")
+                    logger.debug(f"Simulated entry {trades[-1]['type']} at ${entry_price:.2f}, shares: {shares}")
 
-            elif position != 0 and self.ib_client and self.paper_trading:
+            elif position != 0:
                 current_trade = trades[-1]
                 current_price = df['close'].iloc[i]
                 current_time = df.index[i]
                 time_held = (current_time - current_trade['entry_date']).total_seconds() / 3600
 
-                # Check order status via IB API (simplified)
-                order_status = await self.ib_client.get_order_status(current_trade['order_id'])
-                if order_status['filled']:
-                    exit_price = order_status['avg_fill_price']
-                    is_long = current_trade['type'] == 'LONG'
-                    profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if is_long else (current_trade['entry_price'] - exit_price) * current_trade['shares']
-                    capital += profit
-                    position = 0
-                    current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
-                    logger.debug(f"Exited {current_trade['type']} at ${exit_price:.2f}, profit: ${profit:.2f}")
-                    del active_orders[current_trade['order_id']]
-                elif time_held >= self.max_duration_hours:
-                    # Cancel orders and exit
-                    await self.ib_client.cancel_order(current_trade['order_id'])
-                    exit_price = current_price
-                    is_long = current_trade['type'] == 'LONG'
-                    profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if is_long else (current_trade['entry_price'] - exit_price) * current_trade['shares']
-                    capital += profit
-                    position = 0
-                    current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
-                    logger.debug(f"Exited {current_trade['type']} due to duration at ${exit_price:.2f}, profit: ${profit:.2f}")
-                    del active_orders[current_trade['order_id']]
-
-            elif position != 0 and not self.paper_trading:
-                current_trade = trades[-1]
-                current_price = df['close'].iloc[i]
-                current_time = df.index[i]
-                time_held = (current_time - current_trade['entry_date']).total_seconds() / 3600
-                if time_held >= self.max_duration_hours:
-                    exit_price = current_price
-                    profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if current_trade['type'] == 'LONG' else (current_trade['entry_price'] - exit_price) * current_trade['shares']
-                    capital += profit
-                    position = 0
-                    current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
-                    logger.debug(f"Exited {current_trade['type']} after {time_held:.2f}h at ${exit_price:.2f}, profit: ${profit:.2f}")
-                    continue
-                
-                if current_trade['type'] == 'LONG':
-                    if current_price <= current_trade['stop_loss'] or current_price >= current_trade['target']:
-                        exit_price = current_trade['stop_loss'] if current_price <= current_trade['stop_loss'] else current_trade['target']
-                        profit = (exit_price - current_trade['entry_price']) * current_trade['shares']
+                # Handle paper trading exits if order_id exists
+                if 'order_id' in current_trade and self.ib_client and self.paper_trading:
+                    order_status = await self.ib_client.get_order_status(current_trade['order_id'])
+                    if order_status['filled']:
+                        exit_price = order_status['avg_fill_price']
+                        is_long = current_trade['type'] == 'LONG'
+                        profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if is_long else (current_trade['entry_price'] - exit_price) * current_trade['shares']
                         capital += profit
                         position = 0
                         current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
-                        logger.debug(f"Exited LONG at ${exit_price:.2f}, profit: ${profit:.2f}")
+                        logger.debug(f"Exited {current_trade['type']} at ${exit_price:.2f}, profit: ${profit:.2f} via paper trading")
+                        del active_orders[current_trade['order_id']]
+                    elif time_held >= self.max_duration_hours:
+                        await self.ib_client.cancel_order(current_trade['order_id'])
+                        exit_price = current_price
+                        is_long = current_trade['type'] == 'LONG'
+                        profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if is_long else (current_trade['entry_price'] - exit_price) * current_trade['shares']
+                        capital += profit
+                        position = 0
+                        current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
+                        logger.debug(f"Exited {current_trade['type']} due to duration at ${exit_price:.2f}, profit: ${profit:.2f}")
+                        del active_orders[current_trade['order_id']]
                 else:
-                    if current_price >= current_trade['stop_loss'] or current_price <= current_trade['target']:
-                        exit_price = current_trade['stop_loss'] if current_price >= current_trade['stop_loss'] else current_trade['target']
-                        profit = (current_trade['entry_price'] - exit_price) * current_trade['shares']
+                    # Default to simulation (Version 1.1 logic)
+                    if time_held >= self.max_duration_hours:
+                        exit_price = current_price
+                        profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if current_trade['type'] == 'LONG' else (current_trade['entry_price'] - exit_price) * current_trade['shares']
                         capital += profit
                         position = 0
                         current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
-                        logger.debug(f"Exited SHORT at ${exit_price:.2f}, profit: ${profit:.2f}")
+                        logger.debug(f"Exited {current_trade['type']} after {time_held:.2f}h at ${exit_price:.2f}, profit: ${profit:.2f}")
+                        continue
+                    
+                    if current_trade['type'] == 'LONG':
+                        if current_price <= current_trade['stop_loss'] or current_price >= current_trade['target']:
+                            exit_price = current_trade['stop_loss'] if current_price <= current_trade['stop_loss'] else current_trade['target']
+                            profit = (exit_price - current_trade['entry_price']) * current_trade['shares']
+                            capital += profit
+                            position = 0
+                            current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
+                            logger.debug(f"Exited LONG at ${exit_price:.2f}, profit: ${profit:.2f}")
+                    else:
+                        if current_price >= current_trade['stop_loss'] or current_price <= current_trade['target']:
+                            exit_price = current_trade['stop_loss'] if current_price >= current_trade['stop_loss'] else current_trade['target']
+                            profit = (current_trade['entry_price'] - exit_price) * current_trade['shares']
+                            capital += profit
+                            position = 0
+                            current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
+                            logger.debug(f"Exited SHORT at ${exit_price:.2f}, profit: ${profit:.2f}")
+
+        # Close any open position at the end
+        if position != 0:
+            current_trade = trades[-1]
+            exit_price = df['close'].iloc[-1]
+            profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if current_trade['type'] == 'LONG' else (current_trade['entry_price'] - exit_price) * current_trade['shares']
+            capital += profit
+            current_trade.update({
+                'exit_date': df.index[-1],
+                'exit_price': exit_price,
+                'profit': profit
+            })
+            logger.debug(f"Closed final position at ${exit_price:.2f}, profit: ${profit:.2f}")
 
         return {
             'initial_capital': initial_capital,
@@ -278,8 +341,3 @@ class GroqRecommendationsStrategy(StrategyBase):
             'total_trades': len(trades),
             'trades': trades
         }
-
-    def set_ib_client(self, ib_client: IBKRConnection):
-        """Set the IBKR client for trading"""
-        self.ib_client = ib_client
-        logger.info("IBKR client set for trading")
