@@ -46,3 +46,4 @@ MANIFEST
 .idea
 *.egg-info
 /.tox/
+ibkr_env/

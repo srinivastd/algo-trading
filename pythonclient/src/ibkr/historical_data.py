@@ -1,9 +1,12 @@
+"""
+Historical data management for stock analysis.
+"""
 import os
 import logging
 import pandas as pd
 from datetime import datetime, timedelta
 from ib_insync import Stock, RealTimeBar
-from typing import Optional
+from typing import Optional, Dict
 import asyncio
 from pytz import timezone
 from .connection import IBKRConnection
@@ -260,3 +263,93 @@ class HistoricalDataManager:
         latest_date = cached_data.index.max()
         latest_date_str = latest_date.strftime('%Y-%m-%d %H:%M:%S')
         return await self.get_historical_data_range(symbol, latest_date_str, end_date, bar_size, duration)
+    
+    async def get_historical_data_multiple(
+        self,
+        symbols: list,
+        start_date: str,
+        end_date: str,
+        bar_size: str = '1 min',
+        duration: str = '1 M',
+        force_refresh: bool = False,
+        max_concurrent: int = 5
+    ) -> Dict[str, Optional[pd.DataFrame]]:
+        """Fetch historical data for multiple stocks concurrently"""
+        eastern = timezone('America/New_York')
+        current_time = datetime.now(eastern)
+        
+        # Convert input dates to timezone-aware datetime objects
+        try:
+            start_dt = pd.to_datetime(start_date)
+            if start_dt.tzinfo is None:
+                start_dt = eastern.localize(start_dt)
+            
+            end_dt = pd.to_datetime(end_date)
+            if end_dt.tzinfo is None:
+                end_dt = eastern.localize(end_dt)
+            
+            if end_dt > current_time:
+                end_dt = current_time
+                logger.info(f"Adjusted end date to current time: {end_dt}")
+        except Exception as e:
+            logger.error(f"Error parsing dates: {e}")
+            return {symbol: None for symbol in symbols}
+
+        # Use semaphore to limit concurrent requests (respect IBKR rate limit ~60/min)
+        semaphore = asyncio.Semaphore(max_concurrent)
+        async def fetch_symbol_data(symbol):
+            async with semaphore:
+                if not force_refresh:
+                    cached_data = self._get_latest_cached_data(symbol, start_date, end_date, bar_size)
+                    if cached_data is not None:
+                        logger.info(f"Using cached data for {symbol} from {start_date} to {end_date}")
+                        return symbol, cached_data
+                
+                if not self.connection.is_connected():
+                    logger.error(f"Not connected to IBKR for {symbol}")
+                    return symbol, None
+                
+                logger.info(f"Defining contract for {symbol}...")
+                contract = Stock(symbol, 'SMART', 'USD')
+                qualified_contracts = await self.connection.get_ib().qualifyContractsAsync(contract)
+                if not qualified_contracts:
+                    logger.error(f"Could not qualify contract for {symbol}")
+                    return symbol, None
+                contract = qualified_contracts[0]
+                logger.info(f"Contract qualified: {contract}")
+                
+                all_data = []
+                current_end = end_dt
+                pacing_delay = 10  # Delay to respect IBKR rate limits
+                
+                while current_end > start_dt:
+                    if current_end > current_time:
+                        current_end = current_time
+                    
+                    chunk = await self.fetch_data_chunk(contract, current_end, duration, bar_size)
+                    if chunk is None or chunk.empty:
+                        logger.warning(f"No data for {symbol} period ending {current_end}")
+                        current_end -= timedelta(days=30)
+                        await asyncio.sleep(pacing_delay)
+                        continue
+                    
+                    chunk_start = chunk.index.min()
+                    all_data.append(chunk)
+                    current_end = chunk_start - timedelta(seconds=1)
+                    logger.info(f"Fetched data for {symbol} from {chunk_start} to {chunk.index.max()}")
+                    await asyncio.sleep(pacing_delay)
+                
+                if not all_data:
+                    logger.error(f"No data fetched for {symbol} for the entire period")
+                    return symbol, None
+                
+                df = pd.concat(all_data).sort_index()
+                df = df[(df.index >= start_dt) & (df.index <= end_dt)]
+                self._save_data(df, symbol, start_date, end_date, bar_size)
+                return symbol, df
+
+        # Run concurrent tasks
+        tasks = [fetch_symbol_data(symbol) for symbol in symbols]
+        results = await asyncio.gather(*tasks)
+        
+        return {symbol: df for symbol, df in results}

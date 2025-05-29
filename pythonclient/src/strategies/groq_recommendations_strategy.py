@@ -1,6 +1,6 @@
 """
 Trading strategy implementations for stock analysis.
-Version 1.2
+Version 1.4
 """
 import pandas as pd
 import numpy as np
@@ -12,6 +12,8 @@ from pytz import timezone
 from ibkr.connection import IBKRConnection
 import asyncio
 from ib_insync import MarketOrder, StopOrder, LimitOrder
+import chromadb
+from chromadb.utils import embedding_functions
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +21,7 @@ class GroqRecommendationsStrategy(StrategyBase):
     """Strategy based on supply/demand zones with optimized ADX and duration, with paper trading support"""
     
     def __init__(self, risk_per_trade: float = 3000, max_duration_hours: float = 12.0, paper_trading: bool = True,
-                 stop_loss_pct: float = 1.0, target_pct: float = 4.0):
+                 stop_loss_pct: float = 1.0, target_pct: float = 4.0, bar_size: str = "1 hour", duration: str = "1 M"):
         super().__init__("Groq Recommendations Strategy")
         self.risk_per_trade = risk_per_trade
         self.max_duration_hours = max_duration_hours
@@ -27,8 +29,17 @@ class GroqRecommendationsStrategy(StrategyBase):
         self.stop_loss_pct = stop_loss_pct  # Stop loss percentage
         self.target_pct = target_pct  # Target profit percentage
         self.ib_client = None  # Will be set by main.py
+        self.bar_size = bar_size  # Time frame of bars (e.g., "1 hour")
+        self.duration = duration  # Backtest duration (e.g., "1 M")
+        # Initialize ChromaDB client and collection
+        self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+        self.collection = self.chroma_client.get_or_create_collection(
+            name="backtest_results",
+            embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        )
         logger.info(f"Initialized {self.name} with risk_per_trade=${risk_per_trade}, max_duration={max_duration_hours}h, "
-                   f"stop_loss={stop_loss_pct}%, target={target_pct}%, paper_trading={paper_trading}")
+                   f"stop_loss={stop_loss_pct}%, target={target_pct}%, paper_trading={paper_trading}, "
+                   f"bar_size={bar_size}, duration={duration}")
 
     def set_ib_client(self, ib_client):
         """Set the IBKR client for trading"""
@@ -189,7 +200,7 @@ class GroqRecommendationsStrategy(StrategyBase):
             }
 
     async def backtest(self, df: pd.DataFrame, initial_capital: float = 100000, symbol: str = 'MSFT') -> Dict:
-        """Run a backtest on historical data"""
+        """Run a backtest on historical data and store results in ChromaDB"""
         signals = self.generate_signals(df)
         capital = initial_capital
         position = 0
@@ -253,7 +264,7 @@ class GroqRecommendationsStrategy(StrategyBase):
                         })
                         logger.debug(f"Simulated entry {trades[-1]['type']} at ${entry_price:.2f}, shares: {shares}")
                 else:
-                    # Default to simulation (Version 1.1 logic)
+                    # Default to simulation
                     position = shares if is_long else -shares
                     trades.append({
                         'entry_date': entry_time,
@@ -294,7 +305,7 @@ class GroqRecommendationsStrategy(StrategyBase):
                         logger.debug(f"Exited {current_trade['type']} due to duration at ${exit_price:.2f}, profit: ${profit:.2f}")
                         del active_orders[current_trade['order_id']]
                 else:
-                    # Default to simulation (Version 1.1 logic)
+                    # Default to simulation
                     if time_held >= self.max_duration_hours:
                         exit_price = current_price
                         profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if current_trade['type'] == 'LONG' else (current_trade['entry_price'] - exit_price) * current_trade['shares']
@@ -334,10 +345,48 @@ class GroqRecommendationsStrategy(StrategyBase):
             })
             logger.debug(f"Closed final position at ${exit_price:.2f}, profit: ${profit:.2f}")
 
+        # Calculate success rate and total profit for ChromaDB storage
+        total_trades = len(trades)
+        successful_trades = sum(1 for trade in trades if trade.get('profit', 0) > 0)
+        success_rate = (successful_trades / total_trades * 100) if total_trades > 0 else 0
+        total_profit = sum(trade.get('profit', 0) for trade in trades)
+
+        # Enhanced metadata with additional features
+        metadatas = [{
+            "symbol": symbol,
+            "total_profit": total_profit,
+            "success_rate": success_rate,
+            "initial_capital": initial_capital,
+            "final_capital": capital,
+            "total_trades": total_trades,
+            "trades": str(trades),  # Detailed trade data
+            "risk_per_trade": self.risk_per_trade,
+            "stop_loss_pct": self.stop_loss_pct,
+            "target_pct": self.target_pct,
+            "volatility": float(df['volatility'].iloc[-1]) if not df['volatility'].empty else None,
+            "adx": float(df['adx'].iloc[-1]) if not df['adx'].empty else None,
+            "sma_20": float(df['sma_20'].iloc[-1]) if not df['sma_20'].empty else None,
+            "sma_50": float(df['sma_50'].iloc[-1]) if not df['sma_50'].empty else None,
+            "valid_consolidation": bool(df['valid_consolidation'].iloc[-1]) if not df['valid_consolidation'].empty else False,
+            "volume_change": float(df['volume_change'].iloc[-1]) if not df['volume_change'].empty else None,
+            "bar_size": self.bar_size,
+            "duration": self.duration,
+            "paper_trading": self.paper_trading
+        }]
+
+        # Store results in ChromaDB
+        result_id = f"{symbol}_{str(pd.Timestamp.now())}"
+        self.collection.add(
+            documents=[f"Backtest result for {symbol}: {total_profit} profit, {success_rate}% success rate"],
+            metadatas=metadatas[0],  # Pass the first (and only) metadata dictionary
+            ids=[result_id]
+        )
+        logger.info(f"Stored backtest results for {symbol} in ChromaDB with ID {result_id}")
+
         return {
             'initial_capital': initial_capital,
             'final_capital': capital,
             'return_pct': ((capital - initial_capital) / initial_capital) * 100,
-            'total_trades': len(trades),
+            'total_trades': total_trades,
             'trades': trades
         }

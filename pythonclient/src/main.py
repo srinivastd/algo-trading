@@ -1,6 +1,6 @@
 """
 Main script for stock analysis and strategy backtesting with paper trading.
-Version 1.5
+Version 1.7
 """
 import asyncio
 import logging
@@ -19,6 +19,8 @@ from strategies.groq_breakofstructure_riskreward import GroqBreakOfStructureStra
 from strategies.crossSectionalMomentumStrategy import CrossSectionalMomentumStrategy
 from strategies.vwap_mean_reversion_strategy import VWAPTrendTradingStrategy
 from ib_insync import Stock, util
+import json
+import os
 
 # Set up logging to both file and console with color
 class ColoredFormatter(logging.Formatter):
@@ -55,6 +57,24 @@ console_handler.setFormatter(ColoredFormatter('%(asctime)s - %(levelname)s - %(m
 file_handler = logging.FileHandler('stock_analysis.log')
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
+# Create a directory for market data logs
+os.makedirs('market_data_logs', exist_ok=True)
+
+# Add a new file handler for market data
+market_data_handler = logging.FileHandler('market_data_logs/market_data.json', mode='a')  # Append mode
+market_data_handler.setFormatter(logging.Formatter('%(message)s'))  # Raw JSON format
+market_data_logger = logging.getLogger('market_data')
+market_data_logger.setLevel(logging.INFO)
+market_data_logger.addHandler(market_data_handler)
+market_data_logger.propagate = False  # Don't propagate to root logger
+
+# Add a test log entry to verify logger is working
+market_data_logger.info(json.dumps({
+    'timestamp': datetime.now(pytz.timezone('US/Eastern')).isoformat(),
+    'type': 'system',
+    'message': 'Market data logger initialized'
+}))
+
 # Set up root logger
 logging.basicConfig(
     level=logging.DEBUG,  # Set to DEBUG to see all messages
@@ -63,9 +83,191 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+async def watch_mode(symbols, strategy, connection, check_interval):
+    """Real-time watching mode for multiple stocks"""
+    logger.info(f"Starting real-time watch for {symbols} with check interval {check_interval} seconds")
+    
+    # Log watch mode start
+    market_data_logger.info(json.dumps({
+        'timestamp': datetime.now(pytz.timezone('US/Eastern')).isoformat(),
+        'type': 'system',
+        'message': f'Watch mode started for symbols: {symbols}'
+    }))
+    
+    # Set up real-time data subscriptions for all stocks
+    contracts = [Stock(symbol, "SMART", "USD") for symbol in symbols]
+    active_subscriptions = set()  # Track active subscriptions
+    
+    async def setup_market_data(contract):
+        try:
+            await connection.get_ib().qualifyContractsAsync(contract)
+            # Request real-time bars without reqId
+            connection.get_ib().reqRealTimeBars(contract, barSize=5, whatToShow='TRADES', useRTH=True)
+            active_subscriptions.add(contract.symbol)
+            logger.debug(f"Requested real-time bars for {contract.symbol}")
+            return True
+        except Exception as e:
+            logger.error(f"Error setting up market data for {contract.symbol}: {e}")
+            return False
+    
+    # Set up market data for each contract
+    for contract in contracts:
+        success = await setup_market_data(contract)
+        if not success:
+            logger.error(f"Failed to set up market data for {contract.symbol}")
+    
+    # Initialize data storage for each stock
+    data_dict = {symbol: pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume']) for symbol in symbols}
+    
+    def on_data_received(bars, has_gaps):
+        # Process the most recent bar from the list
+        bar = bars[-1]  # Get the latest bar
+        
+        # Since we're only watching one symbol at a time, we can use the first symbol
+        symbol = list(active_subscriptions)[0] if active_subscriptions else None
+        if symbol is None:
+            logger.error("No active subscriptions found")
+            return
+            
+        timestamp = datetime.now(pytz.timezone('US/Eastern'))
+        
+        # Log raw market data
+        market_data = {
+            'timestamp': timestamp.isoformat(),
+            'symbol': symbol,
+            'bar_data': {
+                'date': bar.time.isoformat() if hasattr(bar.time, 'isoformat') else str(bar.time),
+                'open': bar.open_,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume if bar.volume >= 0 else 0,
+                'count': bar.count,
+                'wap': bar.wap
+            }
+        }
+        market_data_logger.info(json.dumps(market_data))
+        
+        # Update data dictionary
+        new_data = pd.DataFrame({
+            'open': [bar.open_],
+            'high': [bar.high],
+            'low': [bar.low],
+            'close': [bar.close],
+            'volume': [bar.volume if bar.volume >= 0 else 0]
+        }, index=[bar.time])
+        data_dict[symbol] = pd.concat([data_dict[symbol], new_data]).drop_duplicates().sort_index()
+        logger.debug(f"Received new bar for {symbol}: {bar.time}, Close: {bar.close}")
+    
+    connection.get_ib().barUpdateEvent += on_data_received
+    
+    # Start watching loop
+    while True:
+        current_time = datetime.now(pytz.timezone('US/Eastern'))
+        # Skip if outside market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
+        if current_time.weekday() >= 5 or not (9 <= current_time.hour < 16):
+            logger.info("Outside market hours, skipping this cycle...")
+            await asyncio.sleep(check_interval)
+            continue
+        
+        # Log data status for each symbol
+        for symbol in symbols:
+            data_len = len(data_dict[symbol])
+            logger.debug(f"Data status for {symbol}: {data_len} bars")
+            if data_len < 5:
+                logger.debug(f"Waiting for more data for {symbol} (need at least 5 bars)")
+        
+        # Generate signals and execute trades for each symbol with sufficient data
+        signals = []
+        for symbol in symbols:
+            if len(data_dict[symbol]) >= 5:
+                df = strategy.calculate_indicators(data_dict[symbol].copy())
+                signal = await strategy.generate_realtime_signals(df)
+                
+                # Log signal generation with market context
+                signal_data = {
+                    'timestamp': current_time.isoformat(),
+                    'symbol': symbol,
+                    'signal': int(signal),  # Convert to native Python int
+                    'market_context': {
+                        'current_price': float(df['close'].iloc[-1]),  # Convert to native Python float
+                        'current_volume': float(df['volume'].iloc[-1]),  # Convert to native Python float
+                        'bars_analyzed': int(len(df)),  # Convert to native Python int
+                        'indicators': {
+                            col: float(df[col].iloc[-1]) if pd.api.types.is_numeric_dtype(df[col]) else str(df[col].iloc[-1])
+                            for col in df.columns 
+                            if col not in ['open', 'high', 'low', 'close', 'volume']
+                        }
+                    }
+                }
+                market_data_logger.info(json.dumps(signal_data))
+                
+                if signal != 0:  # Only process symbols with non-zero signals
+                    signals.append(f"{symbol}: {signal}")
+                    logger.debug(f"Generated signal {signal} for {symbol}")
+                    
+                    # Execute trade for this signal
+                    entry_price = df['close'].iloc[-1]
+                    is_long = signal == 1
+                    stop_loss = entry_price * (1 - strategy.stop_loss_pct/100) if is_long else entry_price * (1 + strategy.stop_loss_pct/100)
+                    target = entry_price * (1 + strategy.target_pct/100) if is_long else entry_price * (1 - strategy.target_pct/100)
+                    risk_per_share = abs(entry_price - stop_loss)
+                    shares = int(strategy.risk_per_trade / risk_per_share) if risk_per_share > 0 else 100
+                    if shares <= 0:
+                        shares = 100  # Minimum trade size
+                    
+                    # Log trade execution attempt
+                    trade_data = {
+                        'timestamp': current_time.isoformat(),
+                        'symbol': symbol,
+                        'action': 'trade_execution_attempt',
+                        'trade_details': {
+                            'signal': signal,
+                            'entry_price': entry_price,
+                            'shares': shares,
+                            'stop_loss': stop_loss,
+                            'target': target,
+                            'risk_per_share': risk_per_share,
+                            'is_long': is_long
+                        }
+                    }
+                    market_data_logger.info(json.dumps(trade_data))
+                    
+                    trade_result = await strategy.execute_trade(
+                        symbol=symbol,
+                        signal=signal,
+                        entry_price=entry_price,
+                        shares=shares,
+                        stop_loss=stop_loss,
+                        target=target
+                    )
+                    
+                    # Log trade execution result
+                    trade_result_data = {
+                        'timestamp': current_time.isoformat(),
+                        'symbol': symbol,
+                        'action': 'trade_execution_result',
+                        'trade_result': trade_result
+                    }
+                    market_data_logger.info(json.dumps(trade_result_data))
+                    
+                    if trade_result['status'] == 'success':
+                        logger.info(f"Executed {'Buy' if signal == 1 else 'Sell'} trade for {symbol}: Entry ${entry_price:.2f}, Shares {shares}")
+                    else:
+                        logger.error(f"Trade failed for {symbol}: {trade_result['message']}")
+        
+        # Log summary of signals
+        if signals:
+            signals_summary = ", ".join(signals)
+            logger.info(f"Completed watch cycle. Signals: {signals_summary}")
+        else:
+            logger.info("Completed watch cycle. No signals generated.")
+        
+        await asyncio.sleep(check_interval)
+
 async def main():
     parser = argparse.ArgumentParser(description='Stock Analysis with IBKR')
-    parser.add_argument('symbol', type=str, help='Stock symbol (e.g., NVDA)')
+    parser.add_argument('symbols', nargs='+', help='Stock symbols (e.g., NVDA MSFT PLTR)')
     parser.add_argument('--duration', type=str, default='5 Y', help='Duration of historical data (e.g., 1 M, 1 Y, 5 Y)')
     parser.add_argument('--bar-size', type=str, default='1 min', help='Bar size (e.g., 1 min, 1 hour, 1 day)')
     parser.add_argument('--strategy', type=str, default='breakout', help='Strategy to use (e.g., breakout, supplydemand, groq, groq_bos, momentum, vwap)')
@@ -80,17 +282,19 @@ async def main():
     
     # Add strategy specific parameters
     parser.add_argument('--risk-per-trade', type=float, default=500.0,
-                      help='Amount of money to risk per trade (default: $500.0, max: $2000.0)')
+                        help='Amount of money to risk per trade (default: $500.0, max: $2000.0)')
     parser.add_argument('--max-duration', type=float, default=12.0,
-                      help='Maximum duration to hold a trade in hours (default: 12.0)')
+                        help='Maximum duration to hold a trade in hours (default: 12.0)')
     parser.add_argument('--stop-loss', type=float, default=1.0,
-                      help='Stop loss percentage (default: 1.0%%)')
+                        help='Stop loss percentage (default: 1.0%%)')
     parser.add_argument('--target', type=float, default=4.0,
-                      help='Target profit percentage (default: 4.0%%)')
+                        help='Target profit percentage (default: 4.0%%)')
     parser.add_argument('--initial-capital', type=float, default=100000.0,
-                      help='Initial capital for backtesting in dollars (default: 100000)')
-    parser.add_argument('--rebalance-period', type=int, default=30, help='Rebalance period in days for momentum strategy (default: 30)')
-    parser.add_argument('--vwap-threshold', type=float, default=0.01, help='VWAP deviation threshold for mean reversion (default: 0.01)')
+                        help='Initial capital for backtesting in dollars (default: 100000)')
+    parser.add_argument('--rebalance-period', type=int, default=30,
+                        help='Rebalance period in days for momentum strategy (default: 30)')
+    parser.add_argument('--vwap-threshold', type=float, default=0.01,
+                        help='VWAP deviation threshold for mean reversion (default: 0.01)')
     
     args = parser.parse_args()
     
@@ -132,8 +336,8 @@ async def main():
         data_manager = HistoricalDataManager(connection)
         
         if args.watch:
-            # Real-time watching mode
-            logger.info(f"Starting real-time watch for {args.symbol} with check interval {args.check_interval} seconds")
+            # Real-time watching mode for multiple stocks
+            logger.info(f"Starting real-time watch for {args.symbols} with check interval {args.check_interval} seconds")
             if args.strategy not in ['groq', 'groq_bos']:
                 logger.error(f"Real-time watching not supported for strategy: {args.strategy}")
                 return
@@ -145,7 +349,9 @@ async def main():
                     max_duration_hours=args.max_duration,
                     paper_trading=paper_mode,
                     stop_loss_pct=args.stop_loss,
-                    target_pct=args.target
+                    target_pct=args.target,
+                    bar_size=args.bar_size,
+                    duration=args.duration
                 )
             elif args.strategy == 'groq_bos':
                 strategy = GroqBreakOfStructureStrategy(
@@ -155,51 +361,10 @@ async def main():
                 )
             strategy.set_ib_client(connection)
             
-            # Set up real-time data subscription
-            contract = Stock(args.symbol, "SMART", "USD")
-            await connection.get_ib().qualifyContractsAsync(contract)
-            connection.get_ib().reqMktData(contract, '', False, False)
-            data = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
-            
-            def on_data_received(bar):
-                new_data = pd.DataFrame({
-                    'open': [bar.open],
-                    'high': [bar.high],
-                    'low': [bar.low],
-                    'close': [bar.close],
-                    'volume': [bar.volume]
-                }, index=[bar.date])
-                nonlocal data
-                data = pd.concat([data, new_data]).drop_duplicates().sort_index()
-                logger.debug(f"Received new bar for {args.symbol}: {bar.date}, Close: {bar.close}")
-            
-            connection.get_ib().barUpdateEvent += on_data_received
-            
-            # Start watching loop
-            while True:
-                if len(data) >= 5:
-                    df = strategy.calculate_indicators(data.copy())
-                    signal = await strategy.generate_realtime_signals(df)
-                    if signal != 0:
-                        entry_price = data['close'].iloc[-1]
-                        stop_loss = entry_price * 0.99 if signal == 1 else entry_price * 1.01
-                        target = entry_price * 1.03 if signal == 1 else entry_price * 0.97
-                        shares = int(args.risk_per_trade / abs(entry_price - stop_loss))
-                        if shares <= 0:
-                            shares = 100  # Minimum trade size
-                        
-                        trade_result = await strategy.execute_trade(
-                            args.symbol, signal, entry_price, shares, stop_loss, target
-                        )
-                        if trade_result['status'] == 'success':
-                            logger.info(f"Executed {'Buy' if signal == 1 else 'Sell'} trade: Entry ${entry_price:.2f}, Shares {shares}")
-                        else:
-                            logger.error(f"Trade failed: {trade_result['message']}")
-                
-                await asyncio.sleep(args.check_interval)
+            await watch_mode(args.symbols, strategy, connection, args.check_interval)
         
         else:
-            # Backtesting mode
+            # Backtesting mode for multiple stocks
             et_tz = pytz.timezone('US/Eastern')
             utc_tz = pytz.UTC
             
@@ -225,94 +390,109 @@ async def main():
             start_date_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
             end_date_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
             
-            # Get historical data using get_historical_data_range
-            logger.info(f"Fetching historical data for {args.symbol}...")
+            # Fetch historical data for all symbols concurrently using get_historical_data_multiple
+            logger.info(f"Fetching historical data for {args.symbols}...")
             logger.info(f"Date Range (ET): {start_date.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_date.strftime('%Y-%m-%d %H:%M:%S %Z')}")
             logger.info(f"Bar Size: {args.bar_size}")
             
-            df = await data_manager.get_historical_data_range(
-                args.symbol,
+            data_dict = await data_manager.get_historical_data_multiple(
+                args.symbols,
                 start_date_str,
                 end_date_str,
                 bar_size=args.bar_size,
                 force_refresh=args.force_refresh
             )
             
-            if df is not None and not df.empty:
-                logger.info(f"Successfully retrieved {len(df)} bars of historical data")
-                logger.info(f"Data range: {df.index[0]} to {df.index[-1]}")
-                
-                # Initialize and run strategy
-                logger.info(f"Initializing {args.strategy} strategy...")
-                if args.strategy == 'breakout':
-                    strategy = BreakoutPullbackStrategy()
-                elif args.strategy == 'supplydemand':
-                    strategy = SupplyDemandSurgeStrategy()
-                elif args.strategy == 'groq':
-                    strategy = GroqRecommendationsStrategy(
-                        risk_per_trade=args.risk_per_trade,
-                        max_duration_hours=args.max_duration,
-                        paper_trading=not args.backtest_only,
-                        stop_loss_pct=args.stop_loss,
-                        target_pct=args.target
-                    )
-                    if not args.backtest_only and paper_mode:
-                        strategy.set_ib_client(connection)
-                elif args.strategy == 'groq_bos':
-                    strategy = GroqBreakOfStructureStrategy(
-                        risk_per_trade=args.risk_per_trade,
-                        max_duration_hours=args.max_duration,
-                        paper_trading=not args.backtest_only,
-                        stop_loss_pct=args.stop_loss,
-                        target_pct=args.target
-                    )
-                    if not args.backtest_only and paper_mode:
-                        strategy.set_ib_client(connection)
-                elif args.strategy == 'momentum':
-                    strategy = CrossSectionalMomentumStrategy(
-                        risk_per_trade=args.risk_per_trade,
-                        rebalance_period_days=args.rebalance_period
-                    )
-                elif args.strategy == 'vwap':
-                    strategy = VWAPTrendTradingStrategy(
-                        risk_per_trade=args.risk_per_trade,
-                        threshold=args.vwap_threshold,
-                        max_duration_hours=args.max_duration
-                    )
+            # Log results for each symbol
+            for symbol in data_dict:
+                if data_dict[symbol] is not None and not data_dict[symbol].empty:
+                    logger.info(f"Successfully retrieved {len(data_dict[symbol])} bars of historical data for {symbol}")
+                    logger.info(f"Data range for {symbol}: {data_dict[symbol].index[0]} to {data_dict[symbol].index[-1]}")
                 else:
-                    logger.error(f"Unknown strategy: {args.strategy}")
-                    return
-                    
-                logger.info("Calculating technical indicators...")
+                    logger.warning(f"No data retrieved for {symbol}")
+            
+            # Filter out symbols with no data
+            data_dict = {symbol: df for symbol, df in data_dict.items() if df is not None and not df.empty}
+            
+            if not data_dict:
+                logger.error("No data was retrieved for any symbol. Please check the logs for details.")
+                return
+            
+            # Initialize and run strategy
+            logger.info(f"Initializing {args.strategy} strategy...")
+            if args.strategy == 'breakout':
+                strategy = BreakoutPullbackStrategy()
+            elif args.strategy == 'supplydemand':
+                strategy = SupplyDemandSurgeStrategy()
+            elif args.strategy == 'groq':
+                strategy = GroqRecommendationsStrategy(
+                    risk_per_trade=args.risk_per_trade,
+                    max_duration_hours=args.max_duration,
+                    paper_trading=not args.backtest_only,
+                    stop_loss_pct=args.stop_loss,
+                    target_pct=args.target
+                )
+                if not args.backtest_only and paper_mode:
+                    strategy.set_ib_client(connection)
+            elif args.strategy == 'groq_bos':
+                strategy = GroqBreakOfStructureStrategy(
+                    risk_per_trade=args.risk_per_trade,
+                    max_duration_hours=args.max_duration,
+                    paper_trading=not args.backtest_only,
+                    stop_loss_pct=args.stop_loss,
+                    target_pct=args.target
+                )
+                if not args.backtest_only and paper_mode:
+                    strategy.set_ib_client(connection)
+            elif args.strategy == 'momentum':
+                strategy = CrossSectionalMomentumStrategy(
+                    risk_per_trade=args.risk_per_trade,
+                    rebalance_period_days=args.rebalance_period
+                )
+            elif args.strategy == 'vwap':
+                strategy = VWAPTrendTradingStrategy(
+                    risk_per_trade=args.risk_per_trade,
+                    threshold=args.vwap_threshold,
+                    max_duration_hours=args.max_duration
+                )
+            else:
+                logger.error(f"Unknown strategy: {args.strategy}")
+                return
+            
+            # Run backtesting for each stock
+            all_results = {}
+            for symbol, df in data_dict.items():
+                logger.info(f"Calculating technical indicators for {symbol}...")
                 df = strategy.calculate_indicators(df)
                 
                 if args.backtest_only:
-                    logger.info("Running backtest in simulation mode (no trades will be executed)...")
+                    logger.info(f"Running backtest in simulation mode for {symbol} (no trades will be executed)...")
                 else:
-                    logger.info("Running backtest with paper trading enabled...")
+                    logger.info(f"Running backtest with paper trading enabled for {symbol}...")
                     
                 # Validate risk per trade
                 if args.risk_per_trade > 2000.0:
                     logger.warning(f"Risk per trade (${args.risk_per_trade}) exceeds maximum allowed ($2000.0). Setting to $2000.0")
                     args.risk_per_trade = 2000.0
                 
-                backtest_results = await strategy.backtest(df, initial_capital=args.initial_capital, symbol=args.symbol)
+                backtest_results = await strategy.backtest(df, initial_capital=args.initial_capital, symbol=symbol)
+                all_results[symbol] = backtest_results
                 
-                logger.info("\nBacktest Results:")
+                logger.info(f"\nBacktest Results for {symbol}:")
                 logger.info(f"Initial Capital: ${backtest_results['initial_capital']:,.2f}")
                 logger.info(f"Final Capital: ${backtest_results['final_capital']:,.2f}")
                 logger.info(f"Return: {backtest_results['return_pct']:.2f}%")
                 logger.info(f"Total Trades: {backtest_results['total_trades']}")
                 
                 # Print basic statistics
-                logger.info("\nBasic Statistics:")
+                logger.info(f"\nBasic Statistics for {symbol}:")
                 logger.info(f"Date Range: {df.index[0]} to {df.index[-1]}")
                 logger.info(f"Number of bars: {len(df)}")
                 logger.info(f"Current price: ${df['close'].iloc[-1]:.2f}")
                 
                 # Log trade details
                 if backtest_results['trades']:
-                    logger.info("\nTrade Details:")
+                    logger.info(f"\nTrade Details for {symbol}:")
                     current_capital = backtest_results['initial_capital']
                     for i, trade in enumerate(backtest_results['trades'], 1):
                         logger.info(f"\nTrade {i}:")
@@ -354,7 +534,7 @@ async def main():
                     avg_trade_duration = sum(trade_durations) / len(trade_durations) if trade_durations else 0
                     
                     logger.info("\n" + "="*50)
-                    logger.info("CONSOLIDATED PERFORMANCE METRICS")
+                    logger.info(f"CONSOLIDATED PERFORMANCE METRICS FOR {symbol}")
                     logger.info("="*50)
                     logger.info("\nTrade Statistics:")
                     logger.info(f"Total Trades: {len(backtest_results['trades'])}")
@@ -384,9 +564,17 @@ async def main():
                     for month, profit in sorted(monthly_returns.items()):
                         logger.info(f"{month}: ${profit:,.2f}")
                     logger.info("="*50)
-                
-            else:
-                logger.error("No data was retrieved. Please check the logs for details.")
+            
+            # Summary across all stocks
+            logger.info("\n" + "="*50)
+            logger.info("OVERALL PERFORMANCE SUMMARY")
+            logger.info("="*50)
+            total_trades_all = sum(result['total_trades'] for result in all_results.values())
+            total_return_all = sum(result['final_capital'] - result['initial_capital'] for result in all_results.values())
+            logger.info(f"Total Trades Across All Stocks: {total_trades_all}")
+            logger.info(f"Total Net Profit Across All Stocks: ${total_return_all:,.2f}")
+            for symbol, result in all_results.items():
+                logger.info(f"{symbol} - Return: {result['return_pct']:.2f}%, Trades: {result['total_trades']}")
             
     except Exception as e:
         logger.error(f"Error occurred: {e}", exc_info=True)
