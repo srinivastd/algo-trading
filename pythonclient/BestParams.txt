@@ -1,0 +1,4 @@
+python src/main.py TSLA --duration "1 Y" --bar-size "4 hours" --strategy groq --backtest-only --risk-per-trade 1000 --max-duration 72 --stop-loss 0.75 --target 6.0 >>tslabacktest.log
+
+ython src/main.py qbts --duration "1 Y" --bar-size "4 hours" --strategy groq --backtest-only --risk-per-trade 1000 --max-duration 72 --stop-loss 0.75 --target 6.0 --initial-capital 50000  >> qbtsbacktest.log 
+ Profit Factor: 3.69
