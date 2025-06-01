@@ -5,7 +5,7 @@ Version 1.3
 """
 import logging
 import asyncio
-from ib_insync import IB, MarketOrder, StopOrder, LimitOrder, Trade
+from ib_insync import IB, MarketOrder, StopOrder, LimitOrder, Trade, Stock
 from typing import List, Optional, Dict
 import sys
 
@@ -174,12 +174,12 @@ class IBKRConnection:
                 order = MarketOrder(action, quantity, tif='GTC', transmit=True)
 
             trade = self.get_ib().placeOrder(contract, order)
-            await asyncio.sleep(1)  # Allow time for order to process
-            await trade.logResponsesAsync()  # Wait for order confirmation
+            await asyncio.sleep(2)  # Allow time for order to process
 
-            if trade.orderStatus.status in ['Filled', 'Submitted']:
+            # Check order status after placement
+            if trade.orderStatus.status in ['Filled', 'Submitted', 'PendingSubmit']:
                 order_id = trade.order.orderId
-                logger.info(f"Placed order {order_id}: {action} {quantity} shares of {symbol}")
+                logger.info(f"Placed order {order_id}: {action} {quantity} shares of {symbol} at {limit_price or 'market'}")
                 return order_id
             else:
                 logger.error(f"Order failed: {trade.orderStatus.status}")

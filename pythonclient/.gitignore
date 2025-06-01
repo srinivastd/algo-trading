@@ -47,3 +47,5 @@ MANIFEST
 *.egg-info
 /.tox/
 ibkr_env/
+market_data_logs/
+pythonclient/historical_data/

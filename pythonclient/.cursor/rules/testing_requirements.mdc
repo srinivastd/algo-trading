@@ -1,0 +1,130 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Testing Requirements
+Rule Type: Always
+
+## Test Coverage Requirements
+### Minimum Coverage
+- Overall code coverage: 80%
+- Critical paths: 90%
+- Trading logic: 95%
+- Error handling: 90%
+
+### Critical Paths
+- Signal generation
+- Order execution
+- Risk management
+- Error handling
+- Connection management
+
+## Required Tests
+### Unit Tests
+- All strategy methods
+- All IBKR connection methods
+- All utility functions
+- All data processing functions
+- All error handling code
+
+### Integration Tests
+- IBKR connection
+- Strategy execution
+- Data flow
+- Order management
+- Error recovery
+
+### Backtest Validation
+- Historical data accuracy
+- Signal generation
+- Performance metrics
+- Risk management
+- Position sizing
+
+## Test Categories
+### Strategy Tests
+- Indicator calculations
+- Signal generation
+- Entry/exit logic
+- Risk management
+- Position sizing
+
+### Connection Tests
+- Connection establishment
+- Order placement
+- Order cancellation
+- Market data
+- Error handling
+
+### System Tests
+- End-to-end workflows
+- Performance under load
+- Error recovery
+- Data consistency
+- System stability
+
+## Test Requirements
+### Test Data
+- Use realistic market data
+- Include edge cases
+- Cover error conditions
+- Include stress tests
+- Maintain test datasets
+
+### Test Environment
+- Isolated test environment
+- Paper trading mode
+- Market data simulation
+- Error injection capability
+- Performance monitoring
+
+### Test Documentation
+- Test plan documentation
+- Test case documentation
+- Test results documentation
+- Coverage reports
+- Performance reports
+
+## Validation Requirements
+### Strategy Validation
+- Compare with historical data
+- Validate signal generation
+- Verify risk management
+- Check position sizing
+- Monitor performance
+
+### System Validation
+- Verify data flow
+- Check error handling
+- Validate performance
+- Monitor resource usage
+- Test recovery procedures
+
+## Performance Testing
+### Latency Requirements
+- Signal generation: < 100ms
+- Order execution: < 500ms
+- Data processing: < 50ms
+- System response: < 200ms
+
+### Resource Requirements
+- Memory usage: < 1GB
+- CPU usage: < 50%
+- Network usage: < 1MB/s
+- Disk usage: < 10GB
+
+## Test Maintenance
+### Regular Testing
+- Run tests before deployment
+- Schedule regular test runs
+- Monitor test coverage
+- Update test cases
+- Review test results
+
+### Test Updates
+- Update tests with code changes
+- Add new test cases
+- Remove obsolete tests
+- Maintain test data
+- Update documentation

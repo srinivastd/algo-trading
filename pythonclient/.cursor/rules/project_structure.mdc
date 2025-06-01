@@ -1,0 +1,76 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Project Structure
+Rule Type: Always
+
+## Directory Structure
+```
+src/
+├── strategies/
+│   ├── __init__.py
+│   ├── base.py
+│   └── *_strategy.py
+├── ibkr/
+│   ├── __init__.py
+│   └── connection.py
+└── utils/
+    ├── __init__.py
+    ├── data_loader.py
+    └── logger.py
+```
+
+## Required Files
+### Strategies Directory
+- `__init__.py`: Package initialization
+- `base.py`: Base strategy class
+- Strategy files: Must follow pattern `*_strategy.py`
+  - Example: `groq_recommendations_strategy.py`
+
+### IBKR Directory
+- `__init__.py`: Package initialization
+- `connection.py`: IBKR connection management
+
+### Utils Directory
+- `__init__.py`: Package initialization
+- `data_loader.py`: Data loading utilities
+- `logger.py`: Logging configuration
+
+## File Organization Rules
+- Each strategy must be in its own file
+- Strategy files must inherit from base strategy class
+- Connection management must be isolated in ibkr directory
+- Utility functions must be in appropriate utility modules
+- Configuration files must be in config directory
+- Test files must mirror source directory structure
+
+## Module Dependencies
+- Strategies can depend on:
+  - Base strategy class
+  - IBKR connection
+  - Utility modules
+- IBKR connection can depend on:
+  - Utility modules
+- Utils can only depend on:
+  - Standard library
+  - Third-party packages
+
+## Import Structure
+- Use absolute imports for all local modules
+- Avoid circular dependencies
+- Keep dependencies explicit
+- Use __init__.py to expose public APIs
+
+## Configuration
+- Environment variables in .env file
+- Trading parameters in config files
+- Logging configuration in logger.py
+- Strategy parameters in strategy classes
+
+## Documentation
+- README.md in root directory
+- API documentation in docstrings
+- Strategy documentation in strategy files
+- Configuration guide in docs directory

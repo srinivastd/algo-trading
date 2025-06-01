@@ -15,7 +15,6 @@ from ibkr.historical_data import HistoricalDataManager
 from strategies.breakout_pullback import BreakoutPullbackStrategy
 from strategies.supplydemand_surge import SupplyDemandSurgeStrategy
 from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy
-from strategies.groq_breakofstructure_riskreward import GroqBreakOfStructureStrategy
 from strategies.crossSectionalMomentumStrategy import CrossSectionalMomentumStrategy
 from strategies.vwap_mean_reversion_strategy import VWAPTrendTradingStrategy
 from ib_insync import Stock, util
@@ -96,14 +95,29 @@ async def watch_mode(symbols, strategy, connection, check_interval):
     
     # Set up real-time data subscriptions for all stocks
     contracts = [Stock(symbol, "SMART", "USD") for symbol in symbols]
-    active_subscriptions = set()  # Track active subscriptions
+    
+    # Initialize data storage for each stock - normalize to uppercase
+    symbols_upper = [symbol.upper() for symbol in symbols]
+    data_dict = {symbol: pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume']) for symbol in symbols_upper}
+    
+    # Store real-time bar lists for each symbol
+    realtime_bar_lists = {}
     
     async def setup_market_data(contract):
         try:
             await connection.get_ib().qualifyContractsAsync(contract)
-            # Request real-time bars without reqId
-            connection.get_ib().reqRealTimeBars(contract, barSize=5, whatToShow='TRADES', useRTH=True)
-            active_subscriptions.add(contract.symbol)
+            
+            # Request real-time bars - ib_insync automatically handles reqId internally
+            bars = connection.get_ib().reqRealTimeBars(
+                contract=contract, 
+                barSize=5, 
+                whatToShow='TRADES', 
+                useRTH=True
+            )
+            
+            symbol_upper = contract.symbol.upper()
+            realtime_bar_lists[symbol_upper] = bars
+            
             logger.debug(f"Requested real-time bars for {contract.symbol}")
             return True
         except Exception as e:
@@ -116,18 +130,25 @@ async def watch_mode(symbols, strategy, connection, check_interval):
         if not success:
             logger.error(f"Failed to set up market data for {contract.symbol}")
     
-    # Initialize data storage for each stock
-    data_dict = {symbol: pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume']) for symbol in symbols}
-    
-    def on_data_received(bars, has_gaps):
-        # Process the most recent bar from the list
-        bar = bars[-1]  # Get the latest bar
-        
-        # Since we're only watching one symbol at a time, we can use the first symbol
-        symbol = list(active_subscriptions)[0] if active_subscriptions else None
-        if symbol is None:
-            logger.error("No active subscriptions found")
+    def on_bar_update(bars, has_new_bar):
+        """Handle barUpdateEvent from ib_insync"""
+        # The bars parameter is a RealTimeBarList that contains contract information
+        if not hasattr(bars, 'contract') or not bars.contract:
+            logger.warning("Received bar update without contract information")
             return
+            
+        symbol = bars.contract.symbol.upper()
+        
+        # Get the latest bar
+        if len(bars) == 0:
+            return
+            
+        latest_bar = bars[-1]
+        
+        # Ensure symbol exists in our tracking
+        if symbol not in data_dict:
+            logger.warning(f"Received bar for untracked symbol {symbol}, initializing...")
+            data_dict[symbol] = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
             
         timestamp = datetime.now(pytz.timezone('US/Eastern'))
         
@@ -136,30 +157,33 @@ async def watch_mode(symbols, strategy, connection, check_interval):
             'timestamp': timestamp.isoformat(),
             'symbol': symbol,
             'bar_data': {
-                'date': bar.time.isoformat() if hasattr(bar.time, 'isoformat') else str(bar.time),
-                'open': bar.open_,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume if bar.volume >= 0 else 0,
-                'count': bar.count,
-                'wap': bar.wap
+                'date': latest_bar.time.isoformat() if hasattr(latest_bar.time, 'isoformat') else str(latest_bar.time),
+                'open': latest_bar.open_,
+                'high': latest_bar.high,
+                'low': latest_bar.low,
+                'close': latest_bar.close,
+                'volume': latest_bar.volume if latest_bar.volume >= 0 else 0,
+                'count': latest_bar.count,
+                'wap': latest_bar.wap,
+                'has_new_bar': has_new_bar
             }
         }
         market_data_logger.info(json.dumps(market_data))
         
         # Update data dictionary
         new_data = pd.DataFrame({
-            'open': [bar.open_],
-            'high': [bar.high],
-            'low': [bar.low],
-            'close': [bar.close],
-            'volume': [bar.volume if bar.volume >= 0 else 0]
-        }, index=[bar.time])
+            'open': [latest_bar.open_],
+            'high': [latest_bar.high],
+            'low': [latest_bar.low],
+            'close': [latest_bar.close],
+            'volume': [latest_bar.volume if latest_bar.volume >= 0 else 0]
+        }, index=[latest_bar.time])
+        
         data_dict[symbol] = pd.concat([data_dict[symbol], new_data]).drop_duplicates().sort_index()
-        logger.debug(f"Received new bar for {symbol}: {bar.time}, Close: {bar.close}")
+        logger.debug(f"Received new bar for {symbol}: {latest_bar.time}, Close: {latest_bar.close}, Has new bar: {has_new_bar}")
     
-    connection.get_ib().barUpdateEvent += on_data_received
+    # Subscribe to bar update events from ib_insync
+    connection.get_ib().barUpdateEvent += on_bar_update
     
     # Start watching loop
     while True:
@@ -170,18 +194,127 @@ async def watch_mode(symbols, strategy, connection, check_interval):
             await asyncio.sleep(check_interval)
             continue
         
-        # Log data status for each symbol
+        # STEP 1: Check existing positions for exit signals
+        try:
+            existing_positions = await connection.get_ib().reqPositionsAsync()
+            
+            for position in existing_positions:
+                if position.position != 0:  # Only check non-zero positions
+                    pos_symbol = position.contract.symbol.upper()
+                    position_size = float(position.position)
+                    avg_cost = float(position.avgCost)
+                    
+                    logger.debug(f"Checking position: {pos_symbol}, Size: {position_size}, Avg Cost: ${avg_cost:.2f}")
+                    
+                    # Ensure we have market data for this position
+                    if pos_symbol not in data_dict:
+                        # Add this symbol to our watch list dynamically
+                        logger.info(f"Adding {pos_symbol} to watch list (currently held position)")
+                        try:
+                            pos_contract = Stock(pos_symbol, "SMART", "USD")
+                            success = await setup_market_data(pos_contract)
+                            if success:
+                                data_dict[pos_symbol] = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+                                logger.info(f"Successfully added {pos_symbol} to monitoring")
+                            else:
+                                logger.warning(f"Failed to add {pos_symbol} to monitoring")
+                                continue
+                        except Exception as e:
+                            logger.error(f"Error adding {pos_symbol} to watch list: {e}")
+                            continue
+                    
+                    # Check if we have enough data for this position
+                    if len(data_dict[pos_symbol]) >= 2:
+                        df = strategy.calculate_indicators(data_dict[pos_symbol].copy())
+                        
+                        # Generate exit signal for this position
+                        if position_size > 0:  # Long position
+                            exit_signal = await strategy.generate_exit_signals(df, 'long')
+                        else:  # Short position  
+                            exit_signal = await strategy.generate_exit_signals(df, 'short')
+                        
+                        # Log position monitoring
+                        position_data = {
+                            'timestamp': current_time.isoformat(),
+                            'symbol': pos_symbol,
+                            'action': 'position_monitoring',
+                            'position_details': {
+                                'position_size': position_size,
+                                'avg_cost': avg_cost,
+                                'current_price': float(df['close'].iloc[-1]),
+                                'unrealized_pnl': position_size * (float(df['close'].iloc[-1]) - avg_cost),
+                                'exit_signal': int(exit_signal),
+                                'position_type': 'long' if position_size > 0 else 'short'
+                            }
+                        }
+                        market_data_logger.info(json.dumps(position_data))
+                        
+                        # Execute exit trade if signal indicates
+                        if exit_signal != 0:
+                            logger.info(f"Exit signal {exit_signal} generated for position {pos_symbol}")
+                            
+                            # Determine exit action (opposite of current position)
+                            exit_action = 'SELL' if position_size > 0 else 'BUY'
+                            exit_quantity = abs(int(position_size))
+                            
+                            # Log position exit attempt
+                            exit_data = {
+                                'timestamp': current_time.isoformat(),
+                                'symbol': pos_symbol,
+                                'action': 'position_exit_attempt',
+                                'exit_details': {
+                                    'exit_signal': exit_signal,
+                                    'exit_action': exit_action,
+                                    'exit_quantity': exit_quantity,
+                                    'current_price': float(df['close'].iloc[-1]),
+                                    'position_size': position_size,
+                                    'avg_cost': avg_cost
+                                }
+                            }
+                            market_data_logger.info(json.dumps(exit_data))
+                            
+                            # Execute the exit trade
+                            exit_result = await strategy.execute_trade(
+                                symbol=pos_symbol,
+                                signal=-1 if position_size > 0 else 1,  # Opposite signal to close
+                                entry_price=df['close'].iloc[-1],
+                                shares=exit_quantity,
+                                stop_loss=None,  # No stop loss needed for exit
+                                target=None     # No target needed for exit
+                            )
+                            
+                            # Log exit result
+                            exit_result_data = {
+                                'timestamp': current_time.isoformat(),
+                                'symbol': pos_symbol,
+                                'action': 'position_exit_result',
+                                'exit_result': exit_result
+                            }
+                            market_data_logger.info(json.dumps(exit_result_data))
+                            
+                            if exit_result['status'] == 'success':
+                                pnl = position_size * (float(df['close'].iloc[-1]) - avg_cost)
+                                logger.info(f"Closed position {pos_symbol}: {exit_action} {exit_quantity} shares at ${df['close'].iloc[-1]:.2f}, PnL: ${pnl:.2f}")
+                            else:
+                                logger.error(f"Failed to close position {pos_symbol}: {exit_result['message']}")
+                    
+        except Exception as e:
+            logger.error(f"Error checking existing positions: {e}")
+        
+        # STEP 2: Log data status for each symbol  
         for symbol in symbols:
-            data_len = len(data_dict[symbol])
+            symbol_upper = symbol.upper()
+            data_len = len(data_dict.get(symbol_upper, pd.DataFrame()))
             logger.debug(f"Data status for {symbol}: {data_len} bars")
             if data_len < 5:
                 logger.debug(f"Waiting for more data for {symbol} (need at least 5 bars)")
         
-        # Generate signals and execute trades for each symbol with sufficient data
+        # STEP 3: Generate entry signals and execute trades for each symbol with sufficient data
         signals = []
         for symbol in symbols:
-            if len(data_dict[symbol]) >= 5:
-                df = strategy.calculate_indicators(data_dict[symbol].copy())
+            symbol_upper = symbol.upper()
+            if symbol_upper in data_dict and len(data_dict[symbol_upper]) >= 2:  # Further reduced from 3 to 2 for aggressive testing
+                df = strategy.calculate_indicators(data_dict[symbol_upper].copy())
                 signal = await strategy.generate_realtime_signals(df)
                 
                 # Log signal generation with market context
@@ -338,27 +471,20 @@ async def main():
         if args.watch:
             # Real-time watching mode for multiple stocks
             logger.info(f"Starting real-time watch for {args.symbols} with check interval {args.check_interval} seconds")
-            if args.strategy not in ['groq', 'groq_bos']:
-                logger.error(f"Real-time watching not supported for strategy: {args.strategy}")
+            if args.strategy != 'groq':
+                logger.error(f"Real-time watching only supported for groq strategy, not: {args.strategy}")
                 return
                 
-            # Initialize strategy
-            if args.strategy == 'groq':
-                strategy = GroqRecommendationsStrategy(
-                    risk_per_trade=args.risk_per_trade,
-                    max_duration_hours=args.max_duration,
-                    paper_trading=paper_mode,
-                    stop_loss_pct=args.stop_loss,
-                    target_pct=args.target,
-                    bar_size=args.bar_size,
-                    duration=args.duration
-                )
-            elif args.strategy == 'groq_bos':
-                strategy = GroqBreakOfStructureStrategy(
-                    risk_per_trade=args.risk_per_trade,
-                    max_duration_hours=args.max_duration,
-                    paper_trading=paper_mode
-                )
+            # Initialize GroqRecommendationsStrategy
+            strategy = GroqRecommendationsStrategy(
+                risk_per_trade=args.risk_per_trade,
+                max_duration_hours=args.max_duration,
+                paper_trading=paper_mode,
+                stop_loss_pct=args.stop_loss,
+                target_pct=args.target,
+                bar_size=args.bar_size,
+                duration=args.duration
+            )
             strategy.set_ib_client(connection)
             
             await watch_mode(args.symbols, strategy, connection, args.check_interval)
@@ -426,16 +552,6 @@ async def main():
                 strategy = SupplyDemandSurgeStrategy()
             elif args.strategy == 'groq':
                 strategy = GroqRecommendationsStrategy(
-                    risk_per_trade=args.risk_per_trade,
-                    max_duration_hours=args.max_duration,
-                    paper_trading=not args.backtest_only,
-                    stop_loss_pct=args.stop_loss,
-                    target_pct=args.target
-                )
-                if not args.backtest_only and paper_mode:
-                    strategy.set_ib_client(connection)
-            elif args.strategy == 'groq_bos':
-                strategy = GroqBreakOfStructureStrategy(
                     risk_per_trade=args.risk_per_trade,
                     max_duration_hours=args.max_duration,
                     paper_trading=not args.backtest_only,

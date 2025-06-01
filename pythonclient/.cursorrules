@@ -1,0 +1,277 @@
+# Cursor Rules for Trading System Project
+
+# Python Code Style
+style:
+  # General Python style rules
+  python:
+    max_line_length: 100
+    indent_size: 4
+    use_spaces: true
+    quote_style: double
+    docstring_style: google
+    class_docstring: required
+    function_docstring: required
+    type_hints: required
+    imports:
+      order:
+        - standard_library
+        - third_party
+        - local
+      group_by_package: true
+      sort_within_groups: true
+
+# Project Structure
+structure:
+  src:
+    strategies:
+      required_files:
+        - __init__.py
+        - base.py
+      naming:
+        pattern: "*_strategy.py"
+        example: "groq_recommendations_strategy.py"
+    ibkr:
+      required_files:
+        - __init__.py
+        - connection.py
+    utils:
+      required_files:
+        - __init__.py
+        - data_loader.py
+        - logger.py
+
+# Code Quality Rules
+quality:
+  # Trading Strategy Rules
+  strategy:
+    required_methods:
+      - __init__
+      - calculate_indicators
+      - generate_signals
+      - execute_trade
+      - backtest
+    required_attributes:
+      - name
+      - risk_per_trade
+      - stop_loss_pct
+      - target_pct
+    error_handling:
+      - all trading operations must be wrapped in try-except
+      - log all errors with appropriate severity
+    logging:
+      - use logger instead of print
+      - log all trade executions
+      - log all signal generations
+      - log all errors with stack traces
+
+  # IBKR Connection Rules
+  ibkr_connection:
+    required_methods:
+      - connect
+      - disconnect
+      - place_order
+      - cancel_order
+      - get_order_status
+    error_handling:
+      - handle connection failures
+      - handle order placement failures
+      - implement reconnection logic
+    logging:
+      - log all connection events
+      - log all order operations
+      - log all errors with stack traces
+
+# Testing Requirements
+testing:
+  required:
+    - unit tests for all strategy methods
+    - integration tests for IBKR connection
+    - backtest validation tests
+  coverage:
+    minimum: 80%
+    critical_paths: 90%
+
+# Documentation Requirements
+documentation:
+  required:
+    - README.md with setup instructions
+    - API documentation for all public methods
+    - trading strategy documentation
+    - configuration guide
+  format:
+    - use Google style docstrings
+    - include type hints
+    - document all parameters and return values
+    - include usage examples
+
+# Security Rules
+security:
+  credentials:
+    - never commit API keys
+    - use environment variables
+    - encrypt sensitive data
+  trading:
+    - implement paper trading mode
+    - add safety checks for order sizes
+    - validate all inputs
+    - implement circuit breakers
+
+# Performance Requirements
+performance:
+  realtime:
+    - maximum signal generation latency: 100ms
+    - maximum order execution latency: 500ms
+  backtest:
+    - maximum memory usage: 1GB
+    - maximum processing time: 5 minutes per symbol
+
+# Version Control
+version_control:
+  commit:
+    message_format: "type(scope): description"
+    types:
+      - feat
+      - fix
+      - docs
+      - style
+      - refactor
+      - test
+      - chore
+  branch:
+    naming: "type/description"
+    types:
+      - feature
+      - bugfix
+      - hotfix
+      - release
+
+# Dependencies
+dependencies:
+  required:
+    - ib_insync
+    - pandas
+    - numpy
+    - chromadb
+    - pytz
+  version_control:
+    - pin all versions
+    - use requirements.txt
+    - document all dependencies
+
+# Code Review Guidelines
+code_review:
+  required:
+    - peer review for all trading logic
+    - security review for all IBKR interactions
+    - performance review for realtime operations
+  checklist:
+    - error handling
+    - logging
+    - documentation
+    - test coverage
+    - security
+    - performance
+
+# Project-Specific Rules
+project:
+  # Strategy Consistency Rules
+  strategy_consistency:
+    groq_recommendations:
+      core_principle: "Maintain identical entry/exit logic across all modes"
+      modes:
+        - backtest
+        - watch
+        - realtime
+      rules:
+        - "All entry/exit logic must be implemented in shared methods"
+        - "No mode-specific entry/exit logic allowed"
+        - "Changes to entry/exit logic must be applied to all modes simultaneously"
+        - "Signal generation must use identical parameters across all modes"
+        - "Risk management rules must be identical across all modes"
+      shared_methods:
+        - calculate_indicators
+        - identify_zones
+        - generate_signals
+        - generate_realtime_signals
+        - generate_exit_signals
+      validation:
+        - "Backtest results must be reproducible in watch mode"
+        - "Watch mode signals must match backtest signals for same data"
+        - "Realtime signals must follow same logic as backtest/watch"
+
+  # Change Management Rules
+  change_management:
+    principles:
+      - "Make incremental changes only"
+      - "No major strategy logic changes"
+      - "Focus changes on groq_recommendations_strategy.py"
+      - "Maintain backward compatibility"
+    process:
+      steps:
+        1: "Document current behavior before changes"
+        2: "Make minimal necessary changes"
+        3: "Test changes in all modes"
+        4: "Verify consistency across modes"
+        5: "Update documentation"
+      validation:
+        - "Run backtest before and after changes"
+        - "Compare watch mode behavior before and after"
+        - "Verify realtime behavior matches"
+      restrictions:
+        - "No changes to core entry/exit logic without full review"
+        - "No changes to risk management parameters without approval"
+        - "No changes to signal generation without testing all modes"
+
+  # Mode-Specific Rules
+  mode_rules:
+    backtest:
+      - "Must use same indicators as watch/realtime"
+      - "Must validate against historical data"
+      - "Must log all signals for comparison"
+    watch:
+      - "Must use identical signal generation as backtest"
+      - "Must log all signals for validation"
+      - "Must compare signals with backtest results"
+    realtime:
+      - "Must use identical signal generation as backtest/watch"
+      - "Must implement proper error handling"
+      - "Must log all operations for audit"
+
+  # Testing Requirements
+  testing_requirements:
+    before_deploy:
+      - "Run full backtest suite"
+      - "Verify watch mode signals"
+      - "Test realtime signal generation"
+      - "Validate all modes produce consistent results"
+    validation:
+      - "Compare signals across all modes"
+      - "Verify risk management is identical"
+      - "Check logging is consistent"
+      - "Validate error handling"
+
+  # Documentation Requirements
+  documentation_requirements:
+    changes:
+      - "Document all changes to entry/exit logic"
+      - "Update mode-specific documentation"
+      - "Maintain change log"
+      - "Document validation results"
+    validation:
+      - "Document backtest results"
+      - "Document watch mode behavior"
+      - "Document realtime performance"
+      - "Maintain comparison logs"
+
+  # Monitoring Requirements
+  monitoring:
+    required_metrics:
+      - "Signal consistency across modes"
+      - "Execution latency in realtime"
+      - "Error rates in each mode"
+      - "Performance comparison across modes"
+    logging:
+      - "Log all signals in all modes"
+      - "Log all trades in all modes"
+      - "Log all errors with stack traces"
+      - "Maintain audit trail of changes" 

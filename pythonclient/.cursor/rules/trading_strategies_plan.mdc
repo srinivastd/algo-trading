@@ -1,0 +1,39 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Rule: Trading Strategy - Phased Configuration
+
+## Summary
+Defines a multi-phase configuration plan for evolving a trading strategy over time to improve precision and performance.
+
+---
+
+## PhasedStrategyPlan
+
+```yaml
+phases:
+  - name: Phase 1 - Short-Term
+    lookback: 3
+    adx: 10
+    time_window: "18h"
+    volume: "15%"
+    trend_check: false
+    objective: "Test initial strategy parameters and settings in watch mode for baseline performance evaluation."
+
+  - name: Phase 2 - Mid-Term
+    lookback: 4
+    adx: 15
+    time_window: "12h"
+    volume: "10%"
+    trend_weight: 50%
+    objective: "Evaluate signal quality with adjusted parameters and partial trend consideration."
+
+  - name: Phase 3 - Long-Term
+    lookback: 5
+    adx: 20
+    time_window: "12-16h"
+    volume: "10-15%"
+    trend_weight: 100%
+    objective: "Achieve a target precision of 1.4 or higher through optimal configuration."

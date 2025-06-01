@@ -1,0 +1,143 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Code Review Guidelines
+Rule Type: Always
+
+## Review Requirements
+### Required Reviews
+- Peer review for all trading logic
+- Security review for all IBKR interactions
+- Performance review for realtime operations
+- Strategy logic review
+- Error handling review
+
+### Review Checklist
+- Error handling
+- Logging
+- Documentation
+- Test coverage
+- Security
+- Performance
+
+## Review Process
+### Pre-Review
+- Self-review code
+- Run tests
+- Update documentation
+- Check formatting
+- Verify requirements
+
+### Review Steps
+1. Code quality review
+2. Functionality review
+3. Security review
+4. Performance review
+5. Documentation review
+
+## Review Focus
+### Trading Logic
+- Signal generation
+- Entry/exit logic
+- Risk management
+- Position sizing
+- Error handling
+
+### System Logic
+- Connection management
+- Data processing
+- Order management
+- Error recovery
+- Performance optimization
+
+## Review Criteria
+### Code Quality
+- Code organization
+- Naming conventions
+- Documentation
+- Error handling
+- Logging
+
+### Functionality
+- Business logic
+- Trading rules
+- Risk management
+- Performance
+- Security
+
+## Documentation
+### Review Documentation
+- Code comments
+- Function documentation
+- Class documentation
+- Usage examples
+- Change documentation
+
+### Review Process
+- Document review comments
+- Track review status
+- Update documentation
+- Maintain review history
+- Follow up on changes
+
+## Testing
+### Review Tests
+- Unit tests
+- Integration tests
+- Performance tests
+- Security tests
+- Edge cases
+
+### Test Coverage
+- Code coverage
+- Critical paths
+- Error conditions
+- Performance scenarios
+- Security scenarios
+
+## Security
+### Security Review
+- Input validation
+- Error handling
+- Access control
+- Data protection
+- Secure coding
+
+### Compliance
+- Trading regulations
+- Security standards
+- Best practices
+- Documentation
+- Audit trails
+
+## Performance
+### Performance Review
+- Algorithm efficiency
+- Resource usage
+- Response times
+- Scalability
+- Optimization
+
+### Monitoring
+- Performance metrics
+- Resource usage
+- Error rates
+- Success rates
+- System health
+
+## Follow-up
+### Post-Review
+- Address comments
+- Update code
+- Update tests
+- Update documentation
+- Verify changes
+
+### Verification
+- Run tests
+- Check performance
+- Verify security
+- Update documentation
+- Final review

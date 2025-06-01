@@ -1,0 +1,93 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Code Quality Rules
+Rule Type: Always
+
+## Trading Strategy Requirements
+### Required Methods
+- `__init__`: Strategy initialization
+- `calculate_indicators`: Technical indicator calculations
+- `generate_signals`: Trading signal generation
+- `execute_trade`: Trade execution
+- `backtest`: Strategy backtesting
+
+### Required Attributes
+- `name`: Strategy identifier
+- `risk_per_trade`: Maximum risk per trade
+- `stop_loss_pct`: Stop loss percentage
+- `target_pct`: Target profit percentage
+
+### Error Handling
+- Wrap all trading operations in try-except
+- Log all errors with appropriate severity
+- Implement proper error recovery
+- Handle market data errors
+- Manage connection failures
+
+### Logging
+- Use logger instead of print
+- Log all trade executions
+- Log all signal generations
+- Log all errors with stack traces
+- Include context in log messages
+
+## IBKR Connection Requirements
+### Required Methods
+- `connect`: Establish connection
+- `disconnect`: Close connection
+- `place_order`: Submit trade orders
+- `cancel_order`: Cancel pending orders
+- `get_order_status`: Check order status
+
+### Error Handling
+- Handle connection failures
+- Handle order placement failures
+- Implement reconnection logic
+- Manage session timeouts
+- Handle market data errors
+
+### Logging
+- Log all connection events
+- Log all order operations
+- Log all errors with stack traces
+- Include order details in logs
+- Track connection state
+
+## General Code Quality
+### Code Organization
+- Follow single responsibility principle
+- Keep methods focused and small
+- Use meaningful variable names
+- Document complex logic
+- Maintain clean code structure
+
+### Performance
+- Optimize critical paths
+- Minimize memory usage
+- Reduce network calls
+- Cache frequently used data
+- Profile performance regularly
+
+### Security
+- Validate all inputs
+- Sanitize user data
+- Protect sensitive information
+- Implement proper authentication
+- Follow security best practices
+
+### Testing
+- Write unit tests
+- Include integration tests
+- Test error conditions
+- Validate edge cases
+- Maintain test coverage
+
+### Documentation
+- Document public APIs
+- Include usage examples
+- Document error handling
+- Maintain changelog
+- Update documentation with changes

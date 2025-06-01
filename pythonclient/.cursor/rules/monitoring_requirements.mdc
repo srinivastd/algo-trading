@@ -1,0 +1,157 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Monitoring Requirements
+Rule Type: Prompt
+
+## System Monitoring
+### Performance Metrics
+- CPU usage
+- Memory usage
+- Disk I/O
+- Network usage
+- Response times
+
+### System Health
+- System uptime
+- Error rates
+- Resource usage
+- Connection status
+- Service health
+
+## Trading Monitoring
+### Signal Monitoring
+- Signal generation
+- Signal accuracy
+- Signal timing
+- Signal validation
+- Signal performance
+
+### Execution Monitoring
+- Order execution
+- Execution quality
+- Execution timing
+- Error rates
+- Success rates
+
+## Risk Monitoring
+### Position Monitoring
+- Position sizes
+- Exposure levels
+- Risk metrics
+- Stop losses
+- Profit targets
+
+### Risk Metrics
+- Drawdown
+- Sharpe ratio
+- Win rate
+- Risk/reward
+- Volatility
+
+## Data Monitoring
+### Market Data
+- Data quality
+- Data latency
+- Data gaps
+- Data validation
+- Data storage
+
+### Trade Data
+- Trade execution
+- Trade quality
+- Trade timing
+- Trade validation
+- Trade storage
+
+## Error Monitoring
+### System Errors
+- Error types
+- Error rates
+- Error impact
+- Error recovery
+- Error prevention
+
+### Trading Errors
+- Execution errors
+- Signal errors
+- Data errors
+- Connection errors
+- Risk errors
+
+## Performance Monitoring
+### Trading Performance
+- Strategy performance
+- Execution performance
+- Risk performance
+- Cost performance
+- Overall performance
+
+### System Performance
+- Response times
+- Resource usage
+- Error rates
+- Success rates
+- System health
+
+## Alerting
+### System Alerts
+- Resource alerts
+- Error alerts
+- Performance alerts
+- Health alerts
+- Security alerts
+
+### Trading Alerts
+- Signal alerts
+- Execution alerts
+- Risk alerts
+- Performance alerts
+- Error alerts
+
+## Logging
+### System Logs
+- System events
+- Error logs
+- Performance logs
+- Security logs
+- Audit logs
+
+### Trading Logs
+- Signal logs
+- Execution logs
+- Risk logs
+- Performance logs
+- Error logs
+
+## Reporting
+### System Reports
+- Performance reports
+- Error reports
+- Health reports
+- Security reports
+- Audit reports
+
+### Trading Reports
+- Strategy reports
+- Execution reports
+- Risk reports
+- Performance reports
+- Error reports
+
+## Maintenance
+### Regular Maintenance
+- Log rotation
+- Data cleanup
+- Performance tuning
+- Security updates
+- System updates
+
+### Monitoring Updates
+- Update metrics
+- Update alerts
+- Update reports
+- Update documentation
+- Review effectiveness

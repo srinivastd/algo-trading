@@ -1,0 +1,127 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Security Requirements
+Rule Type: Always
+
+## Credential Management
+### API Keys
+- Never commit API keys
+- Use environment variables
+- Encrypt sensitive data
+- Rotate keys regularly
+- Monitor key usage
+
+### Access Control
+- Implement role-based access
+- Use strong authentication
+- Enforce password policies
+- Monitor access attempts
+- Log security events
+
+## Trading Security
+### Paper Trading
+- Implement paper trading mode
+- Validate paper trading logic
+- Monitor paper trading limits
+- Track paper trading performance
+- Document paper trading rules
+
+### Order Safety
+- Add safety checks for order sizes
+- Validate all inputs
+- Implement circuit breakers
+- Monitor order flow
+- Track execution quality
+
+## Data Security
+### Market Data
+- Validate market data
+- Monitor data quality
+- Handle data gaps
+- Secure data storage
+- Backup critical data
+
+### Trade Data
+- Encrypt trade data
+- Secure trade storage
+- Monitor trade flow
+- Track trade history
+- Backup trade records
+
+## System Security
+### Network Security
+- Use secure connections
+- Implement firewalls
+- Monitor network traffic
+- Log security events
+- Regular security audits
+
+### Application Security
+- Validate all inputs
+- Sanitize user data
+- Prevent SQL injection
+- Handle errors securely
+- Regular security updates
+
+## Risk Management
+### Trading Limits
+- Set position limits
+- Implement loss limits
+- Monitor exposure
+- Track risk metrics
+- Enforce risk rules
+
+### System Limits
+- Set resource limits
+- Monitor system usage
+- Implement timeouts
+- Handle overloads
+- Track performance
+
+## Monitoring
+### Security Monitoring
+- Monitor access attempts
+- Track security events
+- Log security incidents
+- Alert on suspicious activity
+- Regular security reviews
+
+### Trading Monitoring
+- Monitor order flow
+- Track execution quality
+- Monitor risk metrics
+- Alert on anomalies
+- Regular performance reviews
+
+## Compliance
+### Regulatory Requirements
+- Follow trading regulations
+- Maintain audit trails
+- Document compliance
+- Regular compliance reviews
+- Update with regulations
+
+### Internal Policies
+- Follow security policies
+- Document procedures
+- Regular policy reviews
+- Update policies
+- Train team members
+
+## Incident Response
+### Security Incidents
+- Document incident response
+- Define escalation paths
+- Regular incident drills
+- Update procedures
+- Learn from incidents
+
+### Trading Incidents
+- Document trading incidents
+- Define recovery procedures
+- Regular recovery drills
+- Update procedures
+- Learn from incidents

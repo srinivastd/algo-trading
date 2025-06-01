@@ -1,0 +1,112 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Dependencies
+Rule Type: Always
+
+## Required Packages
+### Core Dependencies
+- ib_insync: IBKR API integration
+- pandas: Data manipulation
+- numpy: Numerical computations
+- chromadb: Vector database
+- pytz: Timezone handling
+
+### Version Control
+- Pin all versions
+- Use requirements.txt
+- Document all dependencies
+- Regular updates
+- Security patches
+
+## Package Management
+### Requirements
+- requirements.txt for production
+- requirements-dev.txt for development
+- requirements-test.txt for testing
+- requirements-docs.txt for documentation
+- requirements-lint.txt for linting
+
+### Version Pinning
+- Pin major versions
+- Pin minor versions
+- Document version constraints
+- Regular version updates
+- Security updates
+
+## Dependency Management
+### Installation
+- Use virtual environment
+- Install from requirements
+- Verify installations
+- Check compatibility
+- Update regularly
+
+### Updates
+- Regular dependency updates
+- Security patch updates
+- Version compatibility checks
+- Update documentation
+- Test after updates
+
+## Security
+### Package Security
+- Regular security audits
+- Update vulnerable packages
+- Verify package sources
+- Check package integrity
+- Monitor security alerts
+
+### Access Control
+- Control package access
+- Monitor package usage
+- Track package versions
+- Document access
+- Regular reviews
+
+## Documentation
+### Package Documentation
+- Document all dependencies
+- Version requirements
+- Installation instructions
+- Usage examples
+- Update procedures
+
+### Maintenance
+- Regular documentation updates
+- Version tracking
+- Change logging
+- Usage tracking
+- Performance monitoring
+
+## Testing
+### Dependency Testing
+- Test with pinned versions
+- Test with latest versions
+- Compatibility testing
+- Performance testing
+- Security testing
+
+### Integration Testing
+- Test package integration
+- Verify functionality
+- Check performance
+- Validate security
+- Monitor stability
+
+## Monitoring
+### Usage Monitoring
+- Track package usage
+- Monitor performance
+- Check resource usage
+- Track errors
+- Monitor updates
+
+### Health Checks
+- Regular health checks
+- Version compatibility
+- Security status
+- Performance metrics
+- Resource usage

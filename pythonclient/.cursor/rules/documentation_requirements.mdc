@@ -1,0 +1,112 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Documentation Requirements
+Rule Type: Always
+
+## Required Documentation
+### Project Documentation
+- README.md with setup instructions
+- API documentation for all public methods
+- Trading strategy documentation
+- Configuration guide
+- Deployment guide
+
+### Code Documentation
+- Google style docstrings
+- Type hints for all functions
+- Parameter documentation
+- Return value documentation
+- Usage examples
+
+## Documentation Format
+### Docstring Requirements
+- Use Google style docstrings
+- Include type hints
+- Document all parameters
+- Document return values
+- Include usage examples
+
+### Code Comments
+- Explain complex logic
+- Document assumptions
+- Note limitations
+- Include TODOs
+- Reference related code
+
+## Strategy Documentation
+### Required Sections
+- Strategy overview
+- Entry/exit logic
+- Risk management
+- Performance metrics
+- Usage examples
+
+### Technical Details
+- Indicator calculations
+- Signal generation
+- Position sizing
+- Error handling
+- Performance considerations
+
+## API Documentation
+### Method Documentation
+- Purpose and usage
+- Parameters and types
+- Return values
+- Exceptions
+- Examples
+
+### Class Documentation
+- Class purpose
+- Attributes
+- Methods
+- Usage examples
+- Inheritance
+
+## Configuration Documentation
+### Required Sections
+- Environment setup
+- Configuration parameters
+- Trading parameters
+- Risk parameters
+- System settings
+
+### Usage Guide
+- Installation steps
+- Configuration steps
+- Running instructions
+- Troubleshooting
+- Best practices
+
+## Maintenance Requirements
+### Documentation Updates
+- Update with code changes
+- Review regularly
+- Version control
+- Change tracking
+- Quality checks
+
+### Documentation Review
+- Technical accuracy
+- Completeness
+- Clarity
+- Examples
+- Formatting
+
+## Version Control
+### Documentation Versioning
+- Match code versions
+- Track changes
+- Maintain history
+- Update changelog
+- Tag releases
+
+### Change Management
+- Document all changes
+- Update affected docs
+- Review changes
+- Track updates
+- Maintain consistency

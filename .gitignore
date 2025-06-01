@@ -65,4 +65,6 @@ pythonclient/ibkr_env/lib/python3.12/site-packages/ibapi/utils.py
 pythonclient/ibkr_env/lib/python3.12/site-packages/ibapi/wrapper.py
 pythonclient/src/PatternWatcher.py
 pythonclient/src/ibkr/pattern_watcher.py
+pythonclient/chroma_db/dc9a242c-a3e5-4f67-9f89-4a45098fa9cf/length.bin
+.DS_Store
 pythonclient/historical_data/

@@ -1,0 +1,112 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Performance Requirements
+Rule Type: Always
+
+## Realtime Performance
+### Latency Requirements
+- Signal generation: < 100ms
+- Order execution: < 500ms
+- Market data processing: < 50ms
+- System response: < 200ms
+- Error handling: < 100ms
+
+### Resource Usage
+- Memory usage: < 1GB
+- CPU usage: < 50%
+- Network bandwidth: < 1MB/s
+- Disk I/O: < 100MB/s
+- Connection count: < 100
+
+## Backtest Performance
+### Processing Requirements
+- Maximum memory usage: 1GB
+- Maximum processing time: 5 minutes per symbol
+- Maximum data size: 1GB per symbol
+- Maximum trade count: 1000 per run
+- Maximum symbol count: 100 per run
+
+### Resource Limits
+- CPU usage: < 80%
+- Memory usage: < 2GB
+- Disk usage: < 10GB
+- Network usage: < 100MB
+- File handles: < 1000
+
+## System Performance
+### Scalability
+- Support multiple symbols
+- Handle concurrent trades
+- Process multiple strategies
+- Manage multiple connections
+- Scale with data volume
+
+### Reliability
+- 99.9% uptime
+- < 1% error rate
+- < 0.1% data loss
+- < 1s recovery time
+- < 0.1% order failure
+
+## Monitoring
+### Performance Metrics
+- Response times
+- Resource usage
+- Error rates
+- Success rates
+- System health
+
+### Alerts
+- High latency alerts
+- Resource usage alerts
+- Error rate alerts
+- System health alerts
+- Performance degradation alerts
+
+## Optimization
+### Code Optimization
+- Profile critical paths
+- Optimize algorithms
+- Reduce memory usage
+- Minimize network calls
+- Cache frequently used data
+
+### System Optimization
+- Optimize database queries
+- Reduce disk I/O
+- Minimize network traffic
+- Efficient resource usage
+- Regular performance tuning
+
+## Testing
+### Performance Testing
+- Load testing
+- Stress testing
+- Endurance testing
+- Scalability testing
+- Recovery testing
+
+### Benchmarking
+- Regular benchmarks
+- Performance baselines
+- Trend analysis
+- Comparative testing
+- Optimization validation
+
+## Maintenance
+### Regular Maintenance
+- Performance monitoring
+- Resource cleanup
+- Cache management
+- Log rotation
+- System updates
+
+### Optimization
+- Regular profiling
+- Code optimization
+- System tuning
+- Resource management
+- Performance improvements

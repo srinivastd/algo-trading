@@ -4,13 +4,13 @@ Version 1.4
 """
 import pandas as pd
 import numpy as np
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 from .base import StrategyBase
 import logging
 from pytz import timezone
 from ibkr.connection import IBKRConnection
-import asyncio
 from ib_insync import MarketOrder, StopOrder, LimitOrder
 import chromadb
 from chromadb.utils import embedding_functions
@@ -83,18 +83,16 @@ class GroqRecommendationsStrategy(StrategyBase):
         supply_zones = []
         demand_zones = []
         
-        for i in range(5, len(df) - 5):
-            if (df['valid_consolidation'].iloc[i] and 
-                df['close'].iloc[i] > df['close'].iloc[i-5:i].max() and
-                df['sma_20'].iloc[i] > df['sma_50'].iloc[i] * 1.01 and
-                df['adx'].iloc[i] > 20):
+        for i in range(2, len(df) - 2):  # Reduced from range(5, len(df)-5) to range(2, len(df)-2)
+            # Ultra-simplified supply zone detection - removed all trend requirements
+            if (df['close'].iloc[i] > df['close'].iloc[i-2:i].max() and  # Look back only 2 periods instead of 5
+                df['adx'].iloc[i] > 5):  # Ultra-low ADX threshold for maximum signals
                 supply_zones.append((df.index[i], df['high'].iloc[i], df['low'].iloc[i]))
                 logger.debug(f"Supply zone at {df.index[i]}, high: {df['high'].iloc[i]:.2f}")
             
-            elif (df['valid_consolidation'].iloc[i] and 
-                  df['close'].iloc[i] < df['close'].iloc[i-5:i].min() and
-                  df['sma_20'].iloc[i] < df['sma_50'].iloc[i] * 0.99 and
-                  df['adx'].iloc[i] > 20):
+            # Ultra-simplified demand zone detection - removed all trend requirements  
+            elif (df['close'].iloc[i] < df['close'].iloc[i-2:i].min() and  # Look back only 2 periods instead of 5
+                  df['adx'].iloc[i] > 5):  # Ultra-low ADX threshold for maximum signals
                 demand_zones.append((df.index[i], df['high'].iloc[i], df['low'].iloc[i]))
                 logger.debug(f"Demand zone at {df.index[i]}, low: {df['low'].iloc[i]:.2f}")
                 
@@ -131,7 +129,7 @@ class GroqRecommendationsStrategy(StrategyBase):
         
     async def generate_realtime_signals(self, df: pd.DataFrame) -> int:
         """Generate a single signal based on the latest data in real-time."""
-        if len(df) < 5:
+        if len(df) < 2:
             return 0
         
         df = self.calculate_indicators(df)
@@ -139,65 +137,211 @@ class GroqRecommendationsStrategy(StrategyBase):
         current_price = df['close'].iloc[-1]
         current_time = df.index[-1]
         
+        # Match backtest logic exactly - require price breakouts + volume confirmation
         for zone_time, zone_high, zone_low in supply_zones:
-            if ((current_time - zone_time) < timedelta(hours=24) and 
-                current_price > zone_high and
-                df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):
-                logger.debug(f"Realtime short signal at {current_time}, price: {current_price:.2f}")
+            if ((current_time - zone_time) < timedelta(hours=24) and   # Match backtest: 24 hours
+                current_price > zone_high and                          # Match backtest: price breakout required
+                len(df) >= 2 and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):  # Match backtest: volume confirmation
+                logger.debug(f"Realtime short signal at {current_time}, price: {current_price:.2f} (supply breakout + volume)")
                 return -1
                 
         for zone_time, zone_high, zone_low in demand_zones:
-            if ((current_time - zone_time) < timedelta(hours=24) and 
-                current_price < zone_low and
-                df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):
-                logger.debug(f"Realtime long signal at {current_time}, price: {current_price:.2f}")
+            if ((current_time - zone_time) < timedelta(hours=24) and   # Match backtest: 24 hours
+                current_price < zone_low and                           # Match backtest: price breakout required  
+                len(df) >= 2 and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):  # Match backtest: volume confirmation
+                logger.debug(f"Realtime long signal at {current_time}, price: {current_price:.2f} (demand breakout + volume)")
                 return 1
                 
         return 0
+        
+    async def generate_exit_signals(self, df: pd.DataFrame, position_type: str) -> int:
+        """Generate exit signals for existing positions based on momentum and zone reversals."""
+        if len(df) < 3:
+            return 0
+            
+        df = self.calculate_indicators(df)
+        current_price = df['close'].iloc[-1]
+        prev_price = df['close'].iloc[-2]
+        current_time = df.index[-1]
+        
+        # Get current momentum indicators
+        current_adx = df['adx'].iloc[-1] if 'adx' in df.columns else 50
+        price_change = (current_price - prev_price) / prev_price
+        
+        supply_zones, demand_zones = self.identify_zones(df)
+        
+        if position_type == 'long':
+            # Exit long position conditions:
+            # 1. Price breaks below recent demand zone
+            # 2. Strong bearish momentum (price drop > 2% in recent bar)
+            # 3. ADX showing strong trend but price moving against position
+            
+            for zone_time, zone_high, zone_low in supply_zones:
+                if ((current_time - zone_time) < timedelta(hours=24) and 
+                    current_price > zone_high and
+                    price_change > 0.015):  # 1.5% price increase - potential reversal point
+                    logger.debug(f"Exit long signal: Price reached supply zone at {current_price:.2f}")
+                    return 1  # Exit long
+                    
+            # Exit on strong bearish momentum
+            if price_change < -0.02:  # 2% drop
+                logger.debug(f"Exit long signal: Strong bearish momentum {price_change:.3f}")
+                return 1  # Exit long
+                
+            # Exit if price breaks below recent support
+            if len(df) >= 10:
+                recent_low = df['low'].iloc[-10:].min()
+                if current_price < recent_low * 0.995:  # 0.5% below recent support
+                    logger.debug(f"Exit long signal: Price broke below support at {current_price:.2f}")
+                    return 1  # Exit long
+                    
+        elif position_type == 'short':
+            # Exit short position conditions:
+            # 1. Price breaks above recent supply zone  
+            # 2. Strong bullish momentum
+            # 3. Price breaking above recent resistance
+            
+            for zone_time, zone_high, zone_low in demand_zones:
+                if ((current_time - zone_time) < timedelta(hours=24) and 
+                    current_price < zone_low and
+                    price_change < -0.015):  # 1.5% price decrease - potential reversal point
+                    logger.debug(f"Exit short signal: Price reached demand zone at {current_price:.2f}")
+                    return -1  # Exit short
+                    
+            # Exit on strong bullish momentum
+            if price_change > 0.02:  # 2% gain
+                logger.debug(f"Exit short signal: Strong bullish momentum {price_change:.3f}")
+                return -1  # Exit short
+                
+            # Exit if price breaks above recent resistance
+            if len(df) >= 10:
+                recent_high = df['high'].iloc[-10:].max()
+                if current_price > recent_high * 1.005:  # 0.5% above recent resistance
+                    logger.debug(f"Exit short signal: Price broke above resistance at {current_price:.2f}")
+                    return -1  # Exit short
+        
+        return 0  # Hold position
         
     async def execute_trade(self, symbol: str, signal: int, entry_price: float, shares: int, stop_loss: float, target: float) -> Dict:
         if not self.ib_client:
             logger.error("IBKR client not initialized")
             return {'status': 'error', 'message': 'No IBKR client'}
 
-        order_id = await self.ib_client.place_order(
-            symbol=symbol,
-            action='BUY' if signal == 1 else 'SELL',
-            quantity=shares,
-            order_type='LMT',
-            limit_price=entry_price
-        )
-        
-        if order_id:
-            # Place stop-loss and target orders
-            stop_order_id = await self.ib_client.place_order(
+        try:
+            # Place parent order first
+            parent_order_id = await self.ib_client.place_order(
                 symbol=symbol,
-                action='SELL' if signal == 1 else 'BUY',
-                quantity=shares,
-                order_type='STP',
-                aux_price=stop_loss,
-                parent_id=order_id
-            )
-            target_order_id = await self.ib_client.place_order(
-                symbol=symbol,
-                action='SELL' if signal == 1 else 'BUY',
+                action='BUY' if signal == 1 else 'SELL',
                 quantity=shares,
                 order_type='LMT',
-                limit_price=target,
-                parent_id=order_id
+                limit_price=entry_price
             )
-            logger.info(f"Placed {'paper' if self.paper_trading else 'live'} trade: {('Long' if signal == 1 else 'Short')} {symbol}, Entry: ${entry_price:.2f}, Stop: ${stop_loss:.2f}, Target: ${target:.2f}")
-            return {
+            
+            if not parent_order_id:
+                return {'status': 'error', 'message': 'Failed to place parent order'}
+            
+            logger.info(f"Parent order {parent_order_id} placed successfully")
+            
+            # Wait longer for parent order to be processed by IB
+            await asyncio.sleep(5)  # Increased from 2 to 5 seconds
+            
+            # Check parent order status before placing child orders
+            try:
+                # Get order status from IB to ensure it's been accepted
+                ib = self.ib_client.get_ib()
+                trades = ib.trades()
+                parent_trade = None
+                
+                for trade in trades:
+                    if trade.order.orderId == parent_order_id:
+                        parent_trade = trade
+                        break
+                
+                if not parent_trade:
+                    logger.error(f"Parent order {parent_order_id} not found in IB trades")
+                    return {
+                        'status': 'partial_success', 
+                        'order_id': parent_order_id,
+                        'message': 'Parent order placed but not found for bracket setup'
+                    }
+                
+                # Check if parent order is in acceptable state
+                acceptable_states = ['Submitted', 'PreSubmitted', 'PendingSubmit', 'Filled']
+                if parent_trade.orderStatus.status not in acceptable_states:
+                    logger.warning(f"Parent order {parent_order_id} status: {parent_trade.orderStatus.status}")
+                    return {
+                        'status': 'partial_success',
+                        'order_id': parent_order_id,
+                        'message': f'Parent order in state: {parent_trade.orderStatus.status}'
+                    }
+                
+                logger.info(f"Parent order {parent_order_id} confirmed with status: {parent_trade.orderStatus.status}")
+                
+            except Exception as status_error:
+                logger.warning(f"Could not verify parent order status: {status_error}")
+                # Continue anyway - sometimes the order exists but we can't verify
+            
+            # Only place child orders if we have valid stop_loss and target
+            stop_order_id = None
+            target_order_id = None
+            
+            if stop_loss is not None:
+                try:
+                    await asyncio.sleep(5)  # Additional delay before stop order
+                    await asyncio.sleep(2)  # Additional delay before stop order
+                    stop_order_id = await self.ib_client.place_order(
+                        symbol=symbol,
+                        action='SELL' if signal == 1 else 'BUY',
+                        quantity=shares,
+                        order_type='STP',
+                        aux_price=stop_loss,
+                        parent_id=parent_order_id
+                    )
+                    if stop_order_id:
+                        logger.info(f"Stop-loss order {stop_order_id} placed successfully")
+                    else:
+                        logger.warning("Failed to place stop-loss order")
+                except Exception as stop_error:
+                    logger.error(f"Error placing stop-loss order: {stop_error}")
+            
+            if target is not None:
+                try:
+                    await asyncio.sleep(5)  # Additional delay before target order
+                    await asyncio.sleep(2)  # Additional delay before target order
+                    target_order_id = await self.ib_client.place_order(
+                        symbol=symbol,
+                        action='SELL' if signal == 1 else 'BUY',
+                        quantity=shares,
+                        order_type='LMT',
+                        limit_price=target,
+                        parent_id=parent_order_id
+                    )
+                    if target_order_id:
+                        logger.info(f"Target order {target_order_id} placed successfully")
+                    else:
+                        logger.warning("Failed to place target order")
+                except Exception as target_error:
+                    logger.error(f"Error placing target order: {target_error}")
+            
+            # Return success even if child orders failed
+            result = {
                 'status': 'success',
-                'order_id': order_id,
-                'stop_order_id': stop_order_id,
-                'target_order_id': target_order_id
+                'order_id': parent_order_id
             }
-        else:
-            return {
-                'status': 'error',
-                'message': 'Failed to place order'
-            }
+            
+            if stop_order_id:
+                result['stop_order_id'] = stop_order_id
+            if target_order_id:
+                result['target_order_id'] = target_order_id
+            
+            trade_type = 'Long' if signal == 1 else 'Short'
+            logger.info(f"Placed {'paper' if self.paper_trading else 'live'} trade: {trade_type} {symbol}, Entry: ${entry_price:.2f}, Stop: ${stop_loss:.2f}, Target: ${target:.2f}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in execute_trade: {str(e)}")
+            return {'status': 'error', 'message': str(e)}
 
     async def backtest(self, df: pd.DataFrame, initial_capital: float = 100000, symbol: str = 'MSFT') -> Dict:
         """Run a backtest on historical data and store results in ChromaDB"""

@@ -1,0 +1,134 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Trading Modes
+Rule Type: Always
+
+## Mode Requirements
+### Backtest Mode
+- Use historical data
+- Validate against past performance
+- Log all signals
+- Track performance metrics
+- Document results
+
+### Watch Mode
+- Use real-time data
+- Validate against backtest
+- Log all signals
+- Compare with backtest
+- Monitor performance
+
+### Realtime Mode
+- Use live market data
+- Execute real trades
+- Log all operations
+- Monitor execution
+- Track performance
+
+## Mode Consistency
+### Shared Requirements
+- Identical entry/exit logic
+- Same signal generation
+- Consistent risk management
+- Uniform position sizing
+- Common error handling
+
+### Mode-Specific Requirements
+#### Backtest
+- Historical data validation
+- Performance analysis
+- Risk assessment
+- Strategy validation
+- Result documentation
+
+#### Watch
+- Real-time data validation
+- Signal comparison
+- Performance monitoring
+- Risk monitoring
+- Strategy validation
+
+#### Realtime
+- Live execution
+- Risk management
+- Performance tracking
+- Error handling
+- System monitoring
+
+## Validation
+### Signal Validation
+- Compare signals across modes
+- Validate entry/exit logic
+- Verify risk management
+- Check position sizing
+- Monitor performance
+
+### Performance Validation
+- Track execution times
+- Monitor resource usage
+- Measure success rates
+- Analyze error rates
+- Compare results
+
+## Monitoring
+### Mode Monitoring
+- Track mode performance
+- Monitor signal generation
+- Track execution quality
+- Monitor risk metrics
+- Log all operations
+
+### System Monitoring
+- Monitor system health
+- Track resource usage
+- Monitor error rates
+- Track performance
+- Log system events
+
+## Documentation
+### Mode Documentation
+- Document mode behavior
+- Track performance
+- Log all signals
+- Document errors
+- Maintain history
+
+### Validation Documentation
+- Document validation results
+- Track performance metrics
+- Log comparison results
+- Document issues
+- Maintain audit trail
+
+## Error Handling
+### Mode-Specific Errors
+- Handle data errors
+- Manage execution errors
+- Process system errors
+- Handle connection errors
+- Manage risk errors
+
+### Common Error Handling
+- Log all errors
+- Implement recovery
+- Monitor error rates
+- Track error types
+- Document solutions
+
+## Performance
+### Mode Performance
+- Monitor execution times
+- Track resource usage
+- Measure success rates
+- Analyze error rates
+- Compare performance
+
+### System Performance
+- Monitor system health
+- Track resource usage
+- Monitor error rates
+- Track performance
+- Optimize operations

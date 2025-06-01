@@ -10,10 +10,19 @@ logger = logging.getLogger(__name__)
 class GroqBreakOfStructureStrategy(StrategyBase):
     """Strategy based on supply/demand zones with break of structure, confirmation, and tight stop-loss"""
     
-    def __init__(self, risk_per_trade: float = 500, max_duration_hours: float = 12.0):
+    def __init__(self, risk_per_trade: float = 500, max_duration_hours: float = 12.0, paper_trading: bool = True,
+                 stop_loss_pct: float = 1.0, target_pct: float = 2.0):
         super().__init__("Groq Break of Structure Strategy")
         self.risk_per_trade = risk_per_trade
         self.max_duration_hours = max_duration_hours
+        self.paper_trading = paper_trading
+        self.stop_loss_pct = stop_loss_pct
+        self.target_pct = target_pct
+        self.ib_client = None
+        
+    def set_ib_client(self, ib_client):
+        """Set the IBKR client for trade execution"""
+        self.ib_client = ib_client
         
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df['range'] = df['high'] - df['low']
@@ -168,3 +177,143 @@ class GroqBreakOfStructureStrategy(StrategyBase):
             'total_trades': len(trades),
             'trades': trades
         }
+        
+    async def generate_realtime_signals(self, df: pd.DataFrame) -> int:
+        """Generate a single signal based on the latest data in real-time."""
+        if len(df) < 3:
+            return 0
+        
+        df = self.calculate_indicators(df)
+        supply_zones, demand_zones = self.identify_zones(df)
+        current_price = df['close'].iloc[-1]
+        current_time = df.index[-1]
+        prev_close = df['close'].iloc[-2]
+        
+        # Check for break of structure signals
+        for zone_time, zone_high, zone_low in supply_zones:
+            if ((current_time - zone_time) < timedelta(hours=24) and 
+                current_price > zone_high and
+                prev_close > zone_high and
+                df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):
+                logger.debug(f"Realtime short signal at {current_time}, price: {current_price:.2f}")
+                return -1
+                
+        for zone_time, zone_high, zone_low in demand_zones:
+            if ((current_time - zone_time) < timedelta(hours=24) and 
+                current_price < zone_low and
+                prev_close < zone_low and
+                df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):
+                logger.debug(f"Realtime long signal at {current_time}, price: {current_price:.2f}")
+                return 1
+                
+        return 0
+        
+    async def generate_exit_signals(self, df: pd.DataFrame, position_type: str) -> int:
+        """Generate exit signals for existing positions based on break of structure reversals."""
+        if len(df) < 3:
+            return 0
+            
+        df = self.calculate_indicators(df)
+        current_price = df['close'].iloc[-1]
+        prev_price = df['close'].iloc[-2]
+        current_time = df.index[-1]
+        
+        price_change = (current_price - prev_price) / prev_price
+        supply_zones, demand_zones = self.identify_zones(df)
+        
+        if position_type == 'long':
+            # Exit long position conditions for break of structure strategy:
+            # 1. Price breaks back below demand zone that was just broken
+            # 2. Strong bearish momentum (>1.5% drop)
+            # 3. Volume confirmation of reversal
+            
+            for zone_time, zone_high, zone_low in demand_zones:
+                if ((current_time - zone_time) < timedelta(hours=12) and 
+                    current_price > zone_low and prev_price > zone_low and
+                    current_price < zone_high):  # Price pulled back into zone
+                    logger.debug(f"Exit long signal: Price pulled back into demand zone at {current_price:.2f}")
+                    return 1  # Exit long
+                    
+            # Exit on strong bearish momentum
+            if price_change < -0.015:  # 1.5% drop
+                logger.debug(f"Exit long signal: Strong bearish momentum {price_change:.3f}")
+                return 1  # Exit long
+                
+            # Exit if ADX shows weakening trend
+            if 'adx' in df.columns and len(df) >= 5:
+                recent_adx = df['adx'].iloc[-3:].mean()
+                if recent_adx < 20:  # Weak trend
+                    logger.debug(f"Exit long signal: Weakening trend ADX {recent_adx:.2f}")
+                    return 1  # Exit long
+                    
+        elif position_type == 'short':
+            # Exit short position conditions:
+            # 1. Price breaks back above supply zone that was just broken
+            # 2. Strong bullish momentum (>1.5% gain)
+            # 3. Volume confirmation of reversal
+            
+            for zone_time, zone_high, zone_low in supply_zones:
+                if ((current_time - zone_time) < timedelta(hours=12) and 
+                    current_price < zone_high and prev_price < zone_high and
+                    current_price > zone_low):  # Price pulled back into zone
+                    logger.debug(f"Exit short signal: Price pulled back into supply zone at {current_price:.2f}")
+                    return -1  # Exit short
+                    
+            # Exit on strong bullish momentum
+            if price_change > 0.015:  # 1.5% gain
+                logger.debug(f"Exit short signal: Strong bullish momentum {price_change:.3f}")
+                return -1  # Exit short
+                
+            # Exit if ADX shows weakening trend
+            if 'adx' in df.columns and len(df) >= 5:
+                recent_adx = df['adx'].iloc[-3:].mean()
+                if recent_adx < 20:  # Weak trend
+                    logger.debug(f"Exit short signal: Weakening trend ADX {recent_adx:.2f}")
+                    return -1  # Exit short
+        
+        return 0  # Hold position
+        
+    async def execute_trade(self, symbol: str, signal: int, entry_price: float, shares: int, stop_loss: float, target: float) -> Dict:
+        """Execute a trade through IBKR"""
+        if not self.ib_client:
+            logger.error("IBKR client not initialized")
+            return {'status': 'error', 'message': 'No IBKR client'}
+
+        order_id = await self.ib_client.place_order(
+            symbol=symbol,
+            action='BUY' if signal == 1 else 'SELL',
+            quantity=shares,
+            order_type='LMT',
+            limit_price=entry_price
+        )
+        
+        if order_id:
+            # Place stop-loss and target orders
+            stop_order_id = await self.ib_client.place_order(
+                symbol=symbol,
+                action='SELL' if signal == 1 else 'BUY',
+                quantity=shares,
+                order_type='STP',
+                aux_price=stop_loss,
+                parent_id=order_id
+            )
+            target_order_id = await self.ib_client.place_order(
+                symbol=symbol,
+                action='SELL' if signal == 1 else 'BUY',
+                quantity=shares,
+                order_type='LMT',
+                limit_price=target,
+                parent_id=order_id
+            )
+            logger.info(f"Placed {'paper' if self.paper_trading else 'live'} trade: {('Long' if signal == 1 else 'Short')} {symbol}, Entry: ${entry_price:.2f}, Stop: ${stop_loss:.2f}, Target: ${target:.2f}")
+            return {
+                'status': 'success',
+                'order_id': order_id,
+                'stop_order_id': stop_order_id,
+                'target_order_id': target_order_id
+            }
+        else:
+            return {
+                'status': 'error',
+                'message': 'Failed to place order'
+            }

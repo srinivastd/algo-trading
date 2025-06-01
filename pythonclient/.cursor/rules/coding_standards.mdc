@@ -1,0 +1,71 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Python Code Style
+Rule Type: Always
+
+## General Python Style Rules
+- Maximum line length: 100 characters
+- Indent size: 4 spaces
+- Use spaces, not tabs
+- Quote style: Double quotes
+- Docstring style: Google
+- Class docstrings: Required
+- Function docstrings: Required
+- Type hints: Required
+
+## Import Rules
+- Order imports in the following sequence:
+  1. Standard library imports
+  2. Third-party imports
+  3. Local application imports
+- Group imports by package
+- Sort imports within each group
+- Use absolute imports for local modules
+- Avoid wildcard imports (*)
+
+## Code Organization
+- Maximum function length: 50 lines
+- Maximum class length: 300 lines
+- Maximum file length: 1000 lines
+- Maximum cyclomatic complexity: 10 per function
+- Maximum number of arguments: 5 per function
+- Maximum number of return statements: 3 per function
+
+## Naming Conventions
+- Classes: PascalCase
+- Functions and variables: snake_case
+- Constants: UPPER_SNAKE_CASE
+- Private members: _prefix_snake_case
+- Protected members: _prefix_snake_case
+- Module names: lowercase_snake_case
+
+## Documentation
+- All public APIs must have docstrings
+- Docstrings must follow Google style
+- Include type hints for all function parameters and return values
+- Document all exceptions that may be raised
+- Include usage examples for complex functions
+
+## Code Comments
+- Use comments to explain why, not what
+- Keep comments up to date with code changes
+- Use TODO comments for future improvements
+- Document complex algorithms with clear explanations
+- Avoid commented-out code
+
+## Error Handling
+- Use specific exception types
+- Include meaningful error messages
+- Handle exceptions at appropriate levels
+- Clean up resources in finally blocks
+- Log all exceptions with appropriate context
+
+## Testing
+- Write unit tests for all public functions
+- Use descriptive test names
+- Follow Arrange-Act-Assert pattern
+- Mock external dependencies
+- Test edge cases and error conditions

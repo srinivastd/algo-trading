@@ -1,0 +1,87 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Trading Strategy Consistency
+Rule Type: Prompt
+Prompts: trading strategy, groq_recommendations, entry/exit logic, signal generation
+
+## Core Principles
+- Maintain identical entry/exit logic across all modes
+- Ensure consistent signal generation
+- Use shared methods for all trading operations
+- Validate behavior across all modes
+
+## Mode Consistency Rules
+### Shared Requirements
+- All modes must use identical:
+  - Entry/exit logic
+  - Signal generation parameters
+  - Risk management rules
+  - Indicator calculations
+  - Zone identification logic
+
+### Mode-Specific Requirements
+#### Backtest Mode
+- Must validate against historical data
+- Must log all signals for comparison
+- Must use same indicators as watch/realtime
+- Must be reproducible
+
+#### Watch Mode
+- Must use identical signal generation as backtest
+- Must log all signals for validation
+- Must compare signals with backtest results
+- Must validate against real-time data
+
+#### Realtime Mode
+- Must use identical signal generation as backtest/watch
+- Must implement proper error handling
+- Must log all operations for audit
+- Must validate against market data
+
+## Shared Methods
+The following methods must be identical across all modes:
+- `calculate_indicators`
+- `identify_zones`
+- `generate_signals`
+- `generate_realtime_signals`
+- `generate_exit_signals`
+
+## Validation Requirements
+### Signal Validation
+- Backtest results must be reproducible in watch mode
+- Watch mode signals must match backtest signals
+- Realtime signals must follow same logic
+- All signals must be logged for comparison
+
+### Risk Management
+- Stop loss rules must be identical
+- Target profit rules must be identical
+- Position sizing must be consistent
+- Risk per trade must be identical
+
+### Performance Validation
+- Compare signal timing across modes
+- Validate execution latency
+- Monitor error rates
+- Track performance metrics
+
+## Implementation Guidelines
+- No mode-specific entry/exit logic
+- Use shared parameters for all modes
+- Implement changes across all modes simultaneously
+- Validate changes in all modes before deployment
+
+## Documentation Requirements
+- Document all shared methods
+- Maintain change log
+- Document validation results
+- Track performance metrics
+
+## Monitoring Requirements
+- Monitor signal consistency
+- Track execution latency
+- Log all operations
+- Maintain audit trail

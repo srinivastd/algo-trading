@@ -22,6 +22,35 @@ class StrategyBase(ABC):
         """Generate trading signals"""
         pass
         
+    async def generate_realtime_signals(self, df: pd.DataFrame) -> int:
+        """Generate real-time trading signals (entry signals)
+        
+        Args:
+            df: DataFrame with current market data and indicators
+            
+        Returns:
+            int: Signal value (1 for buy, -1 for sell, 0 for no action)
+        """
+        # Default implementation can be overridden by specific strategies
+        signals = self.generate_signals(df)
+        if len(signals) > 0:
+            return int(signals['signal'].iloc[-1])
+        return 0
+        
+    async def generate_exit_signals(self, df: pd.DataFrame, position_type: str) -> int:
+        """Generate exit signals for existing positions
+        
+        Args:
+            df: DataFrame with current market data and indicators
+            position_type: 'long' or 'short' to indicate current position type
+            
+        Returns:
+            int: Exit signal value (1 to exit long/enter short, -1 to exit short/enter long, 0 for hold)
+        """
+        # Default implementation - should be overridden by specific strategies
+        # For now, return 0 (hold) as a safe default
+        return 0
+        
     @abstractmethod
     async def backtest(self, df: pd.DataFrame, initial_capital: float = 100000, symbol: str = 'MSFT') -> Dict:
         """Run backtest on historical data

@@ -1,0 +1,105 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Change Management
+Rule Type: Prompt
+Prompts: change trading logic, modify strategy, update groq_recommendations
+
+## Core Principles
+- Make incremental changes only
+- No major strategy logic changes
+- Focus changes on groq_recommendations_strategy.py
+- Maintain backward compatibility
+
+## Change Process
+### 1. Pre-Change Requirements
+- Document current behavior
+- Identify specific areas for change
+- Review existing test coverage
+- Plan validation approach
+
+### 2. Implementation Steps
+1. Document current behavior
+2. Make minimal necessary changes
+3. Test changes in all modes
+4. Verify consistency across modes
+5. Update documentation
+
+### 3. Validation Requirements
+- Run backtest before and after
+- Compare watch mode behavior
+- Verify realtime behavior
+- Validate all modes produce consistent results
+
+## Change Restrictions
+### Core Logic
+- No changes to entry/exit logic without full review
+- No changes to risk management without approval
+- No changes to signal generation without testing
+- No mode-specific logic changes
+
+### Risk Management
+- No changes to stop loss parameters without approval
+- No changes to target profit parameters without approval
+- No changes to position sizing without review
+- No changes to risk per trade without approval
+
+### Signal Generation
+- No changes to indicator calculations without testing
+- No changes to zone identification without validation
+- No changes to signal parameters without review
+- No changes to timing logic without approval
+
+## Documentation Requirements
+### Change Documentation
+- Document all changes to entry/exit logic
+- Update mode-specific documentation
+- Maintain change log
+- Document validation results
+
+### Validation Documentation
+- Document backtest results
+- Document watch mode behavior
+- Document realtime performance
+- Maintain comparison logs
+
+## Review Process
+### Code Review
+- Peer review required for all changes
+- Security review for IBKR interactions
+- Performance review for realtime operations
+- Strategy logic review for all changes
+
+### Testing Review
+- Unit test coverage review
+- Integration test review
+- Performance test review
+- Security test review
+
+## Deployment Process
+### Pre-Deployment
+- Run full test suite
+- Verify all modes
+- Check documentation
+- Review change log
+
+### Post-Deployment
+- Monitor performance
+- Track error rates
+- Validate signals
+- Update metrics
+
+## Emergency Procedures
+### Rollback Process
+- Maintain backup of previous version
+- Document rollback procedure
+- Test rollback process
+- Monitor post-rollback behavior
+
+### Emergency Changes
+- Document emergency change process
+- Define approval requirements
+- Specify validation steps
+- Maintain audit trail

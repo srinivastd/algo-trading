@@ -1,0 +1,123 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Version Control
+Rule Type: Always
+
+## Commit Rules
+### Message Format
+- Format: "type(scope): description"
+- Types:
+  - feat: New feature
+  - fix: Bug fix
+  - docs: Documentation
+  - style: Code style
+  - refactor: Code refactoring
+  - test: Testing
+  - chore: Maintenance
+
+### Commit Requirements
+- Atomic commits
+- Descriptive messages
+- Reference issues
+- Include scope
+- Follow format
+
+## Branch Strategy
+### Branch Types
+- feature: New features
+- bugfix: Bug fixes
+- hotfix: Urgent fixes
+- release: Release preparation
+
+### Branch Naming
+- Format: "type/description"
+- Examples:
+  - feature/add-stop-loss
+  - bugfix/fix-signal-generation
+  - hotfix/fix-order-execution
+  - release/v1.0.0
+
+## Workflow
+### Feature Development
+- Create feature branch
+- Develop feature
+- Write tests
+- Update documentation
+- Create pull request
+
+### Bug Fixes
+- Create bugfix branch
+- Fix bug
+- Add tests
+- Update documentation
+- Create pull request
+
+### Releases
+- Create release branch
+- Version bump
+- Update changelog
+- Tag release
+- Merge to main
+
+## Code Review
+### Pull Request Requirements
+- Descriptive title
+- Detailed description
+- Reference issues
+- Include tests
+- Update documentation
+
+### Review Process
+- Code review
+- Test review
+- Documentation review
+- Performance review
+- Security review
+
+## Versioning
+### Semantic Versioning
+- Major: Breaking changes
+- Minor: New features
+- Patch: Bug fixes
+- Pre-release: Alpha/Beta
+- Build metadata
+
+### Version Management
+- Tag releases
+- Update version
+- Maintain changelog
+- Document changes
+- Track dependencies
+
+## Maintenance
+### Branch Maintenance
+- Delete merged branches
+- Update main branch
+- Clean old branches
+- Archive releases
+- Maintain history
+
+### Repository Maintenance
+- Regular cleanup
+- Update .gitignore
+- Maintain hooks
+- Review permissions
+- Backup repository
+
+## Documentation
+### Version Documentation
+- Update changelog
+- Document releases
+- Track dependencies
+- Note breaking changes
+- Include migration guides
+
+### Process Documentation
+- Document workflow
+- Update guidelines
+- Maintain templates
+- Track changes
+- Review regularly
