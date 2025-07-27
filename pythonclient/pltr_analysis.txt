@@ -1,0 +1,41 @@
+🔍 QUERYING MOST RECENT BACKTEST
+============================================================
+📅 Timestamp: 2025-05-26 22:28:41.888496
+🆔 ID: PLTR_2025-05-26 22:28:41.888496
+📄 Summary: Backtest result for PLTR: 5438.835578999991 profit, 50.0% success rate
+📊 MARKET CONDITIONS
+==================================================
+ADX            : 49.2518
+Volatility     : 4.4800
+SMA 20         : 125.5865
+SMA 50         : 116.9318
+Volume Change  : 0.1058
+Valid Consolidation: ✅
+Trend Analysis: 📈 BULLISH
+Market Strength: 🔥 STRONG TREND
+
+💰 PERFORMANCE METRICS
+==================================================
+Initial Capital: $50,000.00
+Final Capital:   $55,438.84
+Total Profit:    $5,438.84
+Return %:        +10.88%
+Success Rate:    50.0%
+Total Trades:    8
+Performance:     ✅ PROFITABLE
+
+⚙️  STRATEGY PARAMETERS
+==================================================
+Risk per Trade : $497.60
+Stop Loss %    : 0.8%
+Target %       : 6.0%
+Bar Size       : 1 hour
+Duration       : 1 M
+Paper Trading  : No
+
+📋 TRADE DETAILS
+==================================================
+Trade details not available in readable format
+
+============================================================
+✅ Analysis complete!

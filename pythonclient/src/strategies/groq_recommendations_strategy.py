@@ -83,20 +83,17 @@ class GroqRecommendationsStrategy(StrategyBase):
         supply_zones = []
         demand_zones = []
         
-        for i in range(2, len(df) - 2):  # Reduced from range(5, len(df)-5) to range(2, len(df)-2)
-            # Ultra-simplified supply zone detection - removed all trend requirements
-            if (df['close'].iloc[i] > df['close'].iloc[i-2:i].max() and  # Look back only 2 periods instead of 5
-                df['adx'].iloc[i] > 5):  # Ultra-low ADX threshold for maximum signals
+        for i in range(4, len(df) - 4):  # Phase 2: lookback 4
+            # Supply zone
+            if (df['close'].iloc[i] > df['close'].iloc[i-4:i].max() and 
+                df['adx'].iloc[i] > 15):  # Phase 2: adx >15
                 supply_zones.append((df.index[i], df['high'].iloc[i], df['low'].iloc[i]))
-                logger.debug(f"Supply zone at {df.index[i]}, high: {df['high'].iloc[i]:.2f}")
             
-            # Ultra-simplified demand zone detection - removed all trend requirements  
-            elif (df['close'].iloc[i] < df['close'].iloc[i-2:i].min() and  # Look back only 2 periods instead of 5
-                  df['adx'].iloc[i] > 5):  # Ultra-low ADX threshold for maximum signals
+            # Demand zone  
+            elif (df['close'].iloc[i] < df['close'].iloc[i-4:i].min() and  
+                  df['adx'].iloc[i] > 15):
                 demand_zones.append((df.index[i], df['high'].iloc[i], df['low'].iloc[i]))
-                logger.debug(f"Demand zone at {df.index[i]}, low: {df['low'].iloc[i]:.2f}")
-                
-        logger.info(f"Found {len(supply_zones)} supply, {len(demand_zones)} demand zones")
+        
         return supply_zones, demand_zones
         
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -109,20 +106,24 @@ class GroqRecommendationsStrategy(StrategyBase):
             current_price = df['close'].iloc[i]
             
             for zone_time, zone_high, zone_low in supply_zones:
-                if ((df.index[i] - zone_time) < timedelta(hours=24) and 
+                if ((df.index[i] - zone_time) < timedelta(hours=12) and  # Phase 2: 12h
                     df['close'].iloc[i] > zone_high and
-                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * 1.2):
+                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * 1.1 and  # Phase 2: 10%
+                    df['volume'].iloc[i-1] > df['volume'].iloc[i-2] * 1.05):
                     signals.loc[signals.index[i], 'signal'] = -1
                     logger.debug(f"Short signal at {df.index[i]}, price: {current_price:.2f}")
                     break
                     
             for zone_time, zone_high, zone_low in demand_zones:
-                if ((df.index[i] - zone_time) < timedelta(hours=24) and 
+                if ((df.index[i] - zone_time) < timedelta(hours=12) and 
                     df['close'].iloc[i] < zone_low and
-                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * 1.2):
-                    signals.loc[signals.index[i], 'signal'] = 1
-                    logger.debug(f"Long signal at {df.index[i]}, price: {current_price:.2f}")
-                    break
+                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * 1.1 and
+                    df['volume'].iloc[i-1] > df['volume'].iloc[i-2] * 1.05):
+                    # Phase 2: 50% trend weight - only signal if trend positive or with 50% prob
+                    if df['sma_20'].iloc[i] > df['sma_50'].iloc[i] or np.random.random() < 0.5:
+                        signals.loc[signals.index[i], 'signal'] = 1
+                        logger.debug(f"Long signal at {df.index[i]}, price: {current_price:.2f}")
+                        break
                     
         logger.info(f"Generated {len(signals[signals['signal'] != 0])} signals")
         return signals
@@ -130,6 +131,7 @@ class GroqRecommendationsStrategy(StrategyBase):
     async def generate_realtime_signals(self, df: pd.DataFrame) -> int:
         """Generate a single signal based on the latest data in real-time."""
         if len(df) < 2:
+            logger.debug("Insufficient data for signal generation (need at least 2 bars)")
             return 0
         
         df = self.calculate_indicators(df)
@@ -142,23 +144,49 @@ class GroqRecommendationsStrategy(StrategyBase):
             if ((current_time - zone_time) < timedelta(hours=24) and   # Match backtest: 24 hours
                 current_price > zone_high and                          # Match backtest: price breakout required
                 len(df) >= 2 and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):  # Match backtest: volume confirmation
-                logger.debug(f"Realtime short signal at {current_time}, price: {current_price:.2f} (supply breakout + volume)")
+                
+                # Log detailed entry conditions when signal is generated
+                current_volume = df['volume'].iloc[-1]
+                prev_volume = df['volume'].iloc[-2]
+                volume_ratio = current_volume / prev_volume
+                current_adx = df['adx'].iloc[-1] if 'adx' in df.columns else 0
+                time_diff_hours = (current_time - zone_time).total_seconds() / 3600
+                
+                logger.info(f"✅ SHORT SIGNAL GENERATED at {current_time}:")
+                logger.info(f"   Price: ${current_price:.2f} (broke above supply zone ${zone_high:.2f})")
+                logger.info(f"   Volume: {current_volume:,.0f} (1.2x+ previous: {prev_volume:,.0f}, ratio: {volume_ratio:.2f})")
+                logger.info(f"   ADX: {current_adx:.1f}")
+                logger.info(f"   Zone Age: {time_diff_hours:.1f} hours")
+                logger.info(f"   Zone Range: ${zone_low:.2f} - ${zone_high:.2f}")
                 return -1
                 
         for zone_time, zone_high, zone_low in demand_zones:
             if ((current_time - zone_time) < timedelta(hours=24) and   # Match backtest: 24 hours
                 current_price < zone_low and                           # Match backtest: price breakout required  
                 len(df) >= 2 and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):  # Match backtest: volume confirmation
-                logger.debug(f"Realtime long signal at {current_time}, price: {current_price:.2f} (demand breakout + volume)")
+                
+                # Log detailed entry conditions when signal is generated
+                current_volume = df['volume'].iloc[-1]
+                prev_volume = df['volume'].iloc[-2]
+                volume_ratio = current_volume / prev_volume
+                current_adx = df['adx'].iloc[-1] if 'adx' in df.columns else 0
+                time_diff_hours = (current_time - zone_time).total_seconds() / 3600
+                
+                logger.info(f"✅ LONG SIGNAL GENERATED at {current_time}:")
+                logger.info(f"   Price: ${current_price:.2f} (broke below demand zone ${zone_low:.2f})")
+                logger.info(f"   Volume: {current_volume:,.0f} (1.2x+ previous: {prev_volume:,.0f}, ratio: {volume_ratio:.2f})")
+                logger.info(f"   ADX: {current_adx:.1f}")
+                logger.info(f"   Zone Age: {time_diff_hours:.1f} hours")
+                logger.info(f"   Zone Range: ${zone_low:.2f} - ${zone_high:.2f}")
                 return 1
                 
         return 0
         
     async def generate_exit_signals(self, df: pd.DataFrame, position_type: str) -> int:
-        """Generate exit signals for existing positions based on momentum and zone reversals."""
+        """Generate exit signals for existing positions based on momentum, zone reversals, and ADX."""
         if len(df) < 3:
             return 0
-            
+        
         df = self.calculate_indicators(df)
         current_price = df['close'].iloc[-1]
         prev_price = df['close'].iloc[-2]
@@ -175,53 +203,79 @@ class GroqRecommendationsStrategy(StrategyBase):
             # 1. Price breaks below recent demand zone
             # 2. Strong bearish momentum (price drop > 2% in recent bar)
             # 3. ADX showing strong trend but price moving against position
-            
-            for zone_time, zone_high, zone_low in supply_zones:
-                if ((current_time - zone_time) < timedelta(hours=24) and 
-                    current_price > zone_high and
-                    price_change > 0.015):  # 1.5% price increase - potential reversal point
-                    logger.debug(f"Exit long signal: Price reached supply zone at {current_price:.2f}")
-                    return 1  # Exit long
-                    
-            # Exit on strong bearish momentum
-            if price_change < -0.02:  # 2% drop
-                logger.debug(f"Exit long signal: Strong bearish momentum {price_change:.3f}")
-                return 1  # Exit long
-                
-            # Exit if price breaks below recent support
-            if len(df) >= 10:
-                recent_low = df['low'].iloc[-10:].min()
-                if current_price < recent_low * 0.995:  # 0.5% below recent support
-                    logger.debug(f"Exit long signal: Price broke below support at {current_price:.2f}")
-                    return 1  # Exit long
-                    
-        elif position_type == 'short':
-            # Exit short position conditions:
-            # 1. Price breaks above recent supply zone  
-            # 2. Strong bullish momentum
-            # 3. Price breaking above recent resistance
-            
+            # 4. Price breaks below recent support
             for zone_time, zone_high, zone_low in demand_zones:
                 if ((current_time - zone_time) < timedelta(hours=24) and 
                     current_price < zone_low and
                     price_change < -0.015):  # 1.5% price decrease - potential reversal point
-                    logger.debug(f"Exit short signal: Price reached demand zone at {current_price:.2f}")
+                    price_change_pct = price_change * 100
+                    time_diff_hours = (current_time - zone_time).total_seconds() / 3600
+                    logger.info(f"🚪 EXIT LONG SIGNAL: Price broke below demand zone at ${current_price:.2f}")
+                    logger.info(f"   Zone Low: ${zone_low:.2f}")
+                    logger.info(f"   Price Change: {price_change_pct:.2f}%")
+                    logger.info(f"   Zone Age: {time_diff_hours:.1f} hours")
+                    logger.info(f"   Zone Range: ${zone_low:.2f} - ${zone_high:.2f}")
+                    return 1  # Exit long
+            
+            # Exit on strong bearish momentum or adverse trend
+            if price_change < -0.02 or (current_adx > 30 and df['minus_di'].iloc[-1] > df['plus_di'].iloc[-1]):  # 2% drop or bearish trend
+                price_change_pct = price_change * 100
+                logger.info(f"🚪 EXIT LONG SIGNAL: Strong bearish momentum or trend at ${current_price:.2f}")
+                logger.info(f"   Price Change: {price_change_pct:.2f}%")
+                logger.info(f"   Current Price: ${current_price:.2f}")
+                logger.info(f"   Previous Price: ${prev_price:.2f}")
+                logger.info(f"   ADX: {current_adx:.2f}")
+                return 1  # Exit long
+            
+            # Exit if price breaks below recent support
+            if len(df) >= 10:
+                recent_low = df['low'].iloc[-10:].min()
+                if current_price < recent_low * 0.995:  # 0.5% below recent support
+                    logger.info(f"🚪 EXIT LONG SIGNAL: Price broke below support at ${current_price:.2f}")
+                    logger.info(f"   Recent Support: ${recent_low:.2f}")
+                    logger.info(f"   Break Level: ${recent_low * 0.995:.2f}")
+                    return 1  # Exit long
+        
+        elif position_type == 'short':
+            # Exit short position conditions:
+            # 1. Price breaks below recent demand zone
+            # 2. Strong bullish momentum (price gain > 2% in recent bar)
+            # 3. ADX showing strong trend but price moving against position
+            # 4. Price breaks above recent resistance
+            for zone_time, zone_high, zone_low in demand_zones:
+                if ((current_time - zone_time) < timedelta(hours=24) and 
+                    current_price < zone_low and
+                    price_change < -0.015):  # 1.5% price decrease - potential reversal point
+                    price_change_pct = price_change * 100
+                    time_diff_hours = (current_time - zone_time).total_seconds() / 3600
+                    logger.info(f"🚪 EXIT SHORT SIGNAL: Price reached demand zone at ${current_price:.2f}")
+                    logger.info(f"   Zone Low: ${zone_low:.2f}")
+                    logger.info(f"   Price Change: {price_change_pct:.2f}%")
+                    logger.info(f"   Zone Age: {time_diff_hours:.1f} hours")
+                    logger.info(f"   Zone Range: ${zone_low:.2f} - ${zone_high:.2f}")
                     return -1  # Exit short
-                    
-            # Exit on strong bullish momentum
-            if price_change > 0.02:  # 2% gain
-                logger.debug(f"Exit short signal: Strong bullish momentum {price_change:.3f}")
+            
+            # Exit on strong bullish momentum or adverse trend
+            if price_change > 0.02 or (current_adx > 30 and df['plus_di'].iloc[-1] > df['minus_di'].iloc[-1]):  # 2% gain or bullish trend
+                price_change_pct = price_change * 100
+                logger.info(f"🚪 EXIT SHORT SIGNAL: Strong bullish momentum or trend at ${current_price:.2f}")
+                logger.info(f"   Price Change: {price_change_pct:.2f}%")
+                logger.info(f"   Current Price: ${current_price:.2f}")
+                logger.info(f"   Previous Price: ${prev_price:.2f}")
+                logger.info(f"   ADX: {current_adx:.2f}")
                 return -1  # Exit short
-                
+            
             # Exit if price breaks above recent resistance
             if len(df) >= 10:
                 recent_high = df['high'].iloc[-10:].max()
                 if current_price > recent_high * 1.005:  # 0.5% above recent resistance
-                    logger.debug(f"Exit short signal: Price broke above resistance at {current_price:.2f}")
+                    logger.info(f"🚪 EXIT SHORT SIGNAL: Price broke above resistance at ${current_price:.2f}")
+                    logger.info(f"   Recent Resistance: ${recent_high:.2f}")
+                    logger.info(f"   Break Level: ${recent_high * 1.005:.2f}")
                     return -1  # Exit short
         
         return 0  # Hold position
-        
+    
     async def execute_trade(self, symbol: str, signal: int, entry_price: float, shares: int, stop_loss: float, target: float) -> Dict:
         if not self.ib_client:
             logger.error("IBKR client not initialized")

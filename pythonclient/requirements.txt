@@ -1,0 +1,11 @@
+ib-insync==0.9.86
+pandas>=1.5.0
+numpy>=1.24.0
+pytz>=2023.3
+chromadb>=0.4.0
+transformers>=4.30.0
+torch>=2.0.0
+asyncio-mqtt>=0.13.0
+logging>=0.4.9.6
+ta>=0.11.0
+sentence-transformers>=5.0.0 
