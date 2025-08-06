@@ -97,9 +97,20 @@ class HistoricalDataManager:
     async def fetch_data_chunk(self, contract, end_date: datetime, duration: str, bar_size: str) -> Optional[pd.DataFrame]:
         try:
             logger.info(f"Requesting historical data ending at {end_date}...")
+            
+            # Convert datetime to IBKR expected format: yyyymmdd hh:mm:ss timezone
+            # IBKR expects format like "20031126 15:59:00 US/Eastern" or empty string for latest
+            if end_date:
+                # Convert to UTC and use dash format
+                utc = timezone('UTC')
+                end_date_utc = end_date.astimezone(utc)
+                end_date_str = end_date_utc.strftime('%Y%m%d-%H:%M:%S')
+            else:
+                end_date_str = ''  # Empty string means "latest available data"
+            
             bars = await self.connection.get_ib().reqHistoricalDataAsync(
                 contract,
-                endDateTime=end_date,
+                endDateTime=end_date_str,
                 durationStr=duration,
                 barSizeSetting=bar_size,
                 whatToShow='TRADES',
