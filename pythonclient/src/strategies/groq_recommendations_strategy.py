@@ -11,7 +11,7 @@ from .base import StrategyBase
 import logging
 from pytz import timezone
 from ibkr.connection import IBKRConnection
-from ib_insync import MarketOrder, StopOrder, LimitOrder
+from ib_insync import MarketOrder, StopOrder, LimitOrder, Stock
 import chromadb
 from chromadb.utils import embedding_functions
 
@@ -22,7 +22,7 @@ class GroqRecommendationsStrategy(StrategyBase):
     
     def __init__(self, risk_per_trade: float = 3000, max_duration_hours: float = 16.0, paper_trading: bool = True,
                  stop_loss_pct: float = 0.75, target_pct: float = 3.0, bar_size: str = "1 hour", duration: str = "1 M",
-                 use_accumulate_distribute: bool = True, min_shares_for_accumulate: int = 100):
+                 use_accumulate_distribute: bool = False, min_shares_for_accumulate: int = 100):
         super().__init__("Groq Recommendations Strategy")
         self.risk_per_trade = risk_per_trade
         self.max_duration_hours = max_duration_hours
@@ -96,6 +96,46 @@ class GroqRecommendationsStrategy(StrategyBase):
         """Set the IBKR client for trading"""
         self.ib_client = ib_client
         logger.info("IBKR client set for trading")
+
+    def apply_symbol_overrides(self, symbol: str) -> None:
+        """Apply per-symbol configuration overrides without changing core logic.
+
+        Args:
+            symbol: The trading symbol (e.g., "PLTR").
+        """
+        try:
+            symbol_upper = symbol.upper() if symbol else ""
+        except Exception:
+            symbol_upper = ""
+
+        if symbol_upper == "PLTR":
+            # Risk and trade management
+            self.risk_per_trade = 1500
+            self.max_duration_hours = 12
+            self.stop_loss_pct = 0.9
+            self.target_pct = 5.0
+
+            # Zone creation
+            self.zone_creation_adx_min = 18
+            self.zone_creation_volume_multiplier = 1.4
+
+            # Entry signal
+            self.entry_adx_min = 18
+            self.entry_volume_multiplier = 1.2
+            self.entry_volume_trend_multiplier = 1.10
+            self.entry_zone_max_age_hours = 8
+
+            # Exit signal
+            self.exit_adx_min = 18
+            self.exit_volume_multiplier = 1.15
+
+            # Accumulate/Distribute behavior
+            self.use_accumulate_distribute = True
+            self.min_shares_for_accumulate = 120
+            self.high_volatility_threshold = 0.035
+            self.strong_trend_threshold = 0.7
+
+            logger.info("Applied PLTR-specific parameter overrides")
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         eastern = timezone('America/New_York')
@@ -338,42 +378,20 @@ class GroqRecommendationsStrategy(StrategyBase):
         return 0  # Hold position
     
     async def execute_trade(self, symbol: str, signal: int, entry_price: float, shares: int, stop_loss: float, target: float) -> Dict:
-        """Execute a trade using Accumulate/Distribute orders for maximum profit"""
+        """Execute a trade using standard LIMIT and STOP orders (Accumulate/Distribute disabled)"""
         if not self.ib_client:
             logger.error("IBKR client not initialized")
             return {'status': 'error', 'message': 'No IBKR client'}
 
         try:
-            # Determine if we should use accumulate/distribute based on configuration and position size
-            use_accumulate = (
-                self.use_accumulate_distribute and 
-                shares >= self.min_shares_for_accumulate
+             # Always use regular LIMIT order for parent
+            parent_order_id = await self.ib_client.place_order(
+                symbol=symbol,
+                action='BUY' if signal == 1 else 'SELL',
+                quantity=shares,
+                order_type='LMT',
+                limit_price=entry_price
             )
-            
-            if use_accumulate:
-                logger.info(f"Using ACCUMULATE/DISTRIBUTE order for {shares} shares")
-                
-                # Calculate volatility for smart order placement
-                volatility = self.calculate_current_volatility(entry_price, stop_loss, target)
-                
-                # Use smart accumulate order for better profit maximization
-                parent_order_id = await self.ib_client.place_smart_accumulate_order(
-                    symbol=symbol,
-                    action='BUY' if signal == 1 else 'SELL',
-                    total_quantity=shares,
-                    current_price=entry_price,
-                    volatility=volatility,
-                    risk_tolerance=self.default_risk_tolerance
-                )
-            else:
-                # Use regular limit order for smaller positions
-                parent_order_id = await self.ib_client.place_order(
-                    symbol=symbol,
-                    action='BUY' if signal == 1 else 'SELL',
-                    quantity=shares,
-                    order_type='LMT',
-                    limit_price=entry_price
-                )
             
             if not parent_order_id:
                 return {'status': 'error', 'message': 'Failed to place parent order'}
@@ -391,31 +409,19 @@ class GroqRecommendationsStrategy(StrategyBase):
             except Exception as status_error:
                 logger.warning(f"Could not get order status: {status_error}")
             
-            # Place stop-loss order with smart distribution if needed
+            # Place stop-loss order (standard STOP)
             stop_order_id = None
             if stop_loss is not None:
                 try:
                     await asyncio.sleep(2)  # Additional delay before stop order
-                    
-                    # Use distribute order for stop-loss to maximize exit value
-                    if use_accumulate and shares >= self.min_shares_for_accumulate // 2:
-                        stop_order_id = await self.ib_client.place_smart_accumulate_order(
-                            symbol=symbol,
-                            action='SELL' if signal == 1 else 'BUY',
-                            total_quantity=shares,
-                            current_price=stop_loss,
-                            volatility=volatility * self.volatility_multiplier_stop,  # Higher volatility for exits
-                            risk_tolerance=self.risk_tolerance_stop  # More conservative for stops
-                        )
-                    else:
-                        stop_order_id = await self.ib_client.place_order(
-                            symbol=symbol,
-                            action='SELL' if signal == 1 else 'BUY',
-                            quantity=shares,
-                            order_type='STP',
-                            aux_price=stop_loss,
-                            parent_id=parent_order_id
-                        )
+                    stop_order_id = await self.ib_client.place_order(
+                        symbol=symbol,
+                        action='SELL' if signal == 1 else 'BUY',
+                        quantity=shares,
+                        order_type='STP',
+                        aux_price=stop_loss,
+                        parent_id=parent_order_id
+                    )
                     
                     if stop_order_id:
                         logger.info(f"Stop-loss order {stop_order_id} placed successfully")
@@ -424,31 +430,19 @@ class GroqRecommendationsStrategy(StrategyBase):
                 except Exception as stop_error:
                     logger.error(f"Error placing stop-loss order: {stop_error}")
             
-            # Place target order with smart distribution for maximum profit
+            # Place target order (standard LIMIT)
             target_order_id = None
             if target is not None:
                 try:
                     await asyncio.sleep(5)  # Additional delay before target order
-                    
-                    # Use distribute order for target to maximize profit taking
-                    if use_accumulate and shares >= self.min_shares_for_accumulate // 2:
-                        target_order_id = await self.ib_client.place_smart_accumulate_order(
-                            symbol=symbol,
-                            action='SELL' if signal == 1 else 'BUY',
-                            total_quantity=shares,
-                            current_price=target,
-                            volatility=volatility * self.volatility_multiplier_target,  # Lower volatility for targets
-                            risk_tolerance=self.risk_tolerance_target  # More aggressive for targets
-                        )
-                    else:
-                        target_order_id = await self.ib_client.place_order(
-                            symbol=symbol,
-                            action='SELL' if signal == 1 else 'BUY',
-                            quantity=shares,
-                            order_type='LMT',
-                            limit_price=target,
-                            parent_id=parent_order_id
-                        )
+                    target_order_id = await self.ib_client.place_order(
+                        symbol=symbol,
+                        action='SELL' if signal == 1 else 'BUY',
+                        quantity=shares,
+                        order_type='LMT',
+                        limit_price=target,
+                        parent_id=parent_order_id
+                    )
                     
                     if target_order_id:
                         logger.info(f"Target order {target_order_id} placed successfully")
@@ -461,7 +455,7 @@ class GroqRecommendationsStrategy(StrategyBase):
             result = {
                 'status': 'success',
                 'order_id': parent_order_id,
-                'order_type': 'ACCUMULATE' if use_accumulate else 'LMT'
+                'order_type': 'LMT'
             }
             
             if stop_order_id:
@@ -470,7 +464,7 @@ class GroqRecommendationsStrategy(StrategyBase):
                 result['target_order_id'] = target_order_id
             
             trade_type = 'Long' if signal == 1 else 'Short'
-            order_type_str = 'ACCUMULATE/DISTRIBUTE' if use_accumulate else 'LIMIT'
+            order_type_str = 'LIMIT'
             logger.info(f"Placed {'paper' if self.paper_trading else 'live'} {order_type_str} trade: {trade_type} {symbol}, "
                       f"Entry: ${entry_price:.2f}, Stop: ${stop_loss:.2f}, Target: ${target:.2f}")
             
@@ -584,6 +578,8 @@ class GroqRecommendationsStrategy(StrategyBase):
     async def backtest(self, df: pd.DataFrame, initial_capital: float = 100000, symbol: str = 'MSFT') -> Dict:
         """Run a backtest on historical data and store results in ChromaDB"""
         logger.info(f"Starting backtest for {symbol} with ${initial_capital:,.2f} initial capital")
+        # Apply any symbol-specific parameter overrides (PLTR tuned config)
+        self.apply_symbol_overrides(symbol)
         
         # Add realistic trading conditions
         slippage_pct = 0.05  # 5 basis points slippage
@@ -748,7 +744,8 @@ class GroqRecommendationsStrategy(StrategyBase):
         total_trades = len(trades)
         successful_trades = sum(1 for trade in trades if trade.get('profit', 0) > 0)
         success_rate = (successful_trades / total_trades * 100) if total_trades > 0 else 0
-        total_profit = sum(trade.get('profit', 0) for trade in trades)
+        # FIX: Calculate total profit as final capital minus initial capital
+        total_profit = capital - initial_capital
         total_commission = sum(trade.get('commission', 0) for trade in trades) + sum(trade.get('exit_commission', 0) for trade in trades)
 
         # Enhanced metadata with trading conditions

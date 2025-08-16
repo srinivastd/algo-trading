@@ -497,7 +497,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Trading System")
     parser.add_argument("symbols", nargs="+", help="Trading symbols")
     parser.add_argument("--duration", default="1 M", help="Duration for historical data")
-    parser.add_argument("--bar-size", default="15 mins", help="Bar size for historical data")
+    parser.add_argument("--bar-size", default="1 hour", help="Bar size for historical data")
     parser.add_argument("--strategy", default="groq", help="Trading strategy to use")
     parser.add_argument("--force-refresh", action="store_true", help="Force refresh historical data")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")

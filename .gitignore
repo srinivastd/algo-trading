@@ -68,3 +68,9 @@ pythonclient/src/ibkr/pattern_watcher.py
 pythonclient/chroma_db/dc9a242c-a3e5-4f67-9f89-4a45098fa9cf/length.bin
 .DS_Store
 pythonclient/historical_data/
+pythonclient/chroma_db/chroma.sqlite3
+pythonclient/chroma_db/dc9a242c-a3e5-4f67-9f89-4a45098fa9cf/length.bin
+pythonclient/market_data_logs/market_data.json
+pythonclient/chroma_db/dc9a242c-a3e5-4f67-9f89-4a45098fa9cf/length.bin
+pythonclient/market_data_logs/market_data.json
+pythonclient/chroma_db/dc9a242c-a3e5-4f67-9f89-4a45098fa9cf/length.bin
