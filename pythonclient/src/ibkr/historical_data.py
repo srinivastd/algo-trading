@@ -1,15 +1,19 @@
 """
 Historical data management for stock analysis.
+Version 1.1 - Added crypto support
 """
 import os
 import logging
 import pandas as pd
 from datetime import datetime, timedelta
-from ib_insync import Stock, RealTimeBar
+from ib_insync import Stock, RealTimeBar, Crypto
 from typing import Optional, Dict
 import asyncio
 from pytz import timezone
 from .connection import IBKRConnection
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.crypto_utils import CryptoUtils
 
 logger = logging.getLogger(__name__)
 
@@ -97,13 +101,15 @@ class HistoricalDataManager:
     async def fetch_data_chunk(self, contract, end_date: datetime, duration: str, bar_size: str) -> Optional[pd.DataFrame]:
         try:
             logger.info(f"Requesting historical data ending at {end_date}...")
+            # Use appropriate parameters for crypto vs equity
+            is_crypto = CryptoUtils.is_crypto(contract.symbol)
             bars = await self.connection.get_ib().reqHistoricalDataAsync(
                 contract,
                 endDateTime=end_date,
                 durationStr=duration,
                 barSizeSetting=bar_size,
-                whatToShow='TRADES',
-                useRTH=True,
+                whatToShow='AGGTRADES' if is_crypto else 'TRADES',
+                useRTH=False if is_crypto else True,  # 24/7 for crypto, RTH for stocks
                 keepUpToDate=False
             )
             
@@ -178,8 +184,9 @@ class HistoricalDataManager:
         if not self.connection.is_connected():
             raise ConnectionError("Not connected to IBKR")
           
-        logger.info(f"Defining contract for {symbol}...")
-        contract = Stock(symbol, 'SMART', 'USD')
+        # Create contract based on symbol type (crypto vs equity)
+        logger.info(f"Creating contract for {symbol}...")
+        contract = CryptoUtils.create_contract(symbol)
         qualified_contracts = await self.connection.get_ib().qualifyContractsAsync(contract)
         if not qualified_contracts:
             logger.error(f"Could not qualify contract for {symbol}")
@@ -309,8 +316,9 @@ class HistoricalDataManager:
                     logger.error(f"Not connected to IBKR for {symbol}")
                     return symbol, None
                 
-                logger.info(f"Defining contract for {symbol}...")
-                contract = Stock(symbol, 'SMART', 'USD')
+                # Create contract based on symbol type (crypto vs equity)
+                logger.info(f"Creating contract for {symbol}...")
+                contract = CryptoUtils.create_contract(symbol)
                 qualified_contracts = await self.connection.get_ib().qualifyContractsAsync(contract)
                 if not qualified_contracts:
                     logger.error(f"Could not qualify contract for {symbol}")

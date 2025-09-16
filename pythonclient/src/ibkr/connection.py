@@ -1,13 +1,18 @@
 """
 IBKR Connection Manager
 Handles connection to IBKR Gateway/TWS and provides connection status.
-Version 1.3
+Version 1.5 - Added crypto trading support with clean separation
 """
 import logging
 import asyncio
-from ib_insync import IB, MarketOrder, StopOrder, LimitOrder, Trade, Stock
+import datetime
+import pytz
+from ib_insync import IB, MarketOrder, StopOrder, LimitOrder, Trade, Stock, Order, Crypto
 from typing import List, Optional, Dict
 import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.crypto_utils import CryptoUtils
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +158,105 @@ class IBKRConnection:
             logger.error(f"Error getting next order ID: {str(e)}")
             return None
 
+    async def validate_symbol(self, symbol: str) -> bool:
+        """Validate that a symbol is tradeable by checking market data availability"""
+        try:
+            if not self.is_connected():
+                logger.warning(f"Cannot validate {symbol} - not connected to IBKR")
+                return False
+                
+            # Create and qualify contract
+            contract = CryptoUtils.create_contract(symbol)
+            qualified_contracts = await self.get_ib().qualifyContractsAsync(contract)
+            
+            if not qualified_contracts:
+                logger.error(f"Symbol {symbol} could not be qualified - may be invalid or delisted")
+                return False
+                
+            contract = qualified_contracts[0]
+            
+            # Validate the contract
+            if not CryptoUtils.validate_contract(contract, symbol):
+                return False
+                
+            # For equities, if we can qualify the contract, it's likely tradeable
+            # Market data might not be available during off-hours but the symbol is still valid
+            if not CryptoUtils.is_crypto(symbol):
+                logger.info(f"Symbol {symbol} validated via contract qualification (Exchange: {getattr(contract, 'primaryExchange', 'Unknown')})")
+                return True
+                
+            # For crypto, try to get market data since it should be available 24/7
+            try:
+                ticker = self.get_ib().reqMktData(contract, '', True, False)
+                await asyncio.sleep(2)  # Wait for data
+                
+                # Check if we got valid market data
+                if hasattr(ticker, 'marketPrice') and ticker.marketPrice() > 0:
+                    logger.info(f"Crypto symbol {symbol} validated - current price: ${ticker.marketPrice():.2f}")
+                    return True
+                elif hasattr(ticker, 'bid') and ticker.bid > 0:
+                    logger.info(f"Crypto symbol {symbol} validated - current bid: ${ticker.bid:.2f}")
+                    return True
+                elif hasattr(ticker, 'last') and ticker.last > 0:
+                    logger.info(f"Crypto symbol {symbol} validated - last price: ${ticker.last:.2f}")
+                    return True
+                else:
+                    logger.warning(f"Crypto symbol {symbol} qualified but no valid market data received")
+                    # Still return True for crypto if contract qualified
+                    return True
+                    
+            except Exception as data_error:
+                logger.warning(f"Could not get market data for crypto {symbol}: {data_error}")
+                # Still return True if contract qualified
+                return True
+            finally:
+                # Clean up market data subscription
+                try:
+                    self.get_ib().cancelMktData(contract)
+                except:
+                    pass
+                    
+        except Exception as e:
+            logger.error(f"Error validating symbol {symbol}: {e}")
+            return False
+
+    async def is_market_open(self, symbol: str) -> bool:
+        """Check if the market is open for the given symbol"""
+        try:
+            if not self.is_connected():
+                return False
+                
+            # For crypto, market is always open (24/7)
+            if CryptoUtils.is_crypto(symbol):
+                return True
+                
+            # For stocks, check if it's during regular trading hours
+            # This is a simple check - IBKR will ultimately validate
+            
+            # Get current time in Eastern timezone (US market timezone)
+            eastern = pytz.timezone('US/Eastern')
+            now = datetime.datetime.now(eastern)
+            current_time = now.time()
+            
+            # Check if it's a weekday
+            if now.weekday() >= 5:  # Saturday = 5, Sunday = 6
+                logger.warning(f"Market is closed (weekend) for {symbol}")
+                return False
+                
+            # Check if it's during regular trading hours (9:30 AM - 4:00 PM ET)
+            market_open = datetime.time(9, 30)
+            market_close = datetime.time(16, 0)
+            
+            if current_time < market_open or current_time > market_close:
+                logger.warning(f"Market is closed (outside trading hours) for {symbol}. Current time: {current_time}")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Could not determine market status for {symbol}: {e}")
+            return True  # Default to allowing the order attempt
+
     async def place_order(self, symbol: str, action: str, quantity: int, order_type: str,
                          limit_price: float = None, aux_price: float = None,
                          parent_id: int = None) -> Optional[int]:
@@ -161,32 +265,182 @@ class IBKRConnection:
             if not self.is_connected():
                 raise ConnectionError("Not connected to IBKR")
 
-            contract = Stock(symbol, "SMART", "USD")
-            await self.get_ib().qualifyContractsAsync(contract)
+            # Pre-validate the symbol to catch issues early
+            logger.info(f"Validating symbol {symbol} before placing order...")
+            if not await self.validate_symbol(symbol):
+                logger.error(f"Symbol validation failed for {symbol} - cannot place order")
+                return None
 
+            # Check if market is open for this symbol
+            if not await self.is_market_open(symbol):
+                logger.warning(f"Attempting to place order for {symbol} when market may be closed")
+                # Continue anyway as IBKR will make the final determination
+
+            # Create appropriate contract based on symbol type (crypto vs equity)
+            contract = CryptoUtils.create_contract(symbol)
+            
+            # Validate contract before placing order
+            qualified_contracts = await self.get_ib().qualifyContractsAsync(contract)
+            if not qualified_contracts:
+                logger.error(f"Could not qualify contract for {symbol} - symbol may be inactive or invalid")
+                return None
+            
+            # Use the first qualified contract
+            contract = qualified_contracts[0]
+            logger.info(f"Contract qualified for {symbol}: {contract}")
+            
+            # Verify contract has valid details using the validation utility
+            if not CryptoUtils.validate_contract(contract, symbol):
+                logger.error(f"Contract validation failed for {symbol}")
+                return None
+
+            # Determine if this is a crypto order
+            is_crypto = CryptoUtils.is_crypto(symbol)
+            
+            # Set appropriate TIF (Time In Force) for crypto vs equity
+            tif = 'IOC' if is_crypto else 'GTC'  # Crypto must use IOC, stocks can use GTC
+            
             if order_type == 'LMT':
-                order = LimitOrder(action, quantity, limit_price, tif='GTC', transmit=True)
+                order = LimitOrder(action, quantity, limit_price, tif=tif, transmit=True)
+                if is_crypto:
+                    order.outsideRth = True  # Allow 24/7 trading for crypto
             elif order_type == 'STP':
-                order = StopOrder(action, quantity, aux_price, tif='GTC', transmit=True)
+                order = StopOrder(action, quantity, aux_price, tif=tif, transmit=True)
+                if is_crypto:
+                    order.outsideRth = True  # Allow 24/7 trading for crypto
                 if parent_id:
                     order.parentId = parent_id
             else:
-                order = MarketOrder(action, quantity, tif='GTC', transmit=True)
+                order = MarketOrder(action, quantity, tif=tif, transmit=True)
+                if is_crypto:
+                    order.outsideRth = True  # Allow 24/7 trading for crypto
 
             trade = self.get_ib().placeOrder(contract, order)
-            await asyncio.sleep(2)  # Allow time for order to process
+            await asyncio.sleep(3)  # Increased wait time for order processing
 
-            # Check order status after placement
-            if trade.orderStatus.status in ['Filled', 'Submitted', 'PendingSubmit']:
-                order_id = trade.order.orderId
-                logger.info(f"Placed order {order_id}: {action} {quantity} shares of {symbol} at {limit_price or 'market'}")
-                return order_id
+            # Check order status after placement with better error handling
+            if hasattr(trade, 'orderStatus') and trade.orderStatus:
+                status = trade.orderStatus.status
+                if status in ['Filled', 'Submitted', 'PendingSubmit', 'PreSubmitted']:
+                    order_id = trade.order.orderId
+                    asset_type = "CRYPTO" if is_crypto else "EQUITY"
+                    price_str = f"{limit_price or aux_price or 'market'}"
+                    logger.info(f"Placed {asset_type} order {order_id}: {action} {quantity} shares of {symbol} at {price_str} (TIF: {tif})")
+                    return order_id
+                elif status == 'Inactive':
+                    logger.warning(f"Order for {symbol} is inactive - attempting retry after delay")
+                    
+                    # Wait and check if order becomes active
+                    await asyncio.sleep(5)
+                    
+                    # Refresh the trade object to get updated status
+                    try:
+                        # Get updated trade status
+                        updated_trade = None
+                        for existing_trade in self.get_ib().trades():
+                            if existing_trade.order.orderId == trade.order.orderId:
+                                updated_trade = existing_trade
+                                break
+                        
+                        if updated_trade and hasattr(updated_trade, 'orderStatus'):
+                            updated_status = updated_trade.orderStatus.status
+                            if updated_status in ['Filled', 'Submitted', 'PendingSubmit', 'PreSubmitted']:
+                                logger.info(f"Order for {symbol} became active after retry: {updated_status}")
+                                return trade.order.orderId
+                            else:
+                                logger.error(f"Order for {symbol} remains inactive after retry: {updated_status}")
+                        
+                    except Exception as retry_error:
+                        logger.warning(f"Error during retry check for {symbol}: {retry_error}")
+                    
+                    # Cancel the inactive order to clean up
+                    try:
+                        self.get_ib().cancelOrder(trade.order)
+                        logger.info(f"Cancelled inactive order for {symbol}")
+                    except Exception as cancel_error:
+                        logger.warning(f"Could not cancel inactive order: {cancel_error}")
+                    return None
+                elif status == 'Cancelled':
+                    logger.error(f"Order for {symbol} was cancelled by the system")
+                    return None
+                else:
+                    logger.error(f"Order failed for {symbol}: {status}")
+                    return None
             else:
-                logger.error(f"Order failed: {trade.orderStatus.status}")
+                logger.error(f"No order status available for {symbol} - trade object may be invalid")
                 return None
+                
         except Exception as e:
-            logger.error(f"Failed to place order: {str(e)}")
+            logger.error(f"Failed to place order for {symbol}: {str(e)}")
             return None
+
+    async def get_account_equity(self) -> float:
+        """Get total account equity for position sizing"""
+        try:
+            if not self.is_connected():
+                logger.warning("Not connected to IBKR for account equity check - using paper trading default")
+                return 100000.0  # Paper trading default
+            
+            # Method 1: Try account summary with proper API call
+            try:
+                # For ib_insync, reqAccountSummaryAsync takes positional arguments
+                account_values = await self.get_ib().reqAccountSummaryAsync(
+                    'All',
+                    'NetLiquidation'
+                )
+                
+                for value in account_values:
+                    if value.tag == 'NetLiquidation' and value.currency == 'USD':
+                        equity = float(value.value)
+                        logger.info(f"Account equity (summary): ${equity:,.2f}")
+                        return equity
+                        
+            except Exception as e:
+                logger.warning(f"Account summary method failed: {e}")
+            
+            # Method 2: Try account values (fallback)
+            try:
+                account_values = self.get_ib().accountValues()
+                for value in account_values:
+                    if value.tag == 'NetLiquidationByCurrency' and value.currency == 'USD':
+                        equity = float(value.value)
+                        logger.info(f"Account equity (values): ${equity:,.2f}")
+                        return equity
+                        
+            except Exception as e:
+                logger.warning(f"Account values method failed: {e}")
+            
+            # For paper trading, use reasonable default
+            logger.warning("Could not get real account equity - using paper trading default")
+            return 100000.0  # Paper trading default
+            
+        except Exception as e:
+            logger.error(f"Error getting account equity: {e}")
+            return 100000.0  # Paper trading default
+
+    async def get_crypto_positions(self, symbol: str) -> float:
+        """Get current crypto position for a symbol"""
+        try:
+            if not self.is_connected():
+                logger.warning("Not connected to IBKR for position check")
+                return 0.0
+            
+            positions = self.get_ib().positions()
+            for position in positions:
+                if (hasattr(position.contract, 'symbol') and 
+                    position.contract.symbol == symbol and 
+                    hasattr(position.contract, 'secType') and
+                    position.contract.secType == 'CRYPTO'):
+                    current_position = float(position.position)
+                    logger.info(f"Current {symbol} position: {current_position} shares")
+                    return current_position
+            
+            logger.info(f"No existing {symbol} position found")
+            return 0.0
+            
+        except Exception as e:
+            logger.error(f"Error getting crypto positions: {e}")
+            return 0.0
 
     async def get_order_status(self, order_id: int) -> Dict:
         """Get the status of an order."""

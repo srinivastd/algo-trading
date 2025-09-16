@@ -22,17 +22,24 @@ class StrategyBase(ABC):
         """Generate trading signals"""
         pass
         
-    async def generate_realtime_signals(self, df: pd.DataFrame) -> int:
+    async def generate_realtime_signals(self, df: pd.DataFrame, symbol: str = '') -> int:
         """Generate real-time trading signals (entry signals)
         
         Args:
             df: DataFrame with current market data and indicators
+            symbol: Symbol being traded (optional for backward compatibility)
             
         Returns:
             int: Signal value (1 for buy, -1 for sell, 0 for no action)
         """
         # Default implementation can be overridden by specific strategies
-        signals = self.generate_signals(df)
+        # Pass symbol to generate_signals if the method supports it
+        try:
+            signals = self.generate_signals(df, symbol)
+        except TypeError:
+            # Fallback for strategies that don't support symbol parameter
+            signals = self.generate_signals(df)
+        
         if len(signals) > 0:
             return int(signals['signal'].iloc[-1])
         return 0
