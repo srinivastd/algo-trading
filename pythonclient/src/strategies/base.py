@@ -8,6 +8,10 @@ from abc import ABC, abstractmethod
 
 class StrategyBase(ABC):
     """Base class for all trading strategies"""
+
+    # CLI / ChromaDB `strategy` metadata slug (override in subclasses)
+    STRATEGY_SLUG = "unknown"
+
     def __init__(self, name: str):
         self.name = name
         self.indicators = {}

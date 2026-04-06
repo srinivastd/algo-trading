@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 class MeanReversionStrategy(StrategyBase):
     """Mean reversion strategy optimized for high volatility stocks"""
 
+    STRATEGY_SLUG = "mean_reversion"
+
     def __init__(self, risk_per_trade: float = 1000, max_duration_hours: float = 24.0, paper_trading: bool = True,
                  stop_loss_pct: float = 2.0, target_pct: float = 3.0, bar_size: str = "1 hour", duration: str = "1 M",
                  rsi_oversold: float = 30.0, rsi_overbought: float = 70.0, bb_position_threshold: float = 0.2):
@@ -282,6 +284,53 @@ class MeanReversionStrategy(StrategyBase):
         successful_trades = sum(1 for trade in trades if trade.get('profit', 0) > 0)
         success_rate = (successful_trades / total_trades * 100) if total_trades > 0 else 0
         total_profit = sum(trade.get('profit', 0) for trade in trades)
+
+        def _last_float(col: str) -> Optional[float]:
+            if col not in df.columns or df[col].empty:
+                return None
+            v = df[col].iloc[-1]
+            try:
+                return float(v) if pd.notna(v) else None
+            except (TypeError, ValueError):
+                return None
+
+        meta = {
+            "strategy": self.STRATEGY_SLUG,
+            "symbol": symbol,
+            "total_profit": total_profit,
+            "success_rate": success_rate,
+            "initial_capital": initial_capital,
+            "final_capital": capital,
+            "total_trades": total_trades,
+            "trades": str(trades),
+            "risk_per_trade": self.risk_per_trade,
+            "stop_loss_pct": self.stop_loss_pct,
+            "target_pct": self.target_pct,
+            "bar_size": self.bar_size,
+            "duration": self.duration,
+            "paper_trading": self.paper_trading,
+            "max_duration_hours": float(self.max_duration_hours),
+            "rsi_oversold": self.rsi_oversold,
+            "rsi_overbought": self.rsi_overbought,
+            "rsi": _last_float("rsi"),
+            "bb_position": _last_float("bb_position"),
+            "volume_ratio": _last_float("volume_ratio"),
+            "volatility": _last_float("volatility"),
+        }
+        result_id = f"{symbol}_{str(pd.Timestamp.now())}"
+        # Chroma metadata: omit None values (schema varies by version)
+        meta_for_chroma = {k: v for k, v in meta.items() if v is not None}
+        try:
+            self.collection.add(
+                documents=[
+                    f"Backtest result ({self.STRATEGY_SLUG}) for {symbol}: {total_profit} profit, {success_rate}% success rate"
+                ],
+                metadatas=meta_for_chroma,
+                ids=[result_id],
+            )
+            logger.info(f"Stored backtest results for {symbol} in ChromaDB with ID {result_id}")
+        except Exception as e:
+            logger.warning(f"ChromaDB store failed for mean reversion backtest: {e}")
 
         return {
             'initial_capital': initial_capital,

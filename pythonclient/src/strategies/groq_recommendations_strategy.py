@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 
 class GroqRecommendationsStrategy(StrategyBase):
     """Strategy based on supply/demand zones with optimized ADX and duration, with paper trading support"""
-    
+
+    STRATEGY_SLUG = "groq"
+
     def __init__(self, risk_per_trade: float = 3000, max_duration_hours: float = 12.0, paper_trading: bool = True,
                  stop_loss_pct: float = 1.0, target_pct: float = 4.0, bar_size: str = "1 hour", duration: str = "1 M"):
         super().__init__("Groq Recommendations Strategy")
@@ -414,13 +416,54 @@ class GroqRecommendationsStrategy(StrategyBase):
             return {'status': 'error', 'message': 'No IBKR client'}
 
         try:
+            # Anchor execution prices to live market snapshot (not stale backtest bar)
+            # while preserving requested risk/reward proportions.
+            live_entry_price = entry_price
+            try:
+                contract = self.ib_client.get_ib().qualifyContracts(
+                    IBKRConnection.create_contract if False else None
+                )
+            except Exception:
+                pass
+            try:
+                ib = self.ib_client.get_ib()
+                contract = Stock(symbol.upper(), "SMART", "USD")
+                qualified = await ib.qualifyContractsAsync(contract)
+                if qualified:
+                    ticker = ib.reqMktData(qualified[0], '', True, False)
+                    await asyncio.sleep(1.0)
+                    market_px = None
+                    if hasattr(ticker, 'marketPrice'):
+                        mp = ticker.marketPrice()
+                        if mp and mp > 0:
+                            market_px = float(mp)
+                    if market_px is None and hasattr(ticker, 'last') and ticker.last and ticker.last > 0:
+                        market_px = float(ticker.last)
+                    if market_px is None and hasattr(ticker, 'close') and ticker.close and ticker.close > 0:
+                        market_px = float(ticker.close)
+                    if market_px is not None:
+                        live_entry_price = market_px
+                        logger.info(f"Using live market reference for {symbol}: ${live_entry_price:.4f}")
+                    ib.cancelMktData(qualified[0])
+            except Exception as market_error:
+                logger.warning(f"Could not fetch live market price for {symbol}; using computed entry price: {market_error}")
+
+            # Preserve stop/target ratios but apply them to live entry.
+            if entry_price and entry_price > 0:
+                if stop_loss is not None:
+                    stop_ratio = abs(entry_price - stop_loss) / entry_price
+                    stop_loss = live_entry_price * (1 - stop_ratio) if signal == 1 else live_entry_price * (1 + stop_ratio)
+                if target is not None:
+                    target_ratio = abs(target - entry_price) / entry_price
+                    target = live_entry_price * (1 + target_ratio) if signal == 1 else live_entry_price * (1 - target_ratio)
+
             # Place parent order first
             parent_order_id = await self.ib_client.place_order(
                 symbol=symbol,
                 action='BUY' if signal == 1 else 'SELL',
                 quantity=shares,
                 order_type='LMT',
-                limit_price=entry_price
+                limit_price=live_entry_price
             )
             
             if not parent_order_id:
@@ -521,7 +564,10 @@ class GroqRecommendationsStrategy(StrategyBase):
                 result['target_order_id'] = target_order_id
             
             trade_type = 'Long' if signal == 1 else 'Short'
-            logger.info(f"Placed {'paper' if self.paper_trading else 'live'} trade: {trade_type} {symbol}, Entry: ${entry_price:.2f}, Stop: ${stop_loss:.2f}, Target: ${target:.2f}")
+            logger.info(
+                f"Placed {'paper' if self.paper_trading else 'live'} trade: "
+                f"{trade_type} {symbol}, Entry: ${live_entry_price:.2f}, Stop: ${stop_loss:.2f}, Target: ${target:.2f}"
+            )
             
             return result
             
@@ -579,8 +625,8 @@ class GroqRecommendationsStrategy(StrategyBase):
                         active_orders[trade_result['order_id']] = {
                             'shares': shares,
                             'is_long': is_long,
-                            'stop_order_id': trade_result['stop_order_id'],
-                            'target_order_id': trade_result['target_order_id']
+                            'stop_order_id': trade_result.get('stop_order_id'),
+                            'target_order_id': trade_result.get('target_order_id')
                         }
                         logger.debug(f"Entered {trades[-1]['type']} at ${entry_price:.2f}, shares: {shares} via paper trading")
                     else:
@@ -686,6 +732,7 @@ class GroqRecommendationsStrategy(StrategyBase):
 
         # Enhanced metadata with deep stock profiling features (inspired by paper)
         metadatas = [{
+            "strategy": self.STRATEGY_SLUG,
             "symbol": symbol,
             "total_profit": total_profit,
             "success_rate": success_rate,
@@ -717,13 +764,16 @@ class GroqRecommendationsStrategy(StrategyBase):
             # Strategy parameters
             "bar_size": self.bar_size,
             "duration": self.duration,
-            "paper_trading": self.paper_trading
+            "paper_trading": self.paper_trading,
+            "max_duration_hours": float(self.max_duration_hours),
         }]
 
         # Store results in ChromaDB
         result_id = f"{symbol}_{str(pd.Timestamp.now())}"
         self.collection.add(
-            documents=[f"Backtest result for {symbol}: {total_profit} profit, {success_rate}% success rate"],
+            documents=[
+                f"Backtest result ({self.STRATEGY_SLUG}) for {symbol}: {total_profit} profit, {success_rate}% success rate"
+            ],
             metadatas=metadatas[0],  # Pass the first (and only) metadata dictionary
             ids=[result_id]
         )
