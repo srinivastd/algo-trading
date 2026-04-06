@@ -100,12 +100,14 @@ class HistoricalDataManager:
             
     async def fetch_data_chunk(self, contract, end_date: datetime, duration: str, bar_size: str) -> Optional[pd.DataFrame]:
         try:
-            logger.info(f"Requesting historical data ending at {end_date}...")
+            # Format end_date for IBKR API (yyyymmdd hh:mm:ss tz format)
+            end_date_str = end_date.strftime('%Y%m%d %H:%M:%S US/Eastern')
+            logger.info(f"Requesting historical data ending at {end_date_str}...")
             # Use appropriate parameters for crypto vs equity
             is_crypto = CryptoUtils.is_crypto(contract.symbol)
             bars = await self.connection.get_ib().reqHistoricalDataAsync(
                 contract,
-                endDateTime=end_date,
+                endDateTime=end_date_str,
                 durationStr=duration,
                 barSizeSetting=bar_size,
                 whatToShow='AGGTRADES' if is_crypto else 'TRADES',

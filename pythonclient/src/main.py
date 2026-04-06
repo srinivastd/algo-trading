@@ -17,6 +17,7 @@ from strategies.supplydemand_surge import SupplyDemandSurgeStrategy
 from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy
 from strategies.crossSectionalMomentumStrategy import CrossSectionalMomentumStrategy
 from strategies.vwap_mean_reversion_strategy import VWAPTrendTradingStrategy
+from strategies.mean_reversion_strategy import MeanReversionStrategy
 from ib_insync import Stock, util
 import json
 import os
@@ -541,6 +542,9 @@ async def main():
     if args.strategy == "groq":
         strategy = GroqRecommendationsStrategy(**strategy_params)
         logger.info(f"Strategy initialized with: stop_loss_pct={strategy.stop_loss_pct}%, target_pct={strategy.target_pct}%, risk_per_trade=${strategy.risk_per_trade}")
+    elif args.strategy == "mean_reversion":
+        strategy = MeanReversionStrategy(**strategy_params)
+        logger.info(f"Mean Reversion Strategy initialized with: stop_loss_pct={strategy.stop_loss_pct}%, target_pct={strategy.target_pct}%, risk_per_trade=${strategy.risk_per_trade}")
     else:
         raise ValueError(f"Unknown strategy: {args.strategy}")
     
@@ -586,10 +590,10 @@ async def main():
         if args.watch:
             # Real-time watching mode for multiple stocks
             logger.info(f"Starting real-time watch for {args.symbols} with check interval {args.check_interval} seconds")
-            if args.strategy != 'groq':
-                logger.error(f"Real-time watching only supported for groq strategy, not: {args.strategy}")
+            if args.strategy not in ['groq', 'mean_reversion']:
+                logger.error(f"Real-time watching only supported for groq and mean_reversion strategies, not: {args.strategy}")
                 return
-                
+
             # Set IB client for watch mode
             strategy.set_ib_client(connection)
             

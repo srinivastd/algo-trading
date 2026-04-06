@@ -76,6 +76,59 @@ class GroqRecommendationsStrategy(StrategyBase):
         df['minus_di'] = 100 * df['minus_dm'].rolling(window=14).mean() / df['atr']
         df['dx'] = 100 * np.abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
         df['adx'] = df['dx'].rolling(window=14).mean()
+
+        # Enhanced stock profiling features (inspired by paper's deep stock profiles)
+        # RSI (Relative Strength Index)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+
+        # MACD (Moving Average Convergence Divergence)
+        df['ema_12'] = df['close'].ewm(span=12, adjust=False).mean()
+        df['ema_26'] = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = df['ema_12'] - df['ema_26']
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        df['macd_histogram'] = df['macd'] - df['macd_signal']
+
+        # Bollinger Bands
+        df['sma_20'] = df['close'].rolling(window=20).mean()
+        df['bb_std'] = df['close'].rolling(window=20).std()
+        df['bb_upper'] = df['sma_20'] + (df['bb_std'] * 2)
+        df['bb_lower'] = df['sma_20'] - (df['bb_std'] * 2)
+        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+
+        # Volume indicators
+        df['volume_sma_20'] = df['volume'].rolling(window=20).mean()
+        df['volume_ratio'] = df['volume'] / df['volume_sma_20']
+
+        # Price momentum indicators
+        df['returns_1d'] = df['close'].pct_change(1)
+        df['returns_5d'] = df['close'].pct_change(5)
+        df['returns_20d'] = df['close'].pct_change(20)
+
+        # Volatility measures
+        df['returns_std_20'] = df['returns_1d'].rolling(window=20).std()
+        df['returns_std_60'] = df['returns_1d'].rolling(window=60).std()
+
+        # Stock profile score (weighted combination of factors)
+        # Normalize and combine key indicators for stock selection
+        df['trend_score'] = (
+            (df['adx'] / 100) * 0.3 +  # Trend strength
+            (df['plus_di'] - df['minus_di']).clip(-50, 50) / 100 * 0.3 +  # DI difference
+            df['macd_histogram'].clip(-2, 2) / 4 * 0.2 +  # Momentum
+            (df['rsi'] - 50).clip(-30, 30) / 60 * 0.2  # Mean reversion
+        )
+
+        df['momentum_score'] = (
+            df['returns_20d'].clip(-0.5, 0.5) * 2 * 0.4 +  # 20-day returns
+            df['volume_ratio'].clip(0, 3) / 3 * 0.3 +  # Volume strength
+            df['bb_position'].clip(0, 1) * 0.3  # Bollinger position
+        )
+
+        # Combined stock profile score for ranking
+        df['stock_profile_score'] = (df['trend_score'] + df['momentum_score']) / 2
         
         return df
         
@@ -95,37 +148,116 @@ class GroqRecommendationsStrategy(StrategyBase):
                 demand_zones.append((df.index[i], df['high'].iloc[i], df['low'].iloc[i]))
         
         return supply_zones, demand_zones
+
+    def get_stock_selection_score(self, df: pd.DataFrame) -> float:
+        """Calculate stock selection score for portfolio construction (inspired by paper's approach)"""
+        if len(df) < 50:  # Need sufficient data
+            return 0.0
+
+        # Use the latest stock profile score as the selection criterion
+        if 'stock_profile_score' in df.columns and not df['stock_profile_score'].empty:
+            return float(df['stock_profile_score'].iloc[-1])
+
+        # Fallback to basic technical score
+        latest = df.iloc[-1]
+        score = 0.0
+
+        # Trend strength (ADX)
+        if 'adx' in df.columns:
+            score += min(latest['adx'] / 100, 0.3)
+
+        # Momentum (MACD)
+        if 'macd_histogram' in df.columns:
+            score += min(max(latest['macd_histogram'], -1), 1) * 0.2
+
+        # Mean reversion (RSI)
+        if 'rsi' in df.columns:
+            rsi_score = 1 - abs(latest['rsi'] - 50) / 50  # Higher score when RSI is neutral
+            score += rsi_score * 0.2
+
+        # Volume strength
+        if 'volume_ratio' in df.columns:
+            score += min(latest['volume_ratio'] / 2, 0.3)
+
+        return score
         
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
         signals = pd.DataFrame(index=df.index)
         signals['signal'] = 0
-        
+        signals['confidence_score'] = 0.0
+        signals['stock_profile_score'] = 0.0
+
         supply_zones, demand_zones = self.identify_zones(df)
-        
+
         for i in range(1, len(df) - 1):
             current_price = df['close'].iloc[i]
-            
+            profile_score = df['stock_profile_score'].iloc[i] if 'stock_profile_score' in df.columns else 0
+            signals.loc[signals.index[i], 'stock_profile_score'] = profile_score
+
+            # Enhanced signal generation with stock profile scoring (inspired by paper's approach)
             for zone_time, zone_high, zone_low in supply_zones:
-                if ((df.index[i] - zone_time) < timedelta(hours=12) and  # Phase 2: 12h
+                if ((df.index[i] - zone_time) < timedelta(hours=12) and
                     df['close'].iloc[i] > zone_high and
-                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * 1.1 and  # Phase 2: 10%
+                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * 1.1 and
                     df['volume'].iloc[i-1] > df['volume'].iloc[i-2] * 1.05):
+
+                    # Enhanced short signal with profile score weighting
+                    confidence = 0.5  # Base confidence
+
+                    # Boost confidence based on profile score and technical conditions
+                    if profile_score < -0.3:  # Strong bearish profile
+                        confidence += 0.3
+                    elif profile_score < 0:  # Moderately bearish
+                        confidence += 0.1
+
+                    # Additional technical confirmation
+                    if df['rsi'].iloc[i] > 70:  # Overbought
+                        confidence += 0.2
+                    if df['macd_histogram'].iloc[i] < 0:  # Bearish momentum
+                        confidence += 0.1
+
                     signals.loc[signals.index[i], 'signal'] = -1
-                    logger.debug(f"Short signal at {df.index[i]}, price: {current_price:.2f}")
+                    signals.loc[signals.index[i], 'confidence_score'] = min(confidence, 1.0)
+                    logger.debug(f"Short signal at {df.index[i]}, price: {current_price:.2f}, confidence: {confidence:.2f}")
                     break
-                    
+
             for zone_time, zone_high, zone_low in demand_zones:
-                if ((df.index[i] - zone_time) < timedelta(hours=12) and 
+                if ((df.index[i] - zone_time) < timedelta(hours=12) and
                     df['close'].iloc[i] < zone_low and
                     df['volume'].iloc[i] > df['volume'].iloc[i-1] * 1.1 and
                     df['volume'].iloc[i-1] > df['volume'].iloc[i-2] * 1.05):
-                    # Phase 2: 50% trend weight - only signal if trend positive or with 50% prob
-                    if df['sma_20'].iloc[i] > df['sma_50'].iloc[i] or np.random.random() < 0.5:
+
+                    # Enhanced long signal with profile score and trend weighting
+                    confidence = 0.5  # Base confidence
+
+                    # Trend confirmation (50% weight as in Phase 2)
+                    trend_confirmed = df['sma_20'].iloc[i] > df['sma_50'].iloc[i] or np.random.random() < 0.5
+
+                    if trend_confirmed:
+                        confidence += 0.2
+
+                        # Boost confidence based on profile score
+                        if profile_score > 0.3:  # Strong bullish profile
+                            confidence += 0.3
+                        elif profile_score > 0:  # Moderately bullish
+                            confidence += 0.1
+
+                        # Additional technical confirmation
+                        if df['rsi'].iloc[i] < 30:  # Oversold
+                            confidence += 0.2
+                        if df['macd_histogram'].iloc[i] > 0:  # Bullish momentum
+                            confidence += 0.1
+                        if df['bb_position'].iloc[i] < 0.2:  # Near lower Bollinger band
+                            confidence += 0.1
+
                         signals.loc[signals.index[i], 'signal'] = 1
-                        logger.debug(f"Long signal at {df.index[i]}, price: {current_price:.2f}")
+                        signals.loc[signals.index[i], 'confidence_score'] = min(confidence, 1.0)
+                        logger.debug(f"Long signal at {df.index[i]}, price: {current_price:.2f}, confidence: {confidence:.2f}, profile: {profile_score:.3f}")
                         break
-                    
-        logger.info(f"Generated {len(signals[signals['signal'] != 0])} signals")
+
+        signal_count = len(signals[signals['signal'] != 0])
+        avg_confidence = signals[signals['signal'] != 0]['confidence_score'].mean() if signal_count > 0 else 0
+        logger.info(f"Generated {signal_count} signals with avg confidence: {avg_confidence:.2f}")
         return signals
         
     async def generate_realtime_signals(self, df: pd.DataFrame) -> int:
@@ -420,12 +552,15 @@ class GroqRecommendationsStrategy(StrategyBase):
                     continue
                     
                 shares = int(self.risk_per_trade // risk_per_share)
-                if shares <= 0 or (shares * entry_price) > (0.95 * capital):
-                    shares = int((0.95 * capital) // entry_price)
-                    if shares <= 0:
-                        continue
-                    risk_per_share = entry_price * 0.01
-                    self.risk_per_trade = shares * risk_per_share
+                if shares <= 0:
+                    continue
+
+                # Limit position size to 95% of available capital
+                max_shares_by_capital = int((0.95 * capital) // entry_price)
+                if max_shares_by_capital > 0:
+                    shares = min(shares, max_shares_by_capital)
+                elif shares * entry_price > capital:
+                    continue  # Skip trade if we can't afford even 1 share with proper risk management
                 
                 # Attempt paper trading if enabled and IB client is available
                 if self.ib_client and self.paper_trading:
@@ -549,7 +684,7 @@ class GroqRecommendationsStrategy(StrategyBase):
         success_rate = (successful_trades / total_trades * 100) if total_trades > 0 else 0
         total_profit = sum(trade.get('profit', 0) for trade in trades)
 
-        # Enhanced metadata with additional features
+        # Enhanced metadata with deep stock profiling features (inspired by paper)
         metadatas = [{
             "symbol": symbol,
             "total_profit": total_profit,
@@ -561,12 +696,25 @@ class GroqRecommendationsStrategy(StrategyBase):
             "risk_per_trade": self.risk_per_trade,
             "stop_loss_pct": self.stop_loss_pct,
             "target_pct": self.target_pct,
+            # Original technical indicators
             "volatility": float(df['volatility'].iloc[-1]) if not df['volatility'].empty else None,
             "adx": float(df['adx'].iloc[-1]) if not df['adx'].empty else None,
             "sma_20": float(df['sma_20'].iloc[-1]) if not df['sma_20'].empty else None,
             "sma_50": float(df['sma_50'].iloc[-1]) if not df['sma_50'].empty else None,
             "valid_consolidation": bool(df['valid_consolidation'].iloc[-1]) if not df['valid_consolidation'].empty else False,
             "volume_change": float(df['volume_change'].iloc[-1]) if not df['volume_change'].empty else None,
+            # Enhanced stock profiling features (from paper's approach)
+            "rsi": float(df['rsi'].iloc[-1]) if 'rsi' in df.columns and not df['rsi'].empty else None,
+            "macd_histogram": float(df['macd_histogram'].iloc[-1]) if 'macd_histogram' in df.columns and not df['macd_histogram'].empty else None,
+            "bb_position": float(df['bb_position'].iloc[-1]) if 'bb_position' in df.columns and not df['bb_position'].empty else None,
+            "volume_ratio": float(df['volume_ratio'].iloc[-1]) if 'volume_ratio' in df.columns and not df['volume_ratio'].empty else None,
+            "returns_20d": float(df['returns_20d'].iloc[-1]) if 'returns_20d' in df.columns and not df['returns_20d'].empty else None,
+            "returns_std_20": float(df['returns_std_20'].iloc[-1]) if 'returns_std_20' in df.columns and not df['returns_std_20'].empty else None,
+            # Stock profile scores (weighted combination)
+            "trend_score": float(df['trend_score'].iloc[-1]) if 'trend_score' in df.columns and not df['trend_score'].empty else None,
+            "momentum_score": float(df['momentum_score'].iloc[-1]) if 'momentum_score' in df.columns and not df['momentum_score'].empty else None,
+            "stock_profile_score": float(df['stock_profile_score'].iloc[-1]) if 'stock_profile_score' in df.columns and not df['stock_profile_score'].empty else None,
+            # Strategy parameters
             "bar_size": self.bar_size,
             "duration": self.duration,
             "paper_trading": self.paper_trading

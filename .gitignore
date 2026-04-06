@@ -68,3 +68,8 @@ pythonclient/src/ibkr/pattern_watcher.py
 pythonclient/chroma_db/dc9a242c-a3e5-4f67-9f89-4a45098fa9cf/length.bin
 .DS_Store
 pythonclient/historical_data/
+
+# Local runtime / artifacts (not for version control)
+chroma_db/
+market_data_logs/
+stock_analysis.log

@@ -49,3 +49,6 @@ MANIFEST
 ibkr_env/
 market_data_logs/
 pythonclient/historical_data/
+pythonclient/chroma_db/
+chroma_db/
+active_trades.json
