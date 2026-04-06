@@ -53,3 +53,9 @@ pythonclient/chroma_db/
 chroma_db/
 active_trades.json
 .query_venv/
+.bt_run_venv/
+runs/
+next_experiment.json
+analyze_results.json
+batch_backtest_results.*
+*.logsource

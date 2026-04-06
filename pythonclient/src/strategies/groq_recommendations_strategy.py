@@ -23,16 +23,27 @@ class GroqRecommendationsStrategy(StrategyBase):
     STRATEGY_SLUG = "groq"
 
     def __init__(self, risk_per_trade: float = 3000, max_duration_hours: float = 12.0, paper_trading: bool = True,
-                 stop_loss_pct: float = 1.0, target_pct: float = 4.0, bar_size: str = "1 hour", duration: str = "1 M"):
+                 stop_loss_pct: float = 1.0, target_pct: float = 4.0, bar_size: str = "1 hour", duration: str = "1 M",
+                 zone_lookback: int = 4, adx_min: float = 15.0,
+                 zone_freshness_hours: float = 12.0,
+                 volume_breakout_mult: float = 1.1,
+                 volume_confirm_mult: float = 1.05,
+                 position_size_cap: float = 0.95):
         super().__init__("Groq Recommendations Strategy")
         self.risk_per_trade = risk_per_trade
         self.max_duration_hours = max_duration_hours
         self.paper_trading = paper_trading
-        self.stop_loss_pct = stop_loss_pct  # Stop loss percentage
-        self.target_pct = target_pct  # Target profit percentage
-        self.ib_client = None  # Will be set by main.py
-        self.bar_size = bar_size  # Time frame of bars (e.g., "1 hour")
-        self.duration = duration  # Backtest duration (e.g., "1 M")
+        self.stop_loss_pct = stop_loss_pct
+        self.target_pct = target_pct
+        self.ib_client = None
+        self.bar_size = bar_size
+        self.duration = duration
+        self.zone_lookback = zone_lookback
+        self.adx_min = adx_min
+        self.zone_freshness_hours = zone_freshness_hours
+        self.volume_breakout_mult = volume_breakout_mult
+        self.volume_confirm_mult = volume_confirm_mult
+        self.position_size_cap = position_size_cap
         # Initialize ChromaDB client and collection
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
         self.collection = self.chroma_client.get_or_create_collection(
@@ -138,15 +149,13 @@ class GroqRecommendationsStrategy(StrategyBase):
         supply_zones = []
         demand_zones = []
         
-        for i in range(4, len(df) - 4):  # Phase 2: lookback 4
-            # Supply zone
-            if (df['close'].iloc[i] > df['close'].iloc[i-4:i].max() and 
-                df['adx'].iloc[i] > 15):  # Phase 2: adx >15
+        lb = self.zone_lookback
+        for i in range(lb, len(df) - lb):
+            if (df['close'].iloc[i] > df['close'].iloc[i-lb:i].max() and
+                df['adx'].iloc[i] > self.adx_min):
                 supply_zones.append((df.index[i], df['high'].iloc[i], df['low'].iloc[i]))
-            
-            # Demand zone  
-            elif (df['close'].iloc[i] < df['close'].iloc[i-4:i].min() and  
-                  df['adx'].iloc[i] > 15):
+            elif (df['close'].iloc[i] < df['close'].iloc[i-lb:i].min() and
+                  df['adx'].iloc[i] > self.adx_min):
                 demand_zones.append((df.index[i], df['high'].iloc[i], df['low'].iloc[i]))
         
         return supply_zones, demand_zones
@@ -198,10 +207,10 @@ class GroqRecommendationsStrategy(StrategyBase):
 
             # Enhanced signal generation with stock profile scoring (inspired by paper's approach)
             for zone_time, zone_high, zone_low in supply_zones:
-                if ((df.index[i] - zone_time) < timedelta(hours=12) and
+                if ((df.index[i] - zone_time) < timedelta(hours=self.zone_freshness_hours) and
                     df['close'].iloc[i] > zone_high and
-                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * 1.1 and
-                    df['volume'].iloc[i-1] > df['volume'].iloc[i-2] * 1.05):
+                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * self.volume_breakout_mult and
+                    df['volume'].iloc[i-1] > df['volume'].iloc[i-2] * self.volume_confirm_mult):
 
                     # Enhanced short signal with profile score weighting
                     confidence = 0.5  # Base confidence
@@ -224,10 +233,10 @@ class GroqRecommendationsStrategy(StrategyBase):
                     break
 
             for zone_time, zone_high, zone_low in demand_zones:
-                if ((df.index[i] - zone_time) < timedelta(hours=12) and
+                if ((df.index[i] - zone_time) < timedelta(hours=self.zone_freshness_hours) and
                     df['close'].iloc[i] < zone_low and
-                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * 1.1 and
-                    df['volume'].iloc[i-1] > df['volume'].iloc[i-2] * 1.05):
+                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * self.volume_breakout_mult and
+                    df['volume'].iloc[i-1] > df['volume'].iloc[i-2] * self.volume_confirm_mult):
 
                     # Enhanced long signal with profile score and trend weighting
                     confidence = 0.5  # Base confidence
@@ -601,8 +610,7 @@ class GroqRecommendationsStrategy(StrategyBase):
                 if shares <= 0:
                     continue
 
-                # Limit position size to 95% of available capital
-                max_shares_by_capital = int((0.95 * capital) // entry_price)
+                max_shares_by_capital = int((self.position_size_cap * capital) // entry_price)
                 if max_shares_by_capital > 0:
                     shares = min(shares, max_shares_by_capital)
                 elif shares * entry_price > capital:
@@ -766,6 +774,12 @@ class GroqRecommendationsStrategy(StrategyBase):
             "duration": self.duration,
             "paper_trading": self.paper_trading,
             "max_duration_hours": float(self.max_duration_hours),
+            "zone_lookback": self.zone_lookback,
+            "adx_min": self.adx_min,
+            "zone_freshness_hours": self.zone_freshness_hours,
+            "volume_breakout_mult": self.volume_breakout_mult,
+            "volume_confirm_mult": self.volume_confirm_mult,
+            "position_size_cap": self.position_size_cap,
         }]
 
         # Store results in ChromaDB

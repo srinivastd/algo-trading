@@ -516,6 +516,12 @@ def parse_args():
     parser.add_argument("--rebalance-period", type=int, default=60, help="Portfolio rebalance period in minutes")
     parser.add_argument("--vwap-threshold", type=float, default=0.5, help="VWAP threshold for entry")
     parser.add_argument("--phase2-rules", action="store_true", help="Use Phase 2 trading rules")
+    parser.add_argument("--zone-lookback", type=int, default=4, help="Bars to look back for supply/demand zones")
+    parser.add_argument("--adx-min", type=float, default=15.0, help="Minimum ADX for zone validity")
+    parser.add_argument("--zone-freshness-hours", type=float, default=12.0, help="Max hours a zone stays valid")
+    parser.add_argument("--volume-breakout-mult", type=float, default=1.1, help="Volume multiplier for breakout bar")
+    parser.add_argument("--volume-confirm-mult", type=float, default=1.05, help="Volume multiplier for confirmation bar")
+    parser.add_argument("--position-size-cap", type=float, default=0.95, help="Max fraction of capital per position")
     return parser.parse_args()
 
 async def main():
@@ -536,11 +542,19 @@ async def main():
         "stop_loss_pct": args.stop_loss,
         "target_pct": args.target,
         "bar_size": args.bar_size,
-        "duration": args.duration
+        "duration": args.duration,
+    }
+    groq_extra = {
+        "zone_lookback": args.zone_lookback,
+        "adx_min": args.adx_min,
+        "zone_freshness_hours": args.zone_freshness_hours,
+        "volume_breakout_mult": args.volume_breakout_mult,
+        "volume_confirm_mult": args.volume_confirm_mult,
+        "position_size_cap": args.position_size_cap,
     }
     
     if args.strategy == "groq":
-        strategy = GroqRecommendationsStrategy(**strategy_params)
+        strategy = GroqRecommendationsStrategy(**strategy_params, **groq_extra)
         logger.info(f"Strategy initialized with: stop_loss_pct={strategy.stop_loss_pct}%, target_pct={strategy.target_pct}%, risk_per_trade=${strategy.risk_per_trade}")
     elif args.strategy == "mean_reversion":
         strategy = MeanReversionStrategy(**strategy_params)

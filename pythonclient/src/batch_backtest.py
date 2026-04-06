@@ -203,6 +203,12 @@ def build_main_argv(
     force_refresh: bool,
     client_id: int,
     debug: bool,
+    zone_lookback: int = 4,
+    adx_min: float = 15.0,
+    zone_freshness_hours: float = 12.0,
+    volume_breakout_mult: float = 1.1,
+    volume_confirm_mult: float = 1.05,
+    position_size_cap: float = 0.95,
 ) -> List[str]:
     exe = sys.executable
     main_py = src_dir / "main.py"
@@ -229,6 +235,18 @@ def build_main_argv(
         str(initial_capital),
         "--client-id",
         str(client_id),
+        "--zone-lookback",
+        str(zone_lookback),
+        "--adx-min",
+        str(adx_min),
+        "--zone-freshness-hours",
+        str(zone_freshness_hours),
+        "--volume-breakout-mult",
+        str(volume_breakout_mult),
+        "--volume-confirm-mult",
+        str(volume_confirm_mult),
+        "--position-size-cap",
+        str(position_size_cap),
     ]
     if force_refresh:
         cmd.append("--force-refresh")
@@ -353,12 +371,24 @@ def run_single_backtest(
     debug: bool,
     chroma_path: Path,
     continue_on_error: bool,
+    zone_lookback: int = 4,
+    adx_min: float = 15.0,
+    zone_freshness_hours: float = 12.0,
+    volume_breakout_mult: float = 1.1,
+    volume_confirm_mult: float = 1.05,
+    position_size_cap: float = 0.95,
 ) -> Dict[str, Any]:
     """Run one main.py backtest, read Chroma, return a result dict."""
     cmd = build_main_argv(
         src_dir, symbol, strategy, duration, bar_size,
         risk, max_duration, stop_loss, target, initial_capital,
         force_refresh, client_id, debug,
+        zone_lookback=zone_lookback,
+        adx_min=adx_min,
+        zone_freshness_hours=zone_freshness_hours,
+        volume_breakout_mult=volume_breakout_mult,
+        volume_confirm_mult=volume_confirm_mult,
+        position_size_cap=position_size_cap,
     )
     label = f"{symbol} SL={stop_loss} T={target} maxDur={max_duration}"
     print(f"\n=== {label} ===", flush=True)
@@ -410,6 +440,12 @@ def main() -> None:
     p.add_argument("--force-refresh", action="store_true")
     p.add_argument("--client-id", type=int, default=1)
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--zone-lookback", type=int, default=4)
+    p.add_argument("--adx-min", type=float, default=15.0)
+    p.add_argument("--zone-freshness-hours", type=float, default=12.0)
+    p.add_argument("--volume-breakout-mult", type=float, default=1.1)
+    p.add_argument("--volume-confirm-mult", type=float, default=1.05)
+    p.add_argument("--position-size-cap", type=float, default=0.95)
     p.add_argument("--continue-on-error", action="store_true", help="Keep batch after a failed symbol")
     p.add_argument("--verify-schema", action="store_true", help="Print Chroma metadata checklist and exit")
     p.add_argument("--json", action="store_true", help="Also write a .json sidecar with full results")
@@ -425,6 +461,11 @@ def main() -> None:
     sweep_g.add_argument("--sweep-target", default=None, help="Comma-separated target pct values")
     sweep_g.add_argument("--sweep-max-duration", default=None, help="Comma-separated max duration values")
     sweep_g.add_argument("--sweep-risk", default=None, help="Comma-separated risk per trade values")
+    sweep_g.add_argument("--sweep-zone-lookback", default=None, help="Comma-separated zone lookback values")
+    sweep_g.add_argument("--sweep-adx-min", default=None, help="Comma-separated ADX min values")
+    sweep_g.add_argument("--sweep-zone-freshness", default=None, help="Comma-separated zone freshness hours")
+    sweep_g.add_argument("--sweep-vol-breakout", default=None, help="Comma-separated volume breakout multipliers")
+    sweep_g.add_argument("--sweep-vol-confirm", default=None, help="Comma-separated volume confirm multipliers")
 
     args = p.parse_args()
 
@@ -462,14 +503,28 @@ def main() -> None:
         tgt_vals = [float(x) for x in args.sweep_target.split(",")] if args.sweep_target else [args.target]
         dur_vals = [float(x) for x in args.sweep_max_duration.split(",")] if args.sweep_max_duration else [args.max_duration]
         risk_vals = [float(x) for x in args.sweep_risk.split(",")] if args.sweep_risk else [args.risk_per_trade]
-        grid = list(itertools.product(symbols, sl_vals, tgt_vals, dur_vals, risk_vals))
-        print(f"Sweep: {len(grid)} combinations ({len(symbols)} symbols × {len(sl_vals)} SL × {len(tgt_vals)} Tgt × {len(dur_vals)} Dur × {len(risk_vals)} Risk)")
-        for sym, sl, tgt, md, rk in grid:
+        zlb_vals = [int(x) for x in args.sweep_zone_lookback.split(",")] if args.sweep_zone_lookback else [args.zone_lookback]
+        adx_vals = [float(x) for x in args.sweep_adx_min.split(",")] if args.sweep_adx_min else [args.adx_min]
+        zfh_vals = [float(x) for x in args.sweep_zone_freshness.split(",")] if args.sweep_zone_freshness else [args.zone_freshness_hours]
+        vb_vals = [float(x) for x in args.sweep_vol_breakout.split(",")] if args.sweep_vol_breakout else [args.volume_breakout_mult]
+        vc_vals = [float(x) for x in args.sweep_vol_confirm.split(",")] if args.sweep_vol_confirm else [args.volume_confirm_mult]
+        grid = list(itertools.product(
+            symbols, sl_vals, tgt_vals, dur_vals, risk_vals,
+            zlb_vals, adx_vals, zfh_vals, vb_vals, vc_vals,
+        ))
+        print(f"Sweep: {len(grid)} combinations")
+        for sym, sl, tgt, md, rk, zlb, adxm, zfh, vb, vc in grid:
             row = run_single_backtest(
                 src_dir, sym, args.strategy, args.duration, args.bar_size,
                 rk, md, sl, tgt, args.initial_capital,
                 args.force_refresh, args.client_id, args.debug,
                 chroma_path, args.continue_on_error,
+                zone_lookback=zlb,
+                adx_min=adxm,
+                zone_freshness_hours=zfh,
+                volume_breakout_mult=vb,
+                volume_confirm_mult=vc,
+                position_size_cap=args.position_size_cap,
             )
             all_rows.append(row)
             with output_path.open("a", newline="", encoding="utf-8") as f:
@@ -487,6 +542,12 @@ def main() -> None:
                 args.risk_per_trade, args.max_duration, args.stop_loss, args.target,
                 args.initial_capital, args.force_refresh, args.client_id, args.debug,
                 chroma_path, args.continue_on_error,
+                zone_lookback=args.zone_lookback,
+                adx_min=args.adx_min,
+                zone_freshness_hours=args.zone_freshness_hours,
+                volume_breakout_mult=args.volume_breakout_mult,
+                volume_confirm_mult=args.volume_confirm_mult,
+                position_size_cap=args.position_size_cap,
             )
             all_rows.append(row)
             with output_path.open("a", newline="", encoding="utf-8") as f:
