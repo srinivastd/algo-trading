@@ -1,0 +1,12 @@
+# Symbol watchlist for batch backtest
+# One ticker per line. Lines starting with # are ignored.
+QBTS
+AAPL
+MSFT
+TSLA
+PLTR
+NVDA
+AMD
+META
+GOOG
+AMZN
