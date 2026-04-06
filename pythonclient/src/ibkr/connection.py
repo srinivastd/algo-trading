@@ -6,6 +6,7 @@ Version 1.5 - Added crypto trading support with clean separation
 import logging
 import asyncio
 import datetime
+import math
 import pytz
 from ib_insync import IB, MarketOrder, StopOrder, LimitOrder, Trade, Stock, Order, Crypto
 from typing import List, Optional, Dict
@@ -266,15 +267,32 @@ class IBKRConnection:
                 raise ConnectionError("Not connected to IBKR")
 
             # Pre-validate the symbol to catch issues early
-            logger.info(f"Validating symbol {symbol} before placing order...")
+            logger.debug(f"Validating symbol {symbol} before placing order...")
             if not await self.validate_symbol(symbol):
                 logger.error(f"Symbol validation failed for {symbol} - cannot place order")
                 return None
 
+            market_open = await self.is_market_open(symbol)
+
             # Check if market is open for this symbol
-            if not await self.is_market_open(symbol):
-                logger.warning(f"Attempting to place order for {symbol} when market may be closed")
-                # Continue anyway as IBKR will make the final determination
+            if not market_open:
+                requested_price = limit_price if order_type == 'LMT' else aux_price if order_type == 'STP' else None
+                logger.info(
+                    "ORDER_ATTEMPT symbol=%s action=%s qty=%s type=%s market_open=%s ref=%s "
+                    "requested=%s final=%s tick=%s parent=%s status=SKIPPED_MARKET_CLOSED",
+                    symbol.upper(),
+                    action.upper(),
+                    quantity,
+                    order_type,
+                    market_open,
+                    None,
+                    f"{requested_price:.6f}" if requested_price is not None else "MKT",
+                    None,
+                    None,
+                    parent_id if parent_id is not None else "-",
+                )
+                logger.info(f"Skipping order for {symbol}: market is closed")
+                return None
 
             # Create appropriate contract based on symbol type (crypto vs equity)
             contract = CryptoUtils.create_contract(symbol)
@@ -287,7 +305,7 @@ class IBKRConnection:
             
             # Use the first qualified contract
             contract = qualified_contracts[0]
-            logger.info(f"Contract qualified for {symbol}: {contract}")
+            logger.debug(f"Contract qualified for {symbol}: {contract}")
             
             # Verify contract has valid details using the validation utility
             if not CryptoUtils.validate_contract(contract, symbol):
@@ -296,6 +314,45 @@ class IBKRConnection:
 
             # Determine if this is a crypto order
             is_crypto = CryptoUtils.is_crypto(symbol)
+
+            # Obtain market snapshot + minimum tick for meaningful, valid pricing.
+            market_price = await self._get_market_reference_price(contract, symbol)
+            min_tick = await self._get_min_tick(contract)
+
+            # Normalize incoming prices to exchange tick size and keep LMT orders
+            # close to current market to avoid unrealistic stale backtest pricing.
+            requested_price = limit_price if order_type == 'LMT' else aux_price if order_type == 'STP' else None
+            if order_type == 'LMT' and limit_price is not None:
+                if market_price and market_price > 0:
+                    limit_price = self._anchor_limit_price_near_market(
+                        requested_price=limit_price,
+                        market_price=market_price,
+                        action=action,
+                        max_distance_bps=35  # 0.35% max drift from market
+                    )
+                if min_tick:
+                    limit_price = self._round_to_tick(limit_price, min_tick, action)
+
+            if order_type == 'STP' and aux_price is not None and min_tick:
+                # Stops should follow protective direction.
+                # SELL stop rounds down, BUY stop rounds up.
+                aux_price = self._round_to_tick(aux_price, min_tick, action)
+
+            final_price = limit_price if order_type == 'LMT' else aux_price if order_type == 'STP' else None
+            logger.info(
+                "ORDER_ATTEMPT symbol=%s action=%s qty=%s type=%s market_open=%s ref=%s "
+                "requested=%s final=%s tick=%s parent=%s status=SUBMITTING",
+                symbol.upper(),
+                action.upper(),
+                quantity,
+                order_type,
+                market_open,
+                f"{market_price:.6f}" if market_price is not None else "NA",
+                f"{requested_price:.6f}" if requested_price is not None else "MKT",
+                f"{final_price:.6f}" if final_price is not None else "MKT",
+                f"{min_tick:.6f}" if min_tick is not None else "NA",
+                parent_id if parent_id is not None else "-",
+            )
             
             # Set appropriate TIF (Time In Force) for crypto vs equity
             tif = 'IOC' if is_crypto else 'GTC'  # Crypto must use IOC, stocks can use GTC
@@ -373,6 +430,85 @@ class IBKRConnection:
         except Exception as e:
             logger.error(f"Failed to place order for {symbol}: {str(e)}")
             return None
+
+    async def _get_market_reference_price(self, contract, symbol: str) -> Optional[float]:
+        """Get best-effort reference price (last/market/bid/ask midpoint)."""
+        try:
+            ticker = self.get_ib().reqMktData(contract, '', True, False)
+            await asyncio.sleep(1.0)
+
+            candidates = []
+            if hasattr(ticker, 'marketPrice'):
+                mp = ticker.marketPrice()
+                if mp and mp > 0:
+                    candidates.append(float(mp))
+            if hasattr(ticker, 'last') and ticker.last and ticker.last > 0:
+                candidates.append(float(ticker.last))
+            if hasattr(ticker, 'close') and ticker.close and ticker.close > 0:
+                candidates.append(float(ticker.close))
+            if hasattr(ticker, 'bid') and hasattr(ticker, 'ask'):
+                if ticker.bid and ticker.ask and ticker.bid > 0 and ticker.ask > 0:
+                    candidates.append(float((ticker.bid + ticker.ask) / 2))
+
+            return candidates[0] if candidates else None
+        except Exception as e:
+            logger.debug(f"Could not fetch market snapshot for {symbol}: {e}")
+            return None
+        finally:
+            try:
+                self.get_ib().cancelMktData(contract)
+            except Exception:
+                pass
+
+    async def _get_min_tick(self, contract) -> Optional[float]:
+        """Get exchange minimum tick size for the contract."""
+        try:
+            details = await self.get_ib().reqContractDetailsAsync(contract)
+            if details and details[0].minTick and details[0].minTick > 0:
+                return float(details[0].minTick)
+        except Exception as e:
+            logger.debug(f"Could not fetch min tick for {getattr(contract, 'symbol', 'unknown')}: {e}")
+        return None
+
+    def _round_to_tick(self, price: float, min_tick: float, action: str) -> float:
+        if min_tick <= 0:
+            return float(price)
+        steps = price / min_tick
+        if action.upper() == 'BUY':
+            rounded_steps = math.ceil(steps)
+        elif action.upper() == 'SELL':
+            rounded_steps = math.floor(steps)
+        else:
+            rounded_steps = round(steps)
+        rounded = rounded_steps * min_tick
+        return float(round(rounded, 8))
+
+    def _anchor_limit_price_near_market(
+        self,
+        requested_price: float,
+        market_price: float,
+        action: str,
+        max_distance_bps: float = 35
+    ) -> float:
+        """
+        Clamp requested limit price to a tight band around market price so orders
+        remain meaningful and not far from current market conditions.
+        """
+        if market_price <= 0:
+            return float(requested_price)
+        band = market_price * (max_distance_bps / 10000.0)
+        lower = market_price - band
+        upper = market_price + band
+        clamped = min(max(requested_price, lower), upper)
+
+        # Keep intent directional:
+        # BUY: do not place below lower bound when trying to enter quickly
+        # SELL: do not place above upper bound when trying to enter quickly
+        if action.upper() == 'BUY':
+            return float(max(clamped, lower))
+        if action.upper() == 'SELL':
+            return float(min(clamped, upper))
+        return float(clamped)
 
     async def get_account_equity(self) -> float:
         """Get total account equity for position sizing"""
