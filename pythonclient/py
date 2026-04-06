@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Use project deps (pytz, ib_insync, …). From pythonclient/: ./py src/main.py …
+cd "$(dirname "$0")" || exit 1
+exec ./.bt_run_venv/bin/python3 "$@"
