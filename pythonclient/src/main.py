@@ -642,6 +642,9 @@ async def main():
             # Process each symbol
             all_results = {}
             for symbol, df in data_dict.items():
+                if df is None or (hasattr(df, 'empty') and df.empty):
+                    logger.error(f"No data returned for {symbol} — skipping (check the ticker is valid)")
+                    continue
                 logger.info(f"Calculating technical indicators for {symbol}...")
                 df = strategy.calculate_indicators(df)
                 
@@ -683,6 +686,9 @@ async def main():
             
             # Print summary across all symbols
             logger.info("\nSummary across all symbols:")
+            if not all_results:
+                logger.error("No valid results — every symbol was skipped or failed. Check your tickers.")
+                return
             total_return = sum(r['return_pct'] for r in all_results.values()) / len(all_results)
             total_trades = sum(r['total_trades'] for r in all_results.values())
             logger.info(f"Average Return: {total_return:.2f}%")
