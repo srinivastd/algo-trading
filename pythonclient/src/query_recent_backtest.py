@@ -160,6 +160,7 @@ def display_strategy_parameters(metadata):
     print("=" * 50)
     
     params = {
+        "Strategy": metadata.get("strategy", "legacy (no tag)"),
         "Risk per Trade": f"${metadata.get('risk_per_trade', 0):,.2f}",
         "Stop Loss %": f"{metadata.get('stop_loss_pct', 0):.1f}%",
         "Target %": f"{metadata.get('target_pct', 0):.1f}%",
