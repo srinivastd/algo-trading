@@ -210,6 +210,9 @@ async def watch_mode(symbols, strategy, connection, check_interval):
             for position in existing_positions:
                 if position.position != 0:  # Only check non-zero positions
                     pos_symbol = position.contract.symbol.upper()
+                    if position.contract.secType not in ('STK', ''):
+                        logger.debug(f"Skipping non-stock position: {pos_symbol} (type={position.contract.secType})")
+                        continue
                     position_size = float(position.position)
                     avg_cost = float(position.avgCost)
                     
@@ -339,7 +342,11 @@ async def watch_mode(symbols, strategy, connection, check_interval):
         for symbol in symbols:
             symbol_upper = symbol.upper()
             if symbol_upper in data_dict and len(data_dict[symbol_upper]) >= 2:  # Further reduced from 3 to 2 for aggressive testing
-                df = strategy.calculate_indicators(data_dict[symbol_upper].copy())
+                try:
+                    df = strategy.calculate_indicators(data_dict[symbol_upper].copy())
+                except Exception as calc_err:
+                    logger.warning(f"Indicator calculation failed for {symbol}: {calc_err}")
+                    continue
                 signal = await strategy.generate_realtime_signals(df)
                 
                 # Log signal generation with market context
@@ -692,11 +699,11 @@ async def main():
                     logger.info(f"\nTrading Mode: {mode}")
                     logger.info(f"Market Hours: 9:30 AM - 4:00 PM ET")
                     logger.info(f"Circuit Breakers Active: Yes")
-                    logger.info(f"Daily Trade Limit: {strategy.max_daily_trades}")
-                    logger.info(f"Daily Loss Limit: ${strategy.max_daily_loss:,.2f}")
-                    logger.info(f"Position Size Limit: ${strategy.max_position_size:,.2f}")
-                    logger.info(f"Min Volume: {strategy.min_volume_threshold:,.0f}")
-                    logger.info(f"Max Volatility: {strategy.max_volatility_pct:.1f}%")
+                    logger.info(f"Daily Trade Limit: {getattr(strategy, 'max_daily_trades', 'N/A')}")
+                    logger.info(f"Daily Loss Limit: ${getattr(strategy, 'max_daily_loss', 0):,.2f}")
+                    logger.info(f"Position Size Limit: ${getattr(strategy, 'max_position_size', 0):,.2f}")
+                    logger.info(f"Min Volume: {getattr(strategy, 'min_volume_threshold', 0):,.0f}")
+                    logger.info(f"Max Volatility: {getattr(strategy, 'max_volatility_pct', 0):.1f}%")
             
             # Print summary across all symbols
             logger.info("\nSummary across all symbols:")
