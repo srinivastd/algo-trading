@@ -68,7 +68,7 @@ class GroqRecommendationsStrategy(StrategyBase):
         
         df['range'] = df['high'] - df['low']
         df['volatility'] = df['range'].rolling(window=5).mean()
-        df['volume_change'] = df['volume'].pct_change().abs()
+        df['volume_change'] = df['volume'].replace(0, np.nan).pct_change().abs().fillna(0)
         
         df['consolidation'] = (df['range'] < 1.2 * df['volatility'].shift(1)) & (df['volume_change'] < 0.2)
         df['consolidation_count'] = df['consolidation'].rolling(window=2).sum()
@@ -85,18 +85,21 @@ class GroqRecommendationsStrategy(StrategyBase):
         df['atr'] = df['tr'].rolling(window=14).mean()
         df['plus_dm'] = np.where((df['high'] > df['high'].shift(1)) & (df['high'] - df['high'].shift(1) > df['low'].shift(1) - df['low']), df['high'] - df['high'].shift(1), 0)
         df['minus_dm'] = np.where((df['low'] < df['low'].shift(1)) & (df['low'].shift(1) - df['low'] > df['high'] - df['high'].shift(1)), df['low'].shift(1) - df['low'], 0)
-        df['plus_di'] = 100 * df['plus_dm'].rolling(window=14).mean() / df['atr']
-        df['minus_di'] = 100 * df['minus_dm'].rolling(window=14).mean() / df['atr']
-        df['dx'] = 100 * np.abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
+        atr_safe = df['atr'].replace(0, np.nan)
+        df['plus_di'] = 100 * df['plus_dm'].rolling(window=14).mean() / atr_safe
+        df['minus_di'] = 100 * df['minus_dm'].rolling(window=14).mean() / atr_safe
+        di_sum = (df['plus_di'] + df['minus_di']).replace(0, np.nan)
+        df['dx'] = 100 * np.abs(df['plus_di'] - df['minus_di']) / di_sum
         df['adx'] = df['dx'].rolling(window=14).mean()
+        df[['plus_di', 'minus_di', 'dx', 'adx']] = df[['plus_di', 'minus_di', 'dx', 'adx']].fillna(0)
 
         # Enhanced stock profiling features (inspired by paper's deep stock profiles)
         # RSI (Relative Strength Index)
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
+        rs = gain / loss.replace(0, np.nan)
+        df['rsi'] = (100 - (100 / (1 + rs))).fillna(50)
 
         # MACD (Moving Average Convergence Divergence)
         df['ema_12'] = df['close'].ewm(span=12, adjust=False).mean()
@@ -110,11 +113,12 @@ class GroqRecommendationsStrategy(StrategyBase):
         df['bb_std'] = df['close'].rolling(window=20).std()
         df['bb_upper'] = df['sma_20'] + (df['bb_std'] * 2)
         df['bb_lower'] = df['sma_20'] - (df['bb_std'] * 2)
-        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+        bb_width = (df['bb_upper'] - df['bb_lower']).replace(0, np.nan)
+        df['bb_position'] = ((df['close'] - df['bb_lower']) / bb_width).fillna(0.5)
 
         # Volume indicators
         df['volume_sma_20'] = df['volume'].rolling(window=20).mean()
-        df['volume_ratio'] = df['volume'] / df['volume_sma_20']
+        df['volume_ratio'] = (df['volume'] / df['volume_sma_20'].replace(0, np.nan)).fillna(0)
 
         # Price momentum indicators
         df['returns_1d'] = df['close'].pct_change(1)
@@ -286,18 +290,23 @@ class GroqRecommendationsStrategy(StrategyBase):
         for zone_time, zone_high, zone_low in supply_zones:
             if ((current_time - zone_time) < timedelta(hours=24) and   # Match backtest: 24 hours
                 current_price > zone_high and                          # Match backtest: price breakout required
-                len(df) >= 2 and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):  # Match backtest: volume confirmation
+                len(df) >= 2 and float(df['volume'].iloc[-2]) > 0
+                and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):  # Match backtest: volume confirmation
                 
                 # Log detailed entry conditions when signal is generated
-                current_volume = df['volume'].iloc[-1]
-                prev_volume = df['volume'].iloc[-2]
-                volume_ratio = current_volume / prev_volume
+                current_volume = float(df['volume'].iloc[-1])
+                prev_volume = float(df['volume'].iloc[-2])
+                volume_ratio = (
+                    current_volume / prev_volume if prev_volume > 0
+                    else (float("inf") if current_volume > 0 else 0.0)
+                )
+                ratio_log = f"{volume_ratio:.2f}" if volume_ratio != float("inf") else "inf"
                 current_adx = df['adx'].iloc[-1] if 'adx' in df.columns else 0
                 time_diff_hours = (current_time - zone_time).total_seconds() / 3600
                 
                 logger.info(f"✅ SHORT SIGNAL GENERATED at {current_time}:")
                 logger.info(f"   Price: ${current_price:.2f} (broke above supply zone ${zone_high:.2f})")
-                logger.info(f"   Volume: {current_volume:,.0f} (1.2x+ previous: {prev_volume:,.0f}, ratio: {volume_ratio:.2f})")
+                logger.info(f"   Volume: {current_volume:,.0f} (1.2x+ previous: {prev_volume:,.0f}, ratio: {ratio_log})")
                 logger.info(f"   ADX: {current_adx:.1f}")
                 logger.info(f"   Zone Age: {time_diff_hours:.1f} hours")
                 logger.info(f"   Zone Range: ${zone_low:.2f} - ${zone_high:.2f}")
@@ -306,18 +315,23 @@ class GroqRecommendationsStrategy(StrategyBase):
         for zone_time, zone_high, zone_low in demand_zones:
             if ((current_time - zone_time) < timedelta(hours=24) and   # Match backtest: 24 hours
                 current_price < zone_low and                           # Match backtest: price breakout required  
-                len(df) >= 2 and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):  # Match backtest: volume confirmation
+                len(df) >= 2 and float(df['volume'].iloc[-2]) > 0
+                and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):  # Match backtest: volume confirmation
                 
                 # Log detailed entry conditions when signal is generated
-                current_volume = df['volume'].iloc[-1]
-                prev_volume = df['volume'].iloc[-2]
-                volume_ratio = current_volume / prev_volume
+                current_volume = float(df['volume'].iloc[-1])
+                prev_volume = float(df['volume'].iloc[-2])
+                volume_ratio = (
+                    current_volume / prev_volume if prev_volume > 0
+                    else (float("inf") if current_volume > 0 else 0.0)
+                )
+                ratio_log = f"{volume_ratio:.2f}" if volume_ratio != float("inf") else "inf"
                 current_adx = df['adx'].iloc[-1] if 'adx' in df.columns else 0
                 time_diff_hours = (current_time - zone_time).total_seconds() / 3600
                 
                 logger.info(f"✅ LONG SIGNAL GENERATED at {current_time}:")
                 logger.info(f"   Price: ${current_price:.2f} (broke below demand zone ${zone_low:.2f})")
-                logger.info(f"   Volume: {current_volume:,.0f} (1.2x+ previous: {prev_volume:,.0f}, ratio: {volume_ratio:.2f})")
+                logger.info(f"   Volume: {current_volume:,.0f} (1.2x+ previous: {prev_volume:,.0f}, ratio: {ratio_log})")
                 logger.info(f"   ADX: {current_adx:.1f}")
                 logger.info(f"   Zone Age: {time_diff_hours:.1f} hours")
                 logger.info(f"   Zone Range: ${zone_low:.2f} - ${zone_high:.2f}")
@@ -337,7 +351,11 @@ class GroqRecommendationsStrategy(StrategyBase):
         
         # Get current momentum indicators
         current_adx = df['adx'].iloc[-1] if 'adx' in df.columns else 50
-        price_change = (current_price - prev_price) / prev_price
+        prev_price = float(prev_price)
+        current_price = float(current_price)
+        price_change = (
+            (current_price - prev_price) / prev_price if prev_price != 0 else 0.0
+        )
         
         supply_zones, demand_zones = self.identify_zones(df)
         
@@ -590,7 +608,6 @@ class GroqRecommendationsStrategy(StrategyBase):
         capital = initial_capital
         position = 0
         trades = []
-        active_orders = {}
 
         for i in range(1, len(df) - 1):
             if signals['signal'].iloc[i] != 0 and position == 0:
@@ -616,52 +633,18 @@ class GroqRecommendationsStrategy(StrategyBase):
                 elif shares * entry_price > capital:
                     continue  # Skip trade if we can't afford even 1 share with proper risk management
                 
-                # Attempt paper trading if enabled and IB client is available
-                if self.ib_client and self.paper_trading:
-                    trade_result = await self.execute_trade(symbol, signals['signal'].iloc[i], entry_price, shares, stop_loss, target)
-                    if trade_result['status'] == 'success':
-                        position = shares if is_long else -shares
-                        trades.append({
-                            'entry_date': entry_time,
-                            'entry_price': entry_price,
-                            'shares': abs(shares),
-                            'stop_loss': stop_loss,
-                            'target': target,
-                            'type': 'LONG' if is_long else 'SHORT',
-                            'order_id': trade_result['order_id']
-                        })
-                        active_orders[trade_result['order_id']] = {
-                            'shares': shares,
-                            'is_long': is_long,
-                            'stop_order_id': trade_result.get('stop_order_id'),
-                            'target_order_id': trade_result.get('target_order_id')
-                        }
-                        logger.debug(f"Entered {trades[-1]['type']} at ${entry_price:.2f}, shares: {shares} via paper trading")
-                    else:
-                        logger.warning(f"Paper trade failed: {trade_result['message']}. Falling back to simulation.")
-                        # Fall back to simulation if paper trading fails
-                        position = shares if is_long else -shares
-                        trades.append({
-                            'entry_date': entry_time,
-                            'entry_price': entry_price,
-                            'shares': abs(shares),
-                            'stop_loss': stop_loss,
-                            'target': target,
-                            'type': 'LONG' if is_long else 'SHORT'
-                        })
-                        logger.debug(f"Simulated entry {trades[-1]['type']} at ${entry_price:.2f}, shares: {shares}")
-                else:
-                    # Default to simulation
-                    position = shares if is_long else -shares
-                    trades.append({
-                        'entry_date': entry_time,
-                        'entry_price': entry_price,
-                        'shares': abs(shares),
-                        'stop_loss': stop_loss,
-                        'target': target,
-                        'type': 'LONG' if is_long else 'SHORT'
-                    })
-                    logger.debug(f"Simulated entry {trades[-1]['type']} at ${entry_price:.2f}, shares: {shares}")
+                # Backtest always simulates — real IBKR orders are only placed
+                # from watch_mode (live monitoring), never from historical replay.
+                position = shares if is_long else -shares
+                trades.append({
+                    'entry_date': entry_time,
+                    'entry_price': entry_price,
+                    'shares': abs(shares),
+                    'stop_loss': stop_loss,
+                    'target': target,
+                    'type': 'LONG' if is_long else 'SHORT'
+                })
+                logger.debug(f"Simulated entry {trades[-1]['type']} at ${entry_price:.2f}, shares: {shares}")
 
             elif position != 0:
                 current_trade = trades[-1]
@@ -669,55 +652,32 @@ class GroqRecommendationsStrategy(StrategyBase):
                 current_time = df.index[i]
                 time_held = (current_time - current_trade['entry_date']).total_seconds() / 3600
 
-                # Handle paper trading exits if order_id exists
-                if 'order_id' in current_trade and self.ib_client and self.paper_trading:
-                    order_status = await self.ib_client.get_order_status(current_trade['order_id'])
-                    if order_status['filled']:
-                        exit_price = order_status['avg_fill_price']
-                        is_long = current_trade['type'] == 'LONG'
-                        profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if is_long else (current_trade['entry_price'] - exit_price) * current_trade['shares']
+                # Backtest exits are always simulated (no IBKR interaction)
+                if time_held >= self.max_duration_hours:
+                    exit_price = current_price
+                    profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if current_trade['type'] == 'LONG' else (current_trade['entry_price'] - exit_price) * current_trade['shares']
+                    capital += profit
+                    position = 0
+                    current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
+                    logger.debug(f"Exited {current_trade['type']} after {time_held:.2f}h at ${exit_price:.2f}, profit: ${profit:.2f}")
+                    continue
+
+                if current_trade['type'] == 'LONG':
+                    if current_price <= current_trade['stop_loss'] or current_price >= current_trade['target']:
+                        exit_price = current_trade['stop_loss'] if current_price <= current_trade['stop_loss'] else current_trade['target']
+                        profit = (exit_price - current_trade['entry_price']) * current_trade['shares']
                         capital += profit
                         position = 0
                         current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
-                        logger.debug(f"Exited {current_trade['type']} at ${exit_price:.2f}, profit: ${profit:.2f} via paper trading")
-                        del active_orders[current_trade['order_id']]
-                    elif time_held >= self.max_duration_hours:
-                        await self.ib_client.cancel_order(current_trade['order_id'])
-                        exit_price = current_price
-                        is_long = current_trade['type'] == 'LONG'
-                        profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if is_long else (current_trade['entry_price'] - exit_price) * current_trade['shares']
-                        capital += profit
-                        position = 0
-                        current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
-                        logger.debug(f"Exited {current_trade['type']} due to duration at ${exit_price:.2f}, profit: ${profit:.2f}")
-                        del active_orders[current_trade['order_id']]
+                        logger.debug(f"Exited LONG at ${exit_price:.2f}, profit: ${profit:.2f}")
                 else:
-                    # Default to simulation
-                    if time_held >= self.max_duration_hours:
-                        exit_price = current_price
-                        profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if current_trade['type'] == 'LONG' else (current_trade['entry_price'] - exit_price) * current_trade['shares']
+                    if current_price >= current_trade['stop_loss'] or current_price <= current_trade['target']:
+                        exit_price = current_trade['stop_loss'] if current_price >= current_trade['stop_loss'] else current_trade['target']
+                        profit = (current_trade['entry_price'] - exit_price) * current_trade['shares']
                         capital += profit
                         position = 0
                         current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
-                        logger.debug(f"Exited {current_trade['type']} after {time_held:.2f}h at ${exit_price:.2f}, profit: ${profit:.2f}")
-                        continue
-                    
-                    if current_trade['type'] == 'LONG':
-                        if current_price <= current_trade['stop_loss'] or current_price >= current_trade['target']:
-                            exit_price = current_trade['stop_loss'] if current_price <= current_trade['stop_loss'] else current_trade['target']
-                            profit = (exit_price - current_trade['entry_price']) * current_trade['shares']
-                            capital += profit
-                            position = 0
-                            current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
-                            logger.debug(f"Exited LONG at ${exit_price:.2f}, profit: ${profit:.2f}")
-                    else:
-                        if current_price >= current_trade['stop_loss'] or current_price <= current_trade['target']:
-                            exit_price = current_trade['stop_loss'] if current_price >= current_trade['stop_loss'] else current_trade['target']
-                            profit = (current_trade['entry_price'] - exit_price) * current_trade['shares']
-                            capital += profit
-                            position = 0
-                            current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
-                            logger.debug(f"Exited SHORT at ${exit_price:.2f}, profit: ${profit:.2f}")
+                        logger.debug(f"Exited SHORT at ${exit_price:.2f}, profit: ${profit:.2f}")
 
         # Close any open position at the end
         if position != 0:
