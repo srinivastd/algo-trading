@@ -98,25 +98,70 @@ class HistoricalDataManager:
             logger.error(f"Error handling timezone: {str(e)}")
             raise
             
-    async def fetch_data_chunk(self, contract, end_date: datetime, duration: str, bar_size: str) -> Optional[pd.DataFrame]:
+    async def fetch_data_chunk(
+        self,
+        contract,
+        end_date: datetime,
+        duration: str,
+        bar_size: str,
+        max_retries: int = 4,
+        base_delay: float = 15.0,
+    ) -> Optional[pd.DataFrame]:
         try:
-            # Format end_date for IBKR API (yyyymmdd hh:mm:ss tz format)
             end_date_str = end_date.strftime('%Y%m%d %H:%M:%S US/Eastern')
-            logger.info(f"Requesting historical data ending at {end_date_str}...")
-            # Use appropriate parameters for crypto vs equity
             is_crypto = CryptoUtils.is_crypto(contract.symbol)
-            bars = await self.connection.get_ib().reqHistoricalDataAsync(
-                contract,
-                endDateTime=end_date_str,
-                durationStr=duration,
-                barSizeSetting=bar_size,
-                whatToShow='AGGTRADES' if is_crypto else 'TRADES',
-                useRTH=False if is_crypto else True,  # 24/7 for crypto, RTH for stocks
-                keepUpToDate=False
-            )
-            
+
+            bars = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    logger.info(
+                        f"Requesting historical data ending at {end_date_str} "
+                        f"(attempt {attempt}/{max_retries})..."
+                    )
+                    bars = await asyncio.wait_for(
+                        self.connection.get_ib().reqHistoricalDataAsync(
+                            contract,
+                            endDateTime=end_date_str,
+                            durationStr=duration,
+                            barSizeSetting=bar_size,
+                            whatToShow='AGGTRADES' if is_crypto else 'TRADES',
+                            useRTH=False if is_crypto else True,
+                            keepUpToDate=False,
+                        ),
+                        timeout=120,
+                    )
+                    if bars:
+                        break
+                except asyncio.TimeoutError:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"IBKR request timed out after 120s "
+                        f"(attempt {attempt}/{max_retries}). "
+                        f"Back-off {delay:.0f}s before retry."
+                    )
+                    await asyncio.sleep(delay)
+                except Exception as req_err:
+                    err_msg = str(req_err).lower()
+                    is_pacing = "pacing" in err_msg or "162" in err_msg
+                    delay = base_delay * (2 ** (attempt - 1))
+                    if is_pacing:
+                        delay = max(delay, 30)
+                        logger.warning(
+                            f"IBKR pacing violation detected: {req_err}. "
+                            f"Back-off {delay:.0f}s (attempt {attempt}/{max_retries})."
+                        )
+                    else:
+                        logger.warning(
+                            f"IBKR request error: {req_err}. "
+                            f"Back-off {delay:.0f}s (attempt {attempt}/{max_retries})."
+                        )
+                    await asyncio.sleep(delay)
+
             if not bars:
-                logger.error("No historical data received")
+                logger.error(
+                    f"No historical data received for {contract.symbol} "
+                    f"ending {end_date_str} after {max_retries} attempts"
+                )
                 return None
               
             logger.info(f"Received {len(bars)} bars")
@@ -198,28 +243,41 @@ class HistoricalDataManager:
       
         all_data = []
         current_end = end_dt
-        pacing_delay = 10  # Delay to respect IBKR rate limits (60 requests per 10 minutes)
+        pacing_delay = 10
+        consecutive_failures = 0
+        max_consecutive_failures = 3
         
         while current_end > start_dt:
-            # Ensure current_end is not in the future
             if current_end > current_time:
                 current_end = current_time
                 
             chunk = await self.fetch_data_chunk(contract, current_end, duration, bar_size)
             if chunk is None or chunk.empty:
-                logger.warning(f"No data for period ending {current_end}")
+                consecutive_failures += 1
+                logger.warning(
+                    f"No data for {symbol} ending {current_end} "
+                    f"(consecutive failures: {consecutive_failures}/{max_consecutive_failures})"
+                )
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.error(
+                        f"STALL DETECTED: {symbol} had {consecutive_failures} consecutive "
+                        f"empty responses. IBKR may be throttling or disconnected. "
+                        f"Aborting data fetch for this symbol."
+                    )
+                    break
                 current_end -= timedelta(days=30)
                 await asyncio.sleep(pacing_delay)
                 continue
-              
+
+            consecutive_failures = 0
             chunk_start = chunk.index.min()
             all_data.append(chunk)
             current_end = chunk_start - timedelta(seconds=1)
-            logger.info(f"Fetched data from {chunk_start} to {chunk.index.max()}")
+            logger.info(f"Fetched data for {symbol} from {chunk_start} to {chunk.index.max()}")
             await asyncio.sleep(pacing_delay)
           
         if not all_data:
-            logger.error("No data fetched for the entire period")
+            logger.error(f"No data fetched for {symbol} for the entire period")
             return None
           
         df = pd.concat(all_data).sort_index()
@@ -330,7 +388,9 @@ class HistoricalDataManager:
                 
                 all_data = []
                 current_end = end_dt
-                pacing_delay = 10  # Delay to respect IBKR rate limits
+                pacing_delay = 10
+                consecutive_failures = 0
+                max_consecutive_failures = 3
                 
                 while current_end > start_dt:
                     if current_end > current_time:
@@ -338,11 +398,22 @@ class HistoricalDataManager:
                     
                     chunk = await self.fetch_data_chunk(contract, current_end, duration, bar_size)
                     if chunk is None or chunk.empty:
-                        logger.warning(f"No data for {symbol} period ending {current_end}")
+                        consecutive_failures += 1
+                        logger.warning(
+                            f"No data for {symbol} ending {current_end} "
+                            f"(consecutive failures: {consecutive_failures}/{max_consecutive_failures})"
+                        )
+                        if consecutive_failures >= max_consecutive_failures:
+                            logger.error(
+                                f"STALL DETECTED: {symbol} had {consecutive_failures} consecutive "
+                                f"empty responses. Aborting data fetch."
+                            )
+                            break
                         current_end -= timedelta(days=30)
                         await asyncio.sleep(pacing_delay)
                         continue
-                    
+
+                    consecutive_failures = 0
                     chunk_start = chunk.index.min()
                     all_data.append(chunk)
                     current_end = chunk_start - timedelta(seconds=1)
