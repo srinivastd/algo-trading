@@ -288,10 +288,13 @@ def update_baseline_if_improved(rows: List[Dict[str, Any]], baseline_path: Path)
     
     Returns True if baseline was updated.
     """
-    if not rows or not baseline_path.exists():
+    if not rows:
         return False
 
-    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    if baseline_path.exists():
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    else:
+        baseline = {"version": 0, "updated": "", "strategy": "groq", "default_params": {}, "symbols": {}}
     symbols_section = baseline.setdefault("symbols", {})
     default_params = baseline.get("default_params", {})
     updated = False
@@ -369,7 +372,8 @@ def main() -> None:
     p.add_argument("--update-baseline", action="store_true", help="Auto-update baseline.json if sweep improved")
     p.add_argument("--baseline", default="../baseline.json", help="Path to baseline.json (relative to src/)")
     p.add_argument("--json", action="store_true", help="Write full ranked results as JSON")
-    p.add_argument("-o", "--output", default=None, help="Output path for JSON files")
+    p.add_argument("-o", "--output", default=None, help="Output path for next_experiment.json (when --next-experiment)")
+    p.add_argument("--json-output", default=None, help="Output path for ranked JSON (when --json)")
 
     args = p.parse_args()
     src_dir = Path(__file__).resolve().parent
@@ -417,10 +421,10 @@ def main() -> None:
         print(f"  Proposed perturbations: {proposal.get('proposed_perturbations')}")
 
     if args.json:
-        out_path = Path(args.output) if args.output else src_dir.parent / "analyze_results.json"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(ranked, indent=2, default=str), encoding="utf-8")
-        print(f"\nFull ranked JSON written to {out_path.resolve()}")
+        json_out = Path(args.json_output) if args.json_output else src_dir.parent / "analyze_results.json"
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(json.dumps(ranked, indent=2, default=str), encoding="utf-8")
+        print(f"\nFull ranked JSON written to {json_out.resolve()}")
 
 
 if __name__ == "__main__":
