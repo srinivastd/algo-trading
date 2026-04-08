@@ -1,6 +1,18 @@
 """
 Mean Reversion Strategy for High Volatility Stocks
 Designed for stocks like BMNR with high volatility and oversold conditions
+
+NOTE: This strategy is currently PAUSED due to poor backtest performance.
+Even with optimizations (ADX filtering, trailing stops, dynamic sizing),
+returns remain negative (-1.5% to -2% in recent 6M tests on BMNR/SLV).
+The strategy may be fundamentally mismatched to current market conditions
+or requires symbol-specific tuning not yet implemented.
+
+TODO before reactivation:
+- Symbol-specific parameter optimization via autoresearch
+- Consider removing SHORT signals (mean reversion harder in bull markets)
+- Extend holding period from hours to days/weeks for mean reversion to work
+- Test on different symbol universe (indices, forex where mean reversion is stronger)
 """
 
 import pandas as pd
