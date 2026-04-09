@@ -6,7 +6,9 @@ import asyncio
 import logging
 import argparse
 import sys
+from pathlib import Path
 from datetime import datetime, timedelta
+from uuid import uuid4
 import pytz
 import random
 import pandas as pd
@@ -22,6 +24,10 @@ from ib_insync import Stock, util
 import json
 import os
 from ib_insync import ExecutionFilter
+from trade_journal import TradeJournal
+from trade_memory import TradeMemory
+
+_PYTHONCLIENT_ROOT = Path(__file__).resolve().parent.parent
 
 # Set up logging to both file and console with color
 class ColoredFormatter(logging.Formatter):
@@ -84,83 +90,143 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-async def watch_mode(symbols, strategy, connection, check_interval):
+def _safe_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _infer_regime(indicators: dict) -> tuple[str, float | None, float | None, str]:
+    adx = _safe_float(indicators.get("adx"))
+    vol_ratio = _safe_float(indicators.get("vol_ratio"))
+    sma20 = _safe_float(indicators.get("sma_20"))
+    sma50 = _safe_float(indicators.get("sma_50"))
+    if sma20 is not None and sma50 is not None:
+        trend_direction = "up" if sma20 >= sma50 else "down"
+    else:
+        trend_direction = "unknown"
+    if adx is not None and adx >= 30:
+        regime = "trending"
+    elif adx is not None and adx <= 20:
+        regime = "ranging"
+    elif vol_ratio is not None and vol_ratio >= 1.5:
+        regime = "volatile"
+    elif vol_ratio is not None and vol_ratio <= 0.8:
+        regime = "quiet"
+    else:
+        regime = "mixed"
+    return regime, adx, vol_ratio, trend_direction
+
+
+def _positions_snapshot(positions):
+    rows = []
+    for p in positions:
+        if float(p.position) == 0:
+            continue
+        rows.append(
+            {
+                "symbol": p.contract.symbol.upper(),
+                "secType": getattr(p.contract, "secType", "STK"),
+                "qty": float(p.position),
+                "avgCost": float(p.avgCost),
+            }
+        )
+    return rows
+
+
+async def watch_mode(
+    symbols,
+    strategy,
+    connection,
+    check_interval,
+    *,
+    journal: TradeJournal | None = None,
+    memory: TradeMemory | None = None,
+    run_id: str | None = None,
+    snapshot_interval_sec: int = 60,
+):
     """Real-time watching mode for multiple stocks"""
     logger.info(f"Starting real-time watch for {symbols} with check interval {check_interval} seconds")
-    
+
     # Load or recover active trades on startup
     active_trades = await load_active_trades(connection)
-    
+
     # Log watch mode start
     market_data_logger.info(json.dumps({
         'timestamp': datetime.now(pytz.timezone('US/Eastern')).isoformat(),
         'type': 'system',
         'message': f'Watch mode started for symbols: {symbols}'
     }))
-    
+
     # Set up real-time data subscriptions for all stocks
     contracts = [Stock(symbol, "SMART", "USD") for symbol in symbols]
-    
+
     # Initialize data storage for each stock - normalize to uppercase
     symbols_upper = [symbol.upper() for symbol in symbols]
     data_dict = {symbol: pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume']) for symbol in symbols_upper}
-    
+
     # Store real-time bar lists for each symbol
     realtime_bar_lists = {}
-    
-    # Trade tracking system to link buys and sells
+
+    # Trade IDs must be globally unique across restarts to avoid journal collisions.
     trade_counter = 0
-    active_trades = {}  # Track active trades by symbol
-    
+    trade_id_prefix = (run_id or f"RUNLESS_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}")
+
+    def _next_trade_id() -> str:
+        nonlocal trade_counter
+        trade_counter += 1
+        return f"TRADE_{trade_id_prefix}_{trade_counter:06d}"
+
     async def setup_market_data(contract):
         try:
             await connection.get_ib().qualifyContractsAsync(contract)
-            
+
             # Request real-time bars - ib_insync automatically handles reqId internally
             bars = connection.get_ib().reqRealTimeBars(
-                contract=contract, 
-                barSize=5, 
-                whatToShow='TRADES', 
+                contract=contract,
+                barSize=5,
+                whatToShow='TRADES',
                 useRTH=True
             )
-            
+
             symbol_upper = contract.symbol.upper()
             realtime_bar_lists[symbol_upper] = bars
-            
+
             logger.debug(f"Requested real-time bars for {contract.symbol}")
             return True
         except Exception as e:
             logger.error(f"Error setting up market data for {contract.symbol}: {e}")
             return False
-    
+
     # Set up market data for each contract
     for contract in contracts:
         success = await setup_market_data(contract)
         if not success:
             logger.error(f"Failed to set up market data for {contract.symbol}")
-    
+
     def on_bar_update(bars, has_new_bar):
         """Handle barUpdateEvent from ib_insync"""
         # The bars parameter is a RealTimeBarList that contains contract information
         if not hasattr(bars, 'contract') or not bars.contract:
             logger.warning("Received bar update without contract information")
             return
-            
+
         symbol = bars.contract.symbol.upper()
-        
+
         # Get the latest bar
         if len(bars) == 0:
             return
-            
+
         latest_bar = bars[-1]
-        
+
         # Ensure symbol exists in our tracking
         if symbol not in data_dict:
             logger.warning(f"Received bar for untracked symbol {symbol}, initializing...")
             data_dict[symbol] = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
-            
+
         timestamp = datetime.now(pytz.timezone('US/Eastern'))
-        
+
         # Log raw market data
         market_data = {
             'timestamp': timestamp.isoformat(),
@@ -178,7 +244,7 @@ async def watch_mode(symbols, strategy, connection, check_interval):
             }
         }
         market_data_logger.info(json.dumps(market_data))
-        
+
         # Update data dictionary
         new_data = pd.DataFrame({
             'open': [latest_bar.open_],
@@ -187,280 +253,468 @@ async def watch_mode(symbols, strategy, connection, check_interval):
             'close': [latest_bar.close],
             'volume': [latest_bar.volume if latest_bar.volume >= 0 else 0]
         }, index=[latest_bar.time])
-        
+
         data_dict[symbol] = pd.concat([data_dict[symbol], new_data]).drop_duplicates().sort_index()
         logger.debug(f"Received new bar for {symbol}: {latest_bar.time}, Close: {latest_bar.close}, Has new bar: {has_new_bar}")
-    
+
     # Subscribe to bar update events from ib_insync
     connection.get_ib().barUpdateEvent += on_bar_update
-    
+
+    snapshot_task = None
+    if journal and snapshot_interval_sec > 0:
+        async def _snapshot_loop():
+            while True:
+                await asyncio.sleep(snapshot_interval_sec)
+                try:
+                    now = datetime.now(pytz.timezone('US/Eastern'))
+                    positions = await connection.get_ib().reqPositionsAsync()
+                    pos_rows = _positions_snapshot(positions)
+                    equity = await connection.get_account_equity()
+                    journal.insert_daily_snapshot(
+                        timestamp=now,
+                        net_liquidation=_safe_float(equity),
+                        positions=pos_rows,
+                        unrealized_pnl=None,
+                        realized_pnl_today=None,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as snapshot_err:
+                    logger.warning(f"Trade journal snapshot failed: {snapshot_err}")
+
+        snapshot_task = asyncio.create_task(_snapshot_loop())
+
     # Start watching loop
-    while True:
-        current_time = datetime.now(pytz.timezone('US/Eastern'))
-        # Skip if outside market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
-        if current_time.weekday() >= 5 or not (9 <= current_time.hour < 16):
-            logger.info("Outside market hours, skipping this cycle...")
-            await asyncio.sleep(check_interval)
-            continue
-        
-        # STEP 1: Check existing positions for exit signals
-        try:
-            existing_positions = await connection.get_ib().reqPositionsAsync()
-            
-            for position in existing_positions:
-                if position.position != 0:  # Only check non-zero positions
-                    pos_symbol = position.contract.symbol.upper()
-                    if position.contract.secType not in ('STK', ''):
-                        logger.debug(f"Skipping non-stock position: {pos_symbol} (type={position.contract.secType})")
-                        continue
-                    position_size = float(position.position)
-                    avg_cost = float(position.avgCost)
-                    
-                    logger.debug(f"Checking position: {pos_symbol}, Size: {position_size}, Avg Cost: ${avg_cost:.2f}")
-                    
-                    # Ensure we have market data for this position
-                    if pos_symbol not in data_dict:
-                        # Add this symbol to our watch list dynamically
-                        logger.info(f"Adding {pos_symbol} to watch list (currently held position)")
-                        try:
-                            pos_contract = Stock(pos_symbol, "SMART", "USD")
-                            success = await setup_market_data(pos_contract)
-                            if success:
-                                data_dict[pos_symbol] = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
-                                logger.info(f"Successfully added {pos_symbol} to monitoring")
-                            else:
-                                logger.warning(f"Failed to add {pos_symbol} to monitoring")
-                                continue
-                        except Exception as e:
-                            logger.error(f"Error adding {pos_symbol} to watch list: {e}")
+    try:
+        while True:
+            current_time = datetime.now(pytz.timezone('US/Eastern'))
+            # Skip if outside market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
+            if current_time.weekday() >= 5 or not (9 <= current_time.hour < 16):
+                logger.info("Outside market hours, skipping this cycle...")
+                await asyncio.sleep(check_interval)
+                continue
+
+            # STEP 1: Check existing positions for exit signals
+            try:
+                existing_positions = await connection.get_ib().reqPositionsAsync()
+
+                for position in existing_positions:
+                    if position.position != 0:  # Only check non-zero positions
+                        pos_symbol = position.contract.symbol.upper()
+                        if position.contract.secType not in ('STK', ''):
+                            logger.debug(f"Skipping non-stock position: {pos_symbol} (type={position.contract.secType})")
                             continue
-                    
-                    # Check if we have enough data for this position
-                    if len(data_dict[pos_symbol]) >= 2:
-                        df = strategy.calculate_indicators(data_dict[pos_symbol].copy())
-                        
-                        # Check maximum duration exit first
-                        # Get position entry time from IBKR (we'll need to track this)
-                        # For now, we'll use a simplified approach - check if position has been held too long
-                        # This is a limitation of the current implementation
-                        
-                        # Generate exit signal for this position
-                        if position_size > 0:  # Long position
-                            exit_signal = await strategy.generate_exit_signals(df, 'long')
-                        else:  # Short position  
-                            exit_signal = await strategy.generate_exit_signals(df, 'short')
-                        
-                        # Log position monitoring
-                        position_data = {
-                            'timestamp': current_time.isoformat(),
-                            'symbol': pos_symbol,
-                            'action': 'position_monitoring',
-                            'position_details': {
-                                'position_size': position_size,
-                                'avg_cost': avg_cost,
-                                'current_price': float(df['close'].iloc[-1]),
-                                'unrealized_pnl': position_size * (float(df['close'].iloc[-1]) - avg_cost),
-                                'exit_signal': int(exit_signal),
-                                'position_type': 'long' if position_size > 0 else 'short',
-                                'max_duration_hours': strategy.max_duration_hours
-                            }
-                        }
-                        market_data_logger.info(json.dumps(position_data))
-                        
-                        # Execute exit trade if signal indicates
-                        if exit_signal != 0:
-                            logger.info(f"Exit signal {exit_signal} generated for position {pos_symbol}")
-                            
-                            # Determine exit action (opposite of current position)
-                            exit_action = 'SELL' if position_size > 0 else 'BUY'
-                            exit_quantity = abs(int(position_size))
-                            
-                            # Get trade ID if this position was tracked
-                            trade_id = active_trades.get(pos_symbol, {}).get('trade_id', 'UNKNOWN_TRADE')
-                            
-                            # Log position exit attempt with trade ID
-                            exit_data = {
+                        position_size = float(position.position)
+                        avg_cost = float(position.avgCost)
+
+                        logger.debug(f"Checking position: {pos_symbol}, Size: {position_size}, Avg Cost: ${avg_cost:.2f}")
+
+                        # Ensure we have market data for this position
+                        if pos_symbol not in data_dict:
+                            # Add this symbol to our watch list dynamically
+                            logger.info(f"Adding {pos_symbol} to watch list (currently held position)")
+                            try:
+                                pos_contract = Stock(pos_symbol, "SMART", "USD")
+                                success = await setup_market_data(pos_contract)
+                                if success:
+                                    data_dict[pos_symbol] = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+                                    logger.info(f"Successfully added {pos_symbol} to monitoring")
+                                else:
+                                    logger.warning(f"Failed to add {pos_symbol} to monitoring")
+                                    continue
+                            except Exception as e:
+                                logger.error(f"Error adding {pos_symbol} to watch list: {e}")
+                                continue
+
+                        # Check if we have enough data for this position
+                        if len(data_dict[pos_symbol]) >= 2:
+                            df = strategy.calculate_indicators(data_dict[pos_symbol].copy())
+
+                            # Generate exit signal for this position
+                            if position_size > 0:  # Long position
+                                exit_signal = await strategy.generate_exit_signals(df, 'long')
+                            else:  # Short position
+                                exit_signal = await strategy.generate_exit_signals(df, 'short')
+
+                            # Log position monitoring
+                            position_data = {
                                 'timestamp': current_time.isoformat(),
-                                'trade_id': trade_id,
                                 'symbol': pos_symbol,
-                                'action': 'position_exit_attempt',
-                                'exit_details': {
-                                    'exit_signal': exit_signal,
-                                    'exit_action': exit_action,
-                                    'exit_quantity': exit_quantity,
-                                    'current_price': float(df['close'].iloc[-1]),
+                                'action': 'position_monitoring',
+                                'position_details': {
                                     'position_size': position_size,
                                     'avg_cost': avg_cost,
-                                    'exit_reason': 'strategy_signal'
+                                    'current_price': float(df['close'].iloc[-1]),
+                                    'unrealized_pnl': position_size * (float(df['close'].iloc[-1]) - avg_cost),
+                                    'exit_signal': int(exit_signal),
+                                    'position_type': 'long' if position_size > 0 else 'short',
+                                    'max_duration_hours': strategy.max_duration_hours
                                 }
                             }
-                            market_data_logger.info(json.dumps(exit_data))
-                            
-                            # Execute the exit trade
-                            exit_result = await strategy.execute_trade(
-                                symbol=pos_symbol,
-                                signal=-1 if position_size > 0 else 1,  # Opposite signal to close
-                                entry_price=df['close'].iloc[-1],
-                                shares=exit_quantity,
-                                stop_loss=None,  # No stop loss needed for exit
-                                target=None     # No target needed for exit
-                            )
-                            
-                            # Log exit result with trade ID
-                            exit_result_data = {
-                                'timestamp': current_time.isoformat(),
-                                'trade_id': trade_id,
-                                'symbol': pos_symbol,
-                                'action': 'position_exit_result',
-                                'exit_result': exit_result
+                            market_data_logger.info(json.dumps(position_data))
+
+                            # Execute exit trade if signal indicates
+                            if exit_signal != 0:
+                                logger.info(f"Exit signal {exit_signal} generated for position {pos_symbol}")
+                                exit_action = 'SELL' if position_size > 0 else 'BUY'
+                                exit_quantity = abs(int(position_size))
+                                trade_id = active_trades.get(pos_symbol, {}).get('trade_id', 'UNKNOWN_TRADE')
+
+                                exit_data = {
+                                    'timestamp': current_time.isoformat(),
+                                    'trade_id': trade_id,
+                                    'symbol': pos_symbol,
+                                    'action': 'position_exit_attempt',
+                                    'exit_details': {
+                                        'exit_signal': exit_signal,
+                                        'exit_action': exit_action,
+                                        'exit_quantity': exit_quantity,
+                                        'current_price': float(df['close'].iloc[-1]),
+                                        'position_size': position_size,
+                                        'avg_cost': avg_cost,
+                                        'exit_reason': 'strategy_signal'
+                                    }
+                                }
+                                market_data_logger.info(json.dumps(exit_data))
+
+                                exit_result = await strategy.execute_trade(
+                                    symbol=pos_symbol,
+                                    signal=-1 if position_size > 0 else 1,  # Opposite signal to close
+                                    entry_price=df['close'].iloc[-1],
+                                    shares=exit_quantity,
+                                    stop_loss=None,
+                                    target=None
+                                )
+
+                                exit_result_data = {
+                                    'timestamp': current_time.isoformat(),
+                                    'trade_id': trade_id,
+                                    'symbol': pos_symbol,
+                                    'action': 'position_exit_result',
+                                    'exit_result': exit_result
+                                }
+                                market_data_logger.info(json.dumps(exit_result_data))
+
+                                if exit_result['status'] == 'success':
+                                    pnl = position_size * (float(df['close'].iloc[-1]) - avg_cost)
+                                    logger.info(
+                                        f"TRADE {trade_id}: Closed position {pos_symbol}: "
+                                        f"{exit_action} {exit_quantity} shares at ${df['close'].iloc[-1]:.2f}, PnL: ${pnl:.2f}"
+                                    )
+                                    at = active_trades.get(pos_symbol, {})
+                                    if journal and trade_id != "UNKNOWN_TRADE":
+                                        try:
+                                            journal.close_trade(
+                                                trade_id=trade_id,
+                                                exit_fill_price=float(df['close'].iloc[-1]),
+                                                exit_fill_time=current_time,
+                                                exit_reason="strategy_signal",
+                                                realized_pnl=float(pnl),
+                                                status="closed",
+                                            )
+                                            journal.record_fill(
+                                                trade_id=trade_id,
+                                                order_id=None,
+                                                exec_id=None,
+                                                symbol=pos_symbol,
+                                                side=exit_action,
+                                                qty=exit_quantity,
+                                                price=float(df['close'].iloc[-1]),
+                                                commission=None,
+                                                time=current_time,
+                                                is_entry=False,
+                                            )
+                                        except Exception as journal_err:
+                                            logger.warning(f"Trade journal close logging failed for {trade_id}: {journal_err}")
+
+                                    if memory and memory.enabled and trade_id != "UNKNOWN_TRADE":
+                                        try:
+                                            memory.capture_closed_trade(
+                                                trade_id=trade_id,
+                                                symbol=pos_symbol,
+                                                strategy=type(strategy).__name__,
+                                                side="LONG" if at.get("is_long", position_size > 0) else "SHORT",
+                                                signal_value=int(at.get("signal_value", -1 if position_size > 0 else 1)),
+                                                entry_price=_safe_float(at.get("entry_price")),
+                                                exit_price=float(df['close'].iloc[-1]),
+                                                realized_pnl=float(pnl),
+                                                shares=_safe_float(at.get("shares", exit_quantity)),
+                                                entry_time=at.get("entry_time"),
+                                                exit_time=current_time,
+                                                entry_regime=at.get("entry_regime"),
+                                                exit_reason="strategy_signal",
+                                                indicators=at.get("indicator_snapshot", {}),
+                                            )
+                                        except Exception as memory_err:
+                                            logger.warning(f"Trade memory capture failed for {trade_id}: {memory_err}")
+
+                                    if pos_symbol in active_trades:
+                                        del active_trades[pos_symbol]
+                                        save_active_trades_cache(active_trades)
+                                else:
+                                    logger.error(f"TRADE {trade_id}: Failed to close position {pos_symbol}: {exit_result['message']}")
+
+            except Exception as e:
+                logger.error(f"Error checking existing positions: {e}")
+
+            # STEP 2: Log data status for each symbol
+            for symbol in symbols:
+                symbol_upper = symbol.upper()
+                data_len = len(data_dict.get(symbol_upper, pd.DataFrame()))
+                logger.debug(f"Data status for {symbol}: {data_len} bars")
+                if data_len < 5:
+                    logger.debug(f"Waiting for more data for {symbol} (need at least 5 bars)")
+
+            # STEP 3: Generate entry signals and execute trades
+            signals = []
+            for symbol in symbols:
+                symbol_upper = symbol.upper()
+                if symbol_upper in data_dict and len(data_dict[symbol_upper]) >= 2:
+                    try:
+                        df = strategy.calculate_indicators(data_dict[symbol_upper].copy())
+                    except Exception as calc_err:
+                        logger.warning(f"Indicator calculation failed for {symbol}: {calc_err}")
+                        continue
+
+                    signal = await strategy.generate_realtime_signals(df)
+                    signal_data = {
+                        'timestamp': current_time.isoformat(),
+                        'symbol': symbol,
+                        'signal': int(signal),
+                        'market_context': {
+                            'current_price': float(df['close'].iloc[-1]),
+                            'current_volume': float(df['volume'].iloc[-1]),
+                            'bars_analyzed': int(len(df)),
+                            'indicators': {
+                                col: float(df[col].iloc[-1]) if pd.api.types.is_numeric_dtype(df[col]) else str(df[col].iloc[-1])
+                                for col in df.columns
+                                if col not in ['open', 'high', 'low', 'close', 'volume']
                             }
-                            market_data_logger.info(json.dumps(exit_result_data))
-                            
-                            if exit_result['status'] == 'success':
-                                pnl = position_size * (float(df['close'].iloc[-1]) - avg_cost)
-                                logger.info(f"TRADE {trade_id}: Closed position {pos_symbol}: {exit_action} {exit_quantity} shares at ${df['close'].iloc[-1]:.2f}, PnL: ${pnl:.2f}")
-                                
-                                # Remove from active trades
-                                if pos_symbol in active_trades:
-                                    del active_trades[pos_symbol]
-                            else:
-                                logger.error(f"TRADE {trade_id}: Failed to close position {pos_symbol}: {exit_result['message']}")
-                    
-        except Exception as e:
-            logger.error(f"Error checking existing positions: {e}")
-        
-        # STEP 2: Log data status for each symbol  
-        for symbol in symbols:
-            symbol_upper = symbol.upper()
-            data_len = len(data_dict.get(symbol_upper, pd.DataFrame()))
-            logger.debug(f"Data status for {symbol}: {data_len} bars")
-            if data_len < 5:
-                logger.debug(f"Waiting for more data for {symbol} (need at least 5 bars)")
-        
-        # STEP 3: Generate entry signals and execute trades for each symbol with sufficient data
-        signals = []
-        for symbol in symbols:
-            symbol_upper = symbol.upper()
-            if symbol_upper in data_dict and len(data_dict[symbol_upper]) >= 2:  # Further reduced from 3 to 2 for aggressive testing
-                try:
-                    df = strategy.calculate_indicators(data_dict[symbol_upper].copy())
-                except Exception as calc_err:
-                    logger.warning(f"Indicator calculation failed for {symbol}: {calc_err}")
-                    continue
-                signal = await strategy.generate_realtime_signals(df)
-                
-                # Log signal generation with market context
-                signal_data = {
-                    'timestamp': current_time.isoformat(),
-                    'symbol': symbol,
-                    'signal': int(signal),  # Convert to native Python int
-                    'market_context': {
-                        'current_price': float(df['close'].iloc[-1]),  # Convert to native Python float
-                        'current_volume': float(df['volume'].iloc[-1]),  # Convert to native Python float
-                        'bars_analyzed': int(len(df)),  # Convert to native Python int
-                        'indicators': {
-                            col: float(df[col].iloc[-1]) if pd.api.types.is_numeric_dtype(df[col]) else str(df[col].iloc[-1])
-                            for col in df.columns 
-                            if col not in ['open', 'high', 'low', 'close', 'volume']
                         }
                     }
-                }
-                market_data_logger.info(json.dumps(signal_data))
-                
-                if signal != 0:  # Only process symbols with non-zero signals
-                    signals.append(f"{symbol}: {signal}")
-                    logger.debug(f"Generated signal {signal} for {symbol}")
-                    
-                    # Generate unique trade ID for this trade
-                    trade_counter += 1
-                    trade_id = f"TRADE_{trade_counter:06d}"
-                    
-                    # Execute trade for this signal
-                    entry_price = df['close'].iloc[-1]
-                    is_long = signal == 1
-                    stop_loss = entry_price * (1 - strategy.stop_loss_pct/100) if is_long else entry_price * (1 + strategy.stop_loss_pct/100)
-                    target = entry_price * (1 + strategy.target_pct/100) if is_long else entry_price * (1 - strategy.target_pct/100)
-                    risk_per_share = abs(entry_price - stop_loss)
-                    shares = int(strategy.risk_per_trade / risk_per_share) if risk_per_share > 0 else 100
-                    if shares <= 0:
-                        shares = 100  # Minimum trade size
-                    
-                    # Debug logging to show actual values being used
-                    logger.info(f"Trade parameters for {symbol}: Entry=${entry_price:.2f}, Stop=${stop_loss:.2f} ({strategy.stop_loss_pct}%), Target=${target:.2f} ({strategy.target_pct}%), Shares={shares}")
-                    
-                    # Log trade execution attempt with trade ID
-                    trade_data = {
-                        'timestamp': current_time.isoformat(),
-                        'trade_id': trade_id,
-                        'symbol': symbol,
-                        'action': 'trade_execution_attempt',
-                        'trade_details': {
-                            'signal': signal,
-                            'entry_price': entry_price,
-                            'shares': shares,
-                            'stop_loss': stop_loss,
-                            'target': target,
-                            'risk_per_share': risk_per_share,
-                            'is_long': is_long,
-                            'trade_type': 'LONG' if is_long else 'SHORT'
-                        }
-                    }
-                    market_data_logger.info(json.dumps(trade_data))
-                    
-                    trade_result = await strategy.execute_trade(
-                        symbol=symbol,
-                        signal=signal,
-                        entry_price=entry_price,
-                        shares=shares,
-                        stop_loss=stop_loss,
-                        target=target
-                    )
-                    
-                    # Log trade execution result with trade ID
-                    trade_result_data = {
-                        'timestamp': current_time.isoformat(),
-                        'trade_id': trade_id,
-                        'symbol': symbol,
-                        'action': 'trade_execution_result',
-                        'trade_result': trade_result
-                    }
-                    market_data_logger.info(json.dumps(trade_result_data))
-                    
-                    if trade_result['status'] == 'success':
-                        # Wait for fill confirmation to get exact entry time
-                        await asyncio.sleep(5)
-                        exec_filter = ExecutionFilter(symbol=symbol, time="1 D")
-                        executions = await connection.get_ib().reqExecutionsAsync(exec_filter)
-                        matching_execs = [exec for exec in executions if exec.orderId == trade_result['order_id']]
-                        if matching_execs:
-                            fill_time = matching_execs[0].time.astimezone(pytz.timezone('US/Eastern'))  # Use first match
-                        else:
-                            fill_time = current_time  # Fallback
-                        active_trades[symbol] = {
-                            'entry_time': fill_time,
+                    market_data_logger.info(json.dumps(signal_data))
+                    indicators = signal_data.get("market_context", {}).get("indicators", {})
+                    regime, adx, vol_ratio, trend_direction = _infer_regime(indicators)
+
+                    if journal and run_id:
+                        try:
+                            journal.log_signal(
+                                run_id=run_id,
+                                symbol=symbol_upper,
+                                timestamp=current_time,
+                                signal_value=int(signal),
+                                price=_safe_float(df['close'].iloc[-1]),
+                                indicators=indicators,
+                            )
+                            regime, adx, vol_ratio, trend_direction = _infer_regime(indicators)
+                            journal.log_market_regime(
+                                symbol=symbol_upper,
+                                timestamp=current_time,
+                                adx=adx,
+                                vol_ratio=vol_ratio,
+                                trend_direction=trend_direction,
+                                regime_label=regime,
+                                regime_confidence=(adx / 50.0 if adx is not None else None),
+                            )
+                        except Exception as journal_err:
+                            logger.warning(f"Trade journal signal logging failed for {symbol_upper}: {journal_err}")
+
+                    if signal != 0:
+                        signals.append(f"{symbol}: {signal}")
+                        logger.debug(f"Generated signal {signal} for {symbol}")
+                        trade_id = _next_trade_id()
+
+                        entry_price = float(df['close'].iloc[-1])
+                        is_long = signal == 1
+                        stop_loss = entry_price * (1 - strategy.stop_loss_pct/100) if is_long else entry_price * (1 + strategy.stop_loss_pct/100)
+                        target = entry_price * (1 + strategy.target_pct/100) if is_long else entry_price * (1 - strategy.target_pct/100)
+                        risk_per_share = abs(entry_price - stop_loss)
+                        shares = int(strategy.risk_per_trade / risk_per_share) if risk_per_share > 0 else 100
+                        if shares <= 0:
+                            shares = 100
+
+                        logger.info(
+                            f"Trade parameters for {symbol}: Entry=${entry_price:.2f}, Stop=${stop_loss:.2f} "
+                            f"({strategy.stop_loss_pct}%), Target=${target:.2f} ({strategy.target_pct}%), Shares={shares}"
+                        )
+                        memory_verdict = None
+                        if memory and memory.enabled:
+                            try:
+                                recall = memory.pre_trade_recall(
+                                    symbol=symbol_upper,
+                                    strategy=type(strategy).__name__,
+                                    signal_value=int(signal),
+                                    entry_price=entry_price,
+                                    indicators=indicators,
+                                )
+                                memory_verdict = recall.as_dict()
+                                if recall.win_rate_similar is not None:
+                                    logger.info(
+                                        f"Memory recall for {symbol_upper}: "
+                                        f"win_rate={recall.win_rate_similar:.1%}, avg_pnl={recall.avg_pnl_similar}"
+                                    )
+                                if recall.regime_warning:
+                                    logger.warning(f"Memory warning for {symbol_upper}: {recall.regime_warning}")
+                            except Exception as memory_err:
+                                logger.warning(f"Trade memory recall failed for {symbol_upper}: {memory_err}")
+
+                        trade_data = {
+                            'timestamp': current_time.isoformat(),
                             'trade_id': trade_id,
-                            'entry_price': entry_price,
-                            'shares': shares,
-                            'is_long': is_long,
-                            'parent_order_id': trade_result.get('order_id'),
-                            'stop_order_id': trade_result.get('stop_order_id'),
-                            'target_order_id': trade_result.get('target_order_id')
+                            'symbol': symbol,
+                            'action': 'trade_execution_attempt',
+                            'trade_details': {
+                                'signal': signal,
+                                'entry_price': entry_price,
+                                'shares': shares,
+                                'stop_loss': stop_loss,
+                                'target': target,
+                                'risk_per_share': risk_per_share,
+                                'is_long': is_long,
+                                'trade_type': 'LONG' if is_long else 'SHORT'
+                            }
                         }
-                        save_active_trades_cache(active_trades)
-                        
-                        logger.info(f"TRADE {trade_id}: Executed {'Buy' if signal == 1 else 'Sell'} trade for {symbol}: Entry ${entry_price:.2f}, Shares {shares}")
-                        logger.info(f"TRADE {trade_id}: Stop Loss Order ID: {trade_result.get('stop_order_id')}, Target Order ID: {trade_result.get('target_order_id')}")
-                    else:
-                        logger.error(f"TRADE {trade_id}: Trade failed for {symbol}: {trade_result['message']}")
-        
-        # Log summary of signals
-        if signals:
-            signals_summary = ", ".join(signals)
-            logger.info(f"Completed watch cycle. Signals: {signals_summary}")
-        else:
-            logger.info("Completed watch cycle. No signals generated.")
-        
-        await asyncio.sleep(check_interval)
+                        market_data_logger.info(json.dumps(trade_data))
+
+                        if journal and run_id:
+                            try:
+                                journal.log_trade_attempt(
+                                    trade_id=trade_id,
+                                    run_id=run_id,
+                                    symbol=symbol,
+                                    side="LONG" if is_long else "SHORT",
+                                    signal_value=int(signal),
+                                    intended_entry_price=entry_price,
+                                    intended_shares=int(shares),
+                                    stop_loss=float(stop_loss),
+                                    target=float(target),
+                                    indicator_snapshot=indicators,
+                                    memory_consulted=memory_verdict is not None,
+                                    memory_verdict=memory_verdict,
+                                )
+                            except Exception as journal_err:
+                                logger.warning(f"Trade journal attempt logging failed for {trade_id}: {journal_err}")
+
+                        trade_result = await strategy.execute_trade(
+                            symbol=symbol,
+                            signal=signal,
+                            entry_price=entry_price,
+                            shares=shares,
+                            stop_loss=stop_loss,
+                            target=target
+                        )
+
+                        trade_result_data = {
+                            'timestamp': current_time.isoformat(),
+                            'trade_id': trade_id,
+                            'symbol': symbol,
+                            'action': 'trade_execution_result',
+                            'trade_result': trade_result
+                        }
+                        market_data_logger.info(json.dumps(trade_result_data))
+
+                        if journal:
+                            try:
+                                if trade_result['status'] == 'success':
+                                    journal.update_trade_execution_result(
+                                        trade_id=trade_id,
+                                        status="submitted",
+                                        order_id=trade_result.get('order_id'),
+                                        stop_order_id=trade_result.get('stop_order_id'),
+                                        target_order_id=trade_result.get('target_order_id'),
+                                    )
+                                else:
+                                    journal.update_trade_execution_result(
+                                        trade_id=trade_id,
+                                        status="error",
+                                        error_message=trade_result.get('message'),
+                                    )
+                            except Exception as journal_err:
+                                logger.warning(f"Trade journal result logging failed for {trade_id}: {journal_err}")
+
+                        if trade_result['status'] == 'success':
+                            await asyncio.sleep(5)
+                            exec_filter = ExecutionFilter(symbol=symbol, time="1 D")
+                            executions = await connection.get_ib().reqExecutionsAsync(exec_filter)
+                            matching_execs = [exec for exec in executions if exec.orderId == trade_result['order_id']]
+                            if matching_execs:
+                                fill_time = matching_execs[0].time.astimezone(pytz.timezone('US/Eastern'))
+                                fill_price = float(matching_execs[0].price)
+                                fill_qty = float(matching_execs[0].shares)
+                            else:
+                                fill_time = current_time
+                                fill_price = entry_price
+                                fill_qty = float(shares)
+
+                            active_trades[symbol.upper()] = {
+                                'entry_time': fill_time,
+                                'trade_id': trade_id,
+                                'entry_price': entry_price,
+                                'shares': shares,
+                                'is_long': is_long,
+                                'signal_value': int(signal),
+                                'entry_regime': regime,
+                                'indicator_snapshot': indicators,
+                                'parent_order_id': trade_result.get('order_id'),
+                                'stop_order_id': trade_result.get('stop_order_id'),
+                                'target_order_id': trade_result.get('target_order_id')
+                            }
+                            save_active_trades_cache(active_trades)
+
+                            if journal:
+                                try:
+                                    slippage_bps = ((fill_price - entry_price) / entry_price * 10000.0) if entry_price else None
+                                    journal.mark_trade_entry_fill(
+                                        trade_id=trade_id,
+                                        entry_fill_price=fill_price,
+                                        entry_fill_time=fill_time,
+                                        slippage_bps=slippage_bps,
+                                        status="open",
+                                    )
+                                    journal.record_fill(
+                                        trade_id=trade_id,
+                                        order_id=trade_result.get('order_id'),
+                                        exec_id=None,
+                                        symbol=symbol,
+                                        side='BUY' if signal == 1 else 'SELL',
+                                        qty=fill_qty,
+                                        price=fill_price,
+                                        commission=None,
+                                        time=fill_time,
+                                        is_entry=True,
+                                    )
+                                except Exception as journal_err:
+                                    logger.warning(f"Trade journal fill logging failed for {trade_id}: {journal_err}")
+
+                            logger.info(
+                                f"TRADE {trade_id}: Executed {'Buy' if signal == 1 else 'Sell'} trade for {symbol}: "
+                                f"Entry ${entry_price:.2f}, Shares {shares}"
+                            )
+                            logger.info(
+                                f"TRADE {trade_id}: Stop Loss Order ID: {trade_result.get('stop_order_id')}, "
+                                f"Target Order ID: {trade_result.get('target_order_id')}"
+                            )
+                        else:
+                            logger.error(f"TRADE {trade_id}: Trade failed for {symbol}: {trade_result['message']}")
+
+            if signals:
+                signals_summary = ", ".join(signals)
+                logger.info(f"Completed watch cycle. Signals: {signals_summary}")
+            else:
+                logger.info("Completed watch cycle. No signals generated.")
+
+            await asyncio.sleep(check_interval)
+    finally:
+        if snapshot_task:
+            snapshot_task.cancel()
+            try:
+                await snapshot_task
+            except asyncio.CancelledError:
+                pass
+        try:
+            connection.get_ib().barUpdateEvent -= on_bar_update
+        except Exception:
+            pass
 
 def save_active_trades_cache(active_trades):
     cache_data = {
@@ -529,6 +783,11 @@ def parse_args():
     parser.add_argument("--volume-breakout-mult", type=float, default=1.1, help="Volume multiplier for breakout bar")
     parser.add_argument("--volume-confirm-mult", type=float, default=1.05, help="Volume multiplier for confirmation bar")
     parser.add_argument("--position-size-cap", type=float, default=0.95, help="Max fraction of capital per position")
+    parser.add_argument("--no-journal", action="store_true", help="Disable SQLite trade journaling in watch mode")
+    parser.add_argument("--journal-db", default=str(_PYTHONCLIENT_ROOT / "trade_journal.db"), help="Path to SQLite journal db")
+    parser.add_argument("--journal-snapshot-interval", type=int, default=60, help="Seconds between account/position snapshots in journal")
+    parser.add_argument("--no-memory", action="store_true", help="Disable Chroma trade memory recall/capture in watch mode")
+    parser.add_argument("--memory-db", default=str(_PYTHONCLIENT_ROOT / "chroma_db"), help="Path to ChromaDB for trade memory")
     return parser.parse_args()
 
 async def main():
@@ -589,6 +848,26 @@ async def main():
     # Only use live trading port (7497) when explicitly requested with --live
     port = 4002 if args.backtest_only or not args.live else 7497
     connection = IBKRConnection(host="127.0.0.1", port=port, client_id=client_id)
+    journal = None
+    if not args.no_journal:
+        try:
+            journal = TradeJournal(Path(args.journal_db))
+            logger.info(f"Trade journal enabled at {args.journal_db}")
+        except Exception as journal_init_err:
+            logger.warning(f"Trade journal init failed, continuing without journal: {journal_init_err}")
+            journal = None
+    memory = None
+    if not args.no_memory:
+        try:
+            memory = TradeMemory(Path(args.memory_db))
+            if memory.enabled:
+                logger.info(f"Trade memory enabled at {args.memory_db}")
+            else:
+                logger.warning(f"Trade memory disabled (init failed): {memory.init_error}")
+                memory = None
+        except Exception as memory_init_err:
+            logger.warning(f"Trade memory init failed, continuing without memory: {memory_init_err}")
+            memory = None
     
     try:
         logger.info("Attempting to connect to IBKR Gateway...")
@@ -617,8 +896,36 @@ async def main():
 
             # Set IB client for watch mode
             strategy.set_ib_client(connection)
-            
-            await watch_mode(args.symbols, strategy, connection, args.check_interval)
+
+            run_id = None
+            if journal:
+                try:
+                    run_id = journal.start_run(
+                        strategy=args.strategy,
+                        symbols=[s.upper() for s in args.symbols],
+                        params={**strategy_params, **groq_extra, "check_interval": args.check_interval},
+                    )
+                except Exception as run_err:
+                    logger.warning(f"Could not start trade journal run: {run_err}")
+                    run_id = None
+
+            try:
+                await watch_mode(
+                    args.symbols,
+                    strategy,
+                    connection,
+                    args.check_interval,
+                    journal=journal,
+                    memory=memory,
+                    run_id=run_id,
+                    snapshot_interval_sec=args.journal_snapshot_interval,
+                )
+            finally:
+                if journal and run_id:
+                    try:
+                        journal.end_run(run_id)
+                    except Exception as end_err:
+                        logger.warning(f"Could not finalize trade journal run {run_id}: {end_err}")
         
         else:
             # Backtesting or paper trading mode
@@ -730,7 +1037,35 @@ async def main():
                         f"\nStarting {'paper' if args.paper else 'live'} trading..."
                     )
                     # Start trading in watch mode
-                    await watch_mode(args.symbols, strategy, connection, args.check_interval)
+                    run_id = None
+                    if journal:
+                        try:
+                            run_id = journal.start_run(
+                                strategy=args.strategy,
+                                symbols=[s.upper() for s in args.symbols],
+                                params={**strategy_params, **groq_extra, "check_interval": args.check_interval},
+                            )
+                        except Exception as run_err:
+                            logger.warning(f"Could not start trade journal run: {run_err}")
+                            run_id = None
+
+                    try:
+                        await watch_mode(
+                            args.symbols,
+                            strategy,
+                            connection,
+                            args.check_interval,
+                            journal=journal,
+                            memory=memory,
+                            run_id=run_id,
+                            snapshot_interval_sec=args.journal_snapshot_interval,
+                        )
+                    finally:
+                        if journal and run_id:
+                            try:
+                                journal.end_run(run_id)
+                            except Exception as end_err:
+                                logger.warning(f"Could not finalize trade journal run {run_id}: {end_err}")
             
     except Exception as e:
         logger.error(f"Error in main: {str(e)}", exc_info=True)
