@@ -276,7 +276,7 @@ class TradeJournal:
         with self._conn() as con:
             con.execute(
                 """
-                INSERT OR REPLACE INTO trades(
+                INSERT INTO trades(
                     trade_id, run_id, symbol, side, signal_value, intended_entry_price, intended_shares,
                     stop_loss, target, status, indicator_snapshot_json, memory_consulted, memory_verdict_json,
                     created_at, updated_at

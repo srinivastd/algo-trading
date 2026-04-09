@@ -8,6 +8,7 @@ import argparse
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
+from uuid import uuid4
 import pytz
 import random
 import pandas as pd
@@ -168,8 +169,14 @@ async def watch_mode(
     # Store real-time bar lists for each symbol
     realtime_bar_lists = {}
 
-    # Trade tracking system to link buys and sells
-    trade_counter = len(active_trades)
+    # Trade IDs must be globally unique across restarts to avoid journal collisions.
+    trade_counter = 0
+    trade_id_prefix = (run_id or f"RUNLESS_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}")
+
+    def _next_trade_id() -> str:
+        nonlocal trade_counter
+        trade_counter += 1
+        return f"TRADE_{trade_id_prefix}_{trade_counter:06d}"
 
     async def setup_market_data(contract):
         try:
@@ -515,8 +522,7 @@ async def watch_mode(
                     if signal != 0:
                         signals.append(f"{symbol}: {signal}")
                         logger.debug(f"Generated signal {signal} for {symbol}")
-                        trade_counter += 1
-                        trade_id = f"TRADE_{trade_counter:06d}"
+                        trade_id = _next_trade_id()
 
                         entry_price = float(df['close'].iloc[-1])
                         is_long = signal == 1
