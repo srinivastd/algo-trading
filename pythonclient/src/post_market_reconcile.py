@@ -54,19 +54,139 @@ def _fmt_money(value: float | None) -> str:
     return f"${value:,.2f}"
 
 
-def _classify_trade(row: dict[str, Any]) -> str:
-    pnl = row.get("realized_pnl")
-    slippage = row.get("slippage_bps")
+def _to_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hold_hours(row: dict[str, Any]) -> float | None:
+    ent = _to_et_datetime(row.get("entry_fill_time"))
+    ex = _to_et_datetime(row.get("exit_fill_time"))
+    if not ent or not ex:
+        return None
+    seconds = (ex - ent).total_seconds()
+    if seconds < 0:
+        return None
+    return seconds / 3600.0
+
+
+def _estimate_r_multiple(row: dict[str, Any]) -> float | None:
+    entry = _to_float(row.get("entry_fill_price")) or _to_float(row.get("intended_entry_price"))
+    pnl = _to_float(row.get("realized_pnl"))
+    shares = _to_float(row.get("intended_shares"))
+    side = str(row.get("side") or "").upper()
+    stop = _to_float(row.get("stop_loss"))
+    if entry is None or pnl is None or shares is None or shares <= 0 or stop is None:
+        return None
+    if side == "LONG":
+        risk_per_share = max(entry - stop, 0.0)
+    elif side == "SHORT":
+        risk_per_share = max(stop - entry, 0.0)
+    else:
+        risk_per_share = 0.0
+    if risk_per_share <= 0:
+        return None
+    risk_dollars = risk_per_share * shares
+    if risk_dollars <= 0:
+        return None
+    return pnl / risk_dollars
+
+
+def _classify_trade(row: dict[str, Any]) -> tuple[str, int, str]:
+    """
+    Smarter classification based on weighted evidence, not just PnL sign.
+
+    Returns:
+      (classification, score, rationale)
+    """
+    pnl = _to_float(row.get("realized_pnl"))
+    slippage = _to_float(row.get("slippage_bps"))
     reason = str(row.get("exit_reason") or "").lower()
-    if pnl is None:
-        return "NEUTRAL"
-    if pnl > 0 and reason in {"target", "strategy_signal", "signal"} and (slippage is None or slippage < 20):
-        return "GOOD"
-    if pnl < 0 and (reason == "time" or (slippage is not None and slippage > 50)):
-        return "BAD"
-    if pnl < 0:
-        return "BAD"
-    return "NEUTRAL"
+    status = str(row.get("status") or "").lower()
+    hold_h = _hold_hours(row)
+    r_mult = _estimate_r_multiple(row)
+
+    if status != "closed" or pnl is None:
+        return ("NEUTRAL", 0, "not closed or missing realized_pnl")
+
+    score = 0
+    notes: list[str] = []
+
+    # PnL is still primary, but graded by magnitude.
+    if pnl > 0:
+        score += 40
+        notes.append("positive pnl")
+        if pnl >= 500:
+            score += 10
+            notes.append("strong absolute pnl")
+    elif pnl < 0:
+        score -= 45
+        notes.append("negative pnl")
+        if pnl <= -500:
+            score -= 10
+            notes.append("large absolute loss")
+
+    # Risk-adjusted outcome if stop context exists.
+    if r_mult is not None:
+        if r_mult >= 1.0:
+            score += 20
+            notes.append(f"r_multiple {r_mult:.2f} >= 1")
+        elif r_mult <= -1.0:
+            score -= 25
+            notes.append(f"r_multiple {r_mult:.2f} <= -1")
+        else:
+            notes.append(f"r_multiple {r_mult:.2f}")
+    else:
+        notes.append("r_multiple unavailable")
+
+    # Execution quality.
+    if slippage is not None:
+        if slippage < 15:
+            score += 10
+            notes.append("low slippage")
+        elif slippage > 50:
+            score -= 20
+            notes.append("high slippage")
+        elif slippage > 30:
+            score -= 10
+            notes.append("elevated slippage")
+    else:
+        notes.append("slippage missing")
+
+    # Exit quality.
+    if reason in {"target"}:
+        score += 12
+        notes.append("target exit")
+    elif reason in {"strategy_signal", "signal"}:
+        score += 4
+        notes.append("signal exit")
+    elif reason in {"stop_loss", "stop"}:
+        score -= 10
+        notes.append("stopped out")
+    elif reason == "time":
+        score -= 8
+        notes.append("time exit")
+
+    # Holding-time sanity checks.
+    if hold_h is not None:
+        if hold_h < 0.03:  # ~2 minutes
+            score -= 6
+            notes.append(f"very short hold ({hold_h:.2f}h)")
+        elif hold_h > 24:
+            score -= 6
+            notes.append(f"very long hold ({hold_h:.1f}h)")
+    else:
+        notes.append("hold duration unavailable")
+
+    if score >= 25:
+        return ("GOOD", score, "; ".join(notes))
+    if score <= -20:
+        return ("BAD", score, "; ".join(notes))
+    return ("NEUTRAL", score, "; ".join(notes))
 
 
 @dataclass
@@ -87,7 +207,8 @@ def _load_journal_trades(conn: sqlite3.Connection, target: date) -> list[dict[st
         SELECT
             trade_id, run_id, symbol, side, status, order_id, stop_order_id, target_order_id,
             intended_entry_price, intended_shares, entry_fill_price, entry_fill_time,
-            exit_fill_price, exit_fill_time, exit_reason, realized_pnl, slippage_bps, created_at, updated_at
+            exit_fill_price, exit_fill_time, exit_reason, realized_pnl, slippage_bps,
+            stop_loss, target, created_at, updated_at
         FROM trades
         ORDER BY created_at ASC
         """
@@ -159,9 +280,11 @@ async def reconcile_post_market(
         closed_trades = 0
         closed_pnl = 0.0
         for row in journal_rows:
-            cls = _classify_trade(row)
+            cls, score, rationale = _classify_trade(row)
             con.execute("UPDATE trades SET classification = ? WHERE trade_id = ?", (cls, row["trade_id"]))
             row["classification"] = cls
+            row["classification_score"] = score
+            row["classification_rationale"] = rationale
             if str(row.get("status", "")).lower() == "closed" and row.get("realized_pnl") is not None:
                 closed_trades += 1
                 closed_pnl += float(row["realized_pnl"])
@@ -218,21 +341,25 @@ def _build_markdown(
 
     lines.append("## Journal Trades")
     lines.append("")
-    lines.append("| trade_id | symbol | side | status | order_id | entry | exit | pnl | slippage_bps | class |")
-    lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |")
+    lines.append("| trade_id | symbol | side | status | order_id | entry | exit | pnl | slip_bps | score | class | rationale |")
+    lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |")
     for r in journal_rows:
         pnl = r.get("realized_pnl")
         pnl_s = f"{float(pnl):.2f}" if pnl is not None else ""
         sl = r.get("slippage_bps")
         sl_s = f"{float(sl):.2f}" if sl is not None else ""
+        score = r.get("classification_score")
+        score_s = str(int(score)) if score is not None else ""
+        rationale = str(r.get("classification_rationale") or "").replace("|", "/")
         entry = r.get("entry_fill_price")
         exit_px = r.get("exit_fill_price")
         lines.append(
             f"| {r.get('trade_id')} | {r.get('symbol')} | {r.get('side')} | {r.get('status')} | "
-            f"{r.get('order_id') or ''} | {entry or ''} | {exit_px or ''} | {pnl_s} | {sl_s} | {r.get('classification','')} |"
+            f"{r.get('order_id') or ''} | {entry or ''} | {exit_px or ''} | {pnl_s} | {sl_s} | "
+            f"{score_s} | {r.get('classification','')} | {rationale} |"
         )
     if not journal_rows:
-        lines.append("| *(none)* | | | | | | | | | |")
+        lines.append("| *(none)* | | | | | | | | | | | |")
     lines.append("")
 
     lines.append("## IB Executions")
