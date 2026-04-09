@@ -24,6 +24,7 @@ import json
 import os
 from ib_insync import ExecutionFilter
 from trade_journal import TradeJournal
+from trade_memory import TradeMemory
 
 _PYTHONCLIENT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -140,6 +141,7 @@ async def watch_mode(
     check_interval,
     *,
     journal: TradeJournal | None = None,
+    memory: TradeMemory | None = None,
     run_id: str | None = None,
     snapshot_interval_sec: int = 60,
 ):
@@ -392,6 +394,7 @@ async def watch_mode(
                                         f"TRADE {trade_id}: Closed position {pos_symbol}: "
                                         f"{exit_action} {exit_quantity} shares at ${df['close'].iloc[-1]:.2f}, PnL: ${pnl:.2f}"
                                     )
+                                    at = active_trades.get(pos_symbol, {})
                                     if journal and trade_id != "UNKNOWN_TRADE":
                                         try:
                                             journal.close_trade(
@@ -416,6 +419,27 @@ async def watch_mode(
                                             )
                                         except Exception as journal_err:
                                             logger.warning(f"Trade journal close logging failed for {trade_id}: {journal_err}")
+
+                                    if memory and memory.enabled and trade_id != "UNKNOWN_TRADE":
+                                        try:
+                                            memory.capture_closed_trade(
+                                                trade_id=trade_id,
+                                                symbol=pos_symbol,
+                                                strategy=type(strategy).__name__,
+                                                side="LONG" if at.get("is_long", position_size > 0) else "SHORT",
+                                                signal_value=int(at.get("signal_value", -1 if position_size > 0 else 1)),
+                                                entry_price=_safe_float(at.get("entry_price")),
+                                                exit_price=float(df['close'].iloc[-1]),
+                                                realized_pnl=float(pnl),
+                                                shares=_safe_float(at.get("shares", exit_quantity)),
+                                                entry_time=at.get("entry_time"),
+                                                exit_time=current_time,
+                                                entry_regime=at.get("entry_regime"),
+                                                exit_reason="strategy_signal",
+                                                indicators=at.get("indicator_snapshot", {}),
+                                            )
+                                        except Exception as memory_err:
+                                            logger.warning(f"Trade memory capture failed for {trade_id}: {memory_err}")
 
                                     if pos_symbol in active_trades:
                                         del active_trades[pos_symbol]
@@ -463,6 +487,7 @@ async def watch_mode(
                     }
                     market_data_logger.info(json.dumps(signal_data))
                     indicators = signal_data.get("market_context", {}).get("indicators", {})
+                    regime, adx, vol_ratio, trend_direction = _infer_regime(indicators)
 
                     if journal and run_id:
                         try:
@@ -506,6 +531,26 @@ async def watch_mode(
                             f"Trade parameters for {symbol}: Entry=${entry_price:.2f}, Stop=${stop_loss:.2f} "
                             f"({strategy.stop_loss_pct}%), Target=${target:.2f} ({strategy.target_pct}%), Shares={shares}"
                         )
+                        memory_verdict = None
+                        if memory and memory.enabled:
+                            try:
+                                recall = memory.pre_trade_recall(
+                                    symbol=symbol_upper,
+                                    strategy=type(strategy).__name__,
+                                    signal_value=int(signal),
+                                    entry_price=entry_price,
+                                    indicators=indicators,
+                                )
+                                memory_verdict = recall.as_dict()
+                                if recall.win_rate_similar is not None:
+                                    logger.info(
+                                        f"Memory recall for {symbol_upper}: "
+                                        f"win_rate={recall.win_rate_similar:.1%}, avg_pnl={recall.avg_pnl_similar}"
+                                    )
+                                if recall.regime_warning:
+                                    logger.warning(f"Memory warning for {symbol_upper}: {recall.regime_warning}")
+                            except Exception as memory_err:
+                                logger.warning(f"Trade memory recall failed for {symbol_upper}: {memory_err}")
 
                         trade_data = {
                             'timestamp': current_time.isoformat(),
@@ -538,8 +583,8 @@ async def watch_mode(
                                     stop_loss=float(stop_loss),
                                     target=float(target),
                                     indicator_snapshot=indicators,
-                                    memory_consulted=False,
-                                    memory_verdict=None,
+                                    memory_consulted=memory_verdict is not None,
+                                    memory_verdict=memory_verdict,
                                 )
                             except Exception as journal_err:
                                 logger.warning(f"Trade journal attempt logging failed for {trade_id}: {journal_err}")
@@ -601,6 +646,9 @@ async def watch_mode(
                                 'entry_price': entry_price,
                                 'shares': shares,
                                 'is_long': is_long,
+                                'signal_value': int(signal),
+                                'entry_regime': regime,
+                                'indicator_snapshot': indicators,
                                 'parent_order_id': trade_result.get('order_id'),
                                 'stop_order_id': trade_result.get('stop_order_id'),
                                 'target_order_id': trade_result.get('target_order_id')
@@ -732,6 +780,8 @@ def parse_args():
     parser.add_argument("--no-journal", action="store_true", help="Disable SQLite trade journaling in watch mode")
     parser.add_argument("--journal-db", default=str(_PYTHONCLIENT_ROOT / "trade_journal.db"), help="Path to SQLite journal db")
     parser.add_argument("--journal-snapshot-interval", type=int, default=60, help="Seconds between account/position snapshots in journal")
+    parser.add_argument("--no-memory", action="store_true", help="Disable Chroma trade memory recall/capture in watch mode")
+    parser.add_argument("--memory-db", default=str(_PYTHONCLIENT_ROOT / "chroma_db"), help="Path to ChromaDB for trade memory")
     return parser.parse_args()
 
 async def main():
@@ -800,6 +850,18 @@ async def main():
         except Exception as journal_init_err:
             logger.warning(f"Trade journal init failed, continuing without journal: {journal_init_err}")
             journal = None
+    memory = None
+    if not args.no_memory:
+        try:
+            memory = TradeMemory(Path(args.memory_db))
+            if memory.enabled:
+                logger.info(f"Trade memory enabled at {args.memory_db}")
+            else:
+                logger.warning(f"Trade memory disabled (init failed): {memory.init_error}")
+                memory = None
+        except Exception as memory_init_err:
+            logger.warning(f"Trade memory init failed, continuing without memory: {memory_init_err}")
+            memory = None
     
     try:
         logger.info("Attempting to connect to IBKR Gateway...")
@@ -848,6 +910,7 @@ async def main():
                     connection,
                     args.check_interval,
                     journal=journal,
+                    memory=memory,
                     run_id=run_id,
                     snapshot_interval_sec=args.journal_snapshot_interval,
                 )
@@ -987,6 +1050,7 @@ async def main():
                             connection,
                             args.check_interval,
                             journal=journal,
+                            memory=memory,
                             run_id=run_id,
                             snapshot_interval_sec=args.journal_snapshot_interval,
                         )
