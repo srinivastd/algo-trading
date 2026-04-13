@@ -279,41 +279,60 @@ class GroqBreakOfStructureStrategy(StrategyBase):
             logger.error("IBKR client not initialized")
             return {'status': 'error', 'message': 'No IBKR client'}
 
-        order_id = await self.ib_client.place_order(
+        entry_res = await self.ib_client.place_order(
             symbol=symbol,
             action='BUY' if signal == 1 else 'SELL',
             quantity=shares,
             order_type='LMT',
             limit_price=entry_price
         )
-        
-        if order_id:
-            # Place stop-loss and target orders
-            stop_order_id = await self.ib_client.place_order(
-                symbol=symbol,
-                action='SELL' if signal == 1 else 'BUY',
-                quantity=shares,
-                order_type='STP',
-                aux_price=stop_loss,
-                parent_id=order_id
-            )
-            target_order_id = await self.ib_client.place_order(
-                symbol=symbol,
-                action='SELL' if signal == 1 else 'BUY',
-                quantity=shares,
-                order_type='LMT',
-                limit_price=target,
-                parent_id=order_id
-            )
-            logger.info(f"Placed {'paper' if self.paper_trading else 'live'} trade: {('Long' if signal == 1 else 'Short')} {symbol}, Entry: ${entry_price:.2f}, Stop: ${stop_loss:.2f}, Target: ${target:.2f}")
-            return {
-                'status': 'success',
-                'order_id': order_id,
-                'stop_order_id': stop_order_id,
-                'target_order_id': target_order_id
-            }
-        else:
+
+        if not entry_res.ok or not entry_res.order_id:
             return {
                 'status': 'error',
-                'message': 'Failed to place order'
+                'message': f"{entry_res.message} [{entry_res.code}]",
+                'ib_place_order': entry_res.as_dict(),
             }
+
+        order_id = entry_res.order_id
+        bracket_qty = (
+            entry_res.quantity_submitted
+            if entry_res.quantity_submitted is not None
+            else shares
+        )
+        stop_res = await self.ib_client.place_order(
+            symbol=symbol,
+            action='SELL' if signal == 1 else 'BUY',
+            quantity=bracket_qty,
+            order_type='STP',
+            aux_price=stop_loss,
+            parent_id=order_id
+        )
+        target_res = await self.ib_client.place_order(
+            symbol=symbol,
+            action='SELL' if signal == 1 else 'BUY',
+            quantity=bracket_qty,
+            order_type='LMT',
+            limit_price=target,
+            parent_id=order_id
+        )
+        stop_order_id = stop_res.order_id if stop_res.ok else None
+        target_order_id = target_res.order_id if target_res.ok else None
+        stop_s = f"${stop_loss:.2f}" if stop_loss is not None else "n/a"
+        target_s = f"${target:.2f}" if target is not None else "n/a"
+        entry_s = f"${entry_price:.2f}" if entry_price is not None else "n/a"
+        logger.info(
+            f"Placed {'paper' if self.paper_trading else 'live'} trade: "
+            f"{('Long' if signal == 1 else 'Short')} {symbol}, Entry: {entry_s}, Stop: {stop_s}, Target: {target_s}"
+        )
+        out = {
+            'status': 'success',
+            'order_id': order_id,
+            'stop_order_id': stop_order_id,
+            'target_order_id': target_order_id
+        }
+        if not stop_order_id:
+            out['stop_order_error'] = stop_res.as_dict()
+        if not target_order_id:
+            out['target_order_error'] = target_res.as_dict()
+        return out
