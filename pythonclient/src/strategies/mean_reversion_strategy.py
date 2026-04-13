@@ -287,48 +287,68 @@ class MeanReversionStrategy(StrategyBase):
             action = 'BUY' if signal == 1 else 'SELL'
             limit_px = entry_price * 1.001 if signal == 1 else entry_price * 0.999
 
-            parent_order_id = await self.ib_client.place_order(
+            parent_res = await self.ib_client.place_order(
                 symbol=symbol,
                 action=action,
                 quantity=shares,
                 order_type='LMT',
                 limit_price=limit_px,
             )
-            if not parent_order_id:
-                return {'status': 'error', 'message': 'Failed to place parent order'}
+            if not parent_res.ok or not parent_res.order_id:
+                return {
+                    'status': 'error',
+                    'message': f"{parent_res.message} [{parent_res.code}]",
+                    'ib_place_order': parent_res.as_dict(),
+                }
 
+            parent_order_id = parent_res.order_id
+            bracket_qty = (
+                parent_res.quantity_submitted
+                if parent_res.quantity_submitted is not None
+                else shares
+            )
             await asyncio.sleep(5)
 
             exit_action = 'SELL' if signal == 1 else 'BUY'
             stop_order_id = None
             target_order_id = None
+            stop_res = None
+            target_res = None
 
             if stop_loss is not None:
                 await asyncio.sleep(2)
-                stop_order_id = await self.ib_client.place_order(
+                stop_res = await self.ib_client.place_order(
                     symbol=symbol,
                     action=exit_action,
-                    quantity=shares,
+                    quantity=bracket_qty,
                     order_type='STP',
                     aux_price=stop_loss,
                     parent_id=parent_order_id,
                 )
+                if stop_res.ok and stop_res.order_id:
+                    stop_order_id = stop_res.order_id
             if target is not None:
                 await asyncio.sleep(2)
-                target_order_id = await self.ib_client.place_order(
+                target_res = await self.ib_client.place_order(
                     symbol=symbol,
                     action=exit_action,
-                    quantity=shares,
+                    quantity=bracket_qty,
                     order_type='LMT',
                     limit_price=target,
                     parent_id=parent_order_id,
                 )
+                if target_res.ok and target_res.order_id:
+                    target_order_id = target_res.order_id
 
             result = {'status': 'success', 'order_id': parent_order_id}
             if stop_order_id:
                 result['stop_order_id'] = stop_order_id
+            elif stop_loss is not None and stop_res is not None:
+                result['stop_order_error'] = stop_res.as_dict()
             if target_order_id:
                 result['target_order_id'] = target_order_id
+            elif target is not None and target_res is not None:
+                result['target_order_error'] = target_res.as_dict()
             return result
 
         except Exception as e:
