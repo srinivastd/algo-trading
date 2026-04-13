@@ -73,3 +73,6 @@ pythonclient/historical_data/
 chroma_db/
 market_data_logs/
 stock_analysis.log
+# Stray empty DB if sqlite3 is run from repo root; real journal is pythonclient/trade_journal.db
+/trade_journal.db
+pythonclient/trade_journal.db
