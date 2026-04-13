@@ -8,8 +8,9 @@ import asyncio
 import datetime
 import math
 import pytz
+from dataclasses import dataclass, field
 from ib_insync import IB, MarketOrder, StopOrder, LimitOrder, Trade, Stock, Order, Crypto
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -17,8 +18,147 @@ from utils.crypto_utils import CryptoUtils
 
 logger = logging.getLogger(__name__)
 
+
+def _serialize_ib_trade_log(trade: Any, max_entries: int = 12) -> List[Dict[str, Any]]:
+    """Last N IB trade log lines for JSON / diagnostics (status, message, errorCode)."""
+    out: List[Dict[str, Any]] = []
+    if trade is None or not hasattr(trade, "log") or not trade.log:
+        return out
+    tail = trade.log[-max_entries:] if len(trade.log) > max_entries else trade.log
+    for entry in tail:
+        ec = getattr(entry, "errorCode", None)
+        out.append(
+            {
+                "status": getattr(entry, "status", None),
+                "message": getattr(entry, "message", None) or str(entry),
+                "errorCode": int(ec) if ec is not None else None,
+            }
+        )
+    return out
+
+
+def _ib_log_error_code(logs: List[Dict[str, Any]]) -> Optional[int]:
+    for row in reversed(logs):
+        ec = row.get("errorCode")
+        if ec is not None and ec != 0:
+            return int(ec)
+    return None
+
+
+@dataclass
+class PlaceOrderResult:
+    """Structured outcome from place_order for logs, JSON, and journal messages."""
+
+    order_id: Optional[int] = None
+    ok: bool = False
+    code: str = "UNKNOWN"
+    message: str = ""
+    ib_status: Optional[str] = None
+    ib_error_code: Optional[int] = None
+    ib_log: List[Dict[str, Any]] = field(default_factory=list)
+    quantity_requested: Optional[int] = None
+    quantity_submitted: Optional[int] = None
+    sizing: Optional[Dict[str, Any]] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "ok": self.ok,
+            "code": self.code,
+            "message": self.message,
+        }
+        if self.order_id is not None:
+            d["order_id"] = self.order_id
+        if self.ib_status is not None:
+            d["ib_status"] = self.ib_status
+        if self.ib_error_code is not None:
+            d["ib_error_code"] = self.ib_error_code
+        if self.ib_log:
+            d["ib_log"] = self.ib_log
+        if self.quantity_requested is not None:
+            d["quantity_requested"] = self.quantity_requested
+        if self.quantity_submitted is not None:
+            d["quantity_submitted"] = self.quantity_submitted
+        if self.sizing:
+            d["sizing"] = self.sizing
+        return d
+
+
+def _account_summary_tag_float(rows: List[Any], tag: str) -> Optional[float]:
+    """Best-effort parse of a numeric account summary field (USD / BASE)."""
+    picked: Optional[float] = None
+    for v in rows:
+        if getattr(v, "tag", None) != tag:
+            continue
+        cur = getattr(v, "currency", None)
+        if cur not in ("USD", "BASE"):
+            continue
+        try:
+            picked = float(v.value)
+        except (TypeError, ValueError):
+            continue
+    return picked
+
+
+def _affordable_max_shares(
+    ref_price: float,
+    headroom: Dict[str, Optional[float]],
+    *,
+    utilization: float = 0.88,
+    reg_t_margin_fraction: float = 0.52,
+) -> Optional[int]:
+    """
+    Conservative whole-share cap from IB summary tags. Uses the minimum of
+    independent caps so we stay under buying power, cash, and rough Reg-T margin.
+    Returns None if no tags available (caller should not clamp).
+    """
+    if ref_price <= 0:
+        return None
+    caps: List[int] = []
+    bp = headroom.get("buying_power")
+    if bp is not None and bp > 0:
+        caps.append(int((bp * utilization) / ref_price))
+    ex = headroom.get("excess_liquidity")
+    if ex is not None and ex > 0 and reg_t_margin_fraction > 0:
+        caps.append(int((ex * utilization) / (reg_t_margin_fraction * ref_price)))
+    faf = headroom.get("full_available_funds")
+    if faf is not None and faf > 0:
+        caps.append(int((faf * utilization) / ref_price))
+    av = headroom.get("available_funds")
+    if av is not None and av > 0:
+        caps.append(int((av * utilization) / ref_price))
+    if not caps:
+        return None
+    return max(min(caps), 0)
+
+
+def place_order_failure_from_trade(trade: Any, code: str, message: str) -> PlaceOrderResult:
+    logs = _serialize_ib_trade_log(trade)
+    oid: Optional[int] = None
+    st: Optional[str] = None
+    if trade is not None and getattr(trade, "order", None):
+        oid = trade.order.orderId
+    if trade is not None and hasattr(trade, "orderStatus") and trade.orderStatus:
+        st = trade.orderStatus.status
+    ec = _ib_log_error_code(logs)
+    return PlaceOrderResult(
+        order_id=oid,
+        ok=False,
+        code=code,
+        message=message,
+        ib_status=st,
+        ib_error_code=ec,
+        ib_log=logs,
+    )
+
+
 class IBKRConnection:
-    def __init__(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 0):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 4002,
+        client_id: int = 0,
+        allow_equity_orders_when_market_closed: bool = False,
+    ):
         """
         Initialize IBKR connection with host, port, and client ID.
         
@@ -26,11 +166,14 @@ class IBKRConnection:
             host: Host address (default: "127.0.0.1")
             port: Port number (4002 for paper, 7497 for live, default: 4002)
             client_id: Client ID for this connection (default: 0)
+            allow_equity_orders_when_market_closed: If True, skip the local US-hours gate
+                for stocks and set ``outsideRth`` on equity orders (for paper diagnostics).
         """
         self.ib = IB()
         self.host = host
         self.port = port
         self.client_id = client_id
+        self._allow_equity_orders_when_market_closed = allow_equity_orders_when_market_closed
         self._connected = False
         self.client = self.ib  # For compatibility with main.py
 
@@ -258,31 +401,84 @@ class IBKRConnection:
             logger.warning(f"Could not determine market status for {symbol}: {e}")
             return True  # Default to allowing the order attempt
 
+    async def get_account_sizing_headroom(self) -> Dict[str, Optional[float]]:
+        """Pull margin/cash tags from IB account summary (USD/BASE) for order sizing."""
+        empty: Dict[str, Optional[float]] = {
+            "buying_power": None,
+            "excess_liquidity": None,
+            "full_available_funds": None,
+            "available_funds": None,
+            "net_liquidation": None,
+            "equity_with_loan": None,
+        }
+        if not self.is_connected():
+            return empty
+        try:
+            ib = self.get_ib()
+            accounts = ib.managedAccounts() or []
+            acct = accounts[0] if accounts else ""
+            rows = await ib.accountSummaryAsync(acct)
+        except Exception as e:
+            logger.debug("get_account_sizing_headroom failed: %s", e)
+            return empty
+        return {
+            "buying_power": _account_summary_tag_float(rows, "BuyingPower"),
+            "excess_liquidity": _account_summary_tag_float(rows, "ExcessLiquidity"),
+            "full_available_funds": _account_summary_tag_float(rows, "FullAvailableFunds"),
+            "available_funds": _account_summary_tag_float(rows, "AvailableFunds"),
+            "net_liquidation": _account_summary_tag_float(rows, "NetLiquidation"),
+            "equity_with_loan": _account_summary_tag_float(rows, "EquityWithLoanValue"),
+        }
+
     async def place_order(self, symbol: str, action: str, quantity: int, order_type: str,
                          limit_price: float = None, aux_price: float = None,
-                         parent_id: int = None) -> Optional[int]:
-        """Place a trade order."""
+                         parent_id: int = None) -> PlaceOrderResult:
+        """Place a trade order. Inspect ``result.as_dict()`` for IB log lines and error codes."""
         try:
+            qty_requested = max(0, int(quantity))
             if not self.is_connected():
-                raise ConnectionError("Not connected to IBKR")
+                res = PlaceOrderResult(
+                    ok=False,
+                    code="NOT_CONNECTED",
+                    message="Not connected to IBKR",
+                )
+                logger.error(
+                    "PLACE_ORDER_FAILED symbol=%s code=%s message=%s",
+                    symbol.upper(),
+                    res.code,
+                    res.message,
+                )
+                return res
 
-            # Pre-validate the symbol to catch issues early
             logger.debug(f"Validating symbol {symbol} before placing order...")
             if not await self.validate_symbol(symbol):
-                logger.error(f"Symbol validation failed for {symbol} - cannot place order")
-                return None
+                res = PlaceOrderResult(
+                    ok=False,
+                    code="SYMBOL_VALIDATION_FAILED",
+                    message=f"Symbol validation failed for {symbol}",
+                )
+                logger.error(
+                    "PLACE_ORDER_FAILED symbol=%s code=%s message=%s",
+                    symbol.upper(),
+                    res.code,
+                    res.message,
+                )
+                return res
 
             market_open = await self.is_market_open(symbol)
-
-            # Check if market is open for this symbol
-            if not market_open:
+            # Crypto is always "open" in is_market_open; equities respect US session unless bypassed.
+            if (
+                not market_open
+                and not CryptoUtils.is_crypto(symbol)
+                and not self._allow_equity_orders_when_market_closed
+            ):
                 requested_price = limit_price if order_type == 'LMT' else aux_price if order_type == 'STP' else None
                 logger.info(
                     "ORDER_ATTEMPT symbol=%s action=%s qty=%s type=%s market_open=%s ref=%s "
                     "requested=%s final=%s tick=%s parent=%s status=SKIPPED_MARKET_CLOSED",
                     symbol.upper(),
                     action.upper(),
-                    quantity,
+                    qty_requested,
                     order_type,
                     market_open,
                     None,
@@ -292,35 +488,70 @@ class IBKRConnection:
                     parent_id if parent_id is not None else "-",
                 )
                 logger.info(f"Skipping order for {symbol}: market is closed")
-                return None
+                res = PlaceOrderResult(
+                    ok=False,
+                    code="MARKET_CLOSED",
+                    message="Market closed; order not submitted",
+                )
+                logger.error(
+                    "PLACE_ORDER_FAILED symbol=%s code=%s message=%s",
+                    symbol.upper(),
+                    res.code,
+                    res.message,
+                )
+                return res
 
-            # Create appropriate contract based on symbol type (crypto vs equity)
             contract = CryptoUtils.create_contract(symbol)
-            
-            # Validate contract before placing order
+
             qualified_contracts = await self.get_ib().qualifyContractsAsync(contract)
             if not qualified_contracts:
-                logger.error(f"Could not qualify contract for {symbol} - symbol may be inactive or invalid")
-                return None
-            
-            # Use the first qualified contract
+                res = PlaceOrderResult(
+                    ok=False,
+                    code="CONTRACT_QUALIFY_FAILED",
+                    message=f"Could not qualify contract for {symbol}",
+                )
+                logger.error(
+                    "PLACE_ORDER_FAILED symbol=%s code=%s message=%s",
+                    symbol.upper(),
+                    res.code,
+                    res.message,
+                )
+                return res
+
             contract = qualified_contracts[0]
             logger.debug(f"Contract qualified for {symbol}: {contract}")
-            
-            # Verify contract has valid details using the validation utility
+
             if not CryptoUtils.validate_contract(contract, symbol):
-                logger.error(f"Contract validation failed for {symbol}")
-                return None
+                res = PlaceOrderResult(
+                    ok=False,
+                    code="CONTRACT_INVALID",
+                    message=f"Contract validation failed for {symbol}",
+                )
+                logger.error(
+                    "PLACE_ORDER_FAILED symbol=%s code=%s message=%s",
+                    symbol.upper(),
+                    res.code,
+                    res.message,
+                )
+                return res
 
-            # Determine if this is a crypto order
             is_crypto = CryptoUtils.is_crypto(symbol)
+            equity_outside_rth = (
+                self._allow_equity_orders_when_market_closed
+                and not is_crypto
+                and not market_open
+            )
+            if equity_outside_rth:
+                logger.info(
+                    "ORDER_OUTSIDE_LOCAL_SESSION symbol=%s action=%s (allow_equity_orders_when_market_closed; "
+                    "outsideRth=True for equity)",
+                    symbol.upper(),
+                    action.upper(),
+                )
 
-            # Obtain market snapshot + minimum tick for meaningful, valid pricing.
             market_price = await self._get_market_reference_price(contract, symbol)
             min_tick = await self._get_min_tick(contract)
 
-            # Normalize incoming prices to exchange tick size and keep LMT orders
-            # close to current market to avoid unrealistic stale backtest pricing.
             requested_price = limit_price if order_type == 'LMT' else aux_price if order_type == 'STP' else None
             if order_type == 'LMT' and limit_price is not None:
                 if market_price and market_price > 0:
@@ -328,23 +559,72 @@ class IBKRConnection:
                         requested_price=limit_price,
                         market_price=market_price,
                         action=action,
-                        max_distance_bps=35  # 0.35% max drift from market
+                        max_distance_bps=35,
                     )
                 if min_tick:
                     limit_price = self._round_to_tick(limit_price, min_tick, action)
 
             if order_type == 'STP' and aux_price is not None and min_tick:
-                # Stops should follow protective direction.
-                # SELL stop rounds down, BUY stop rounds up.
                 aux_price = self._round_to_tick(aux_price, min_tick, action)
 
             final_price = limit_price if order_type == 'LMT' else aux_price if order_type == 'STP' else None
+
+            qty = qty_requested
+            sizing_meta: Optional[Dict[str, Any]] = None
+            # Size only standalone equity orders; bracket legs must match parent quantity.
+            if not is_crypto and parent_id is None and qty > 0:
+                ref_px: Optional[float] = None
+                if final_price is not None and final_price > 0:
+                    ref_px = float(final_price)
+                elif market_price is not None and market_price > 0:
+                    ref_px = float(market_price)
+                if ref_px is not None and ref_px > 0:
+                    headroom = await self.get_account_sizing_headroom()
+                    max_q = _affordable_max_shares(ref_px, headroom)
+                    if max_q is not None:
+                        if max_q == 0:
+                            res = PlaceOrderResult(
+                                ok=False,
+                                code="INSUFFICIENT_BUYING_POWER",
+                                message="Account headroom does not allow any size at reference price",
+                                quantity_requested=qty_requested,
+                                quantity_submitted=0,
+                                sizing={
+                                    "ref_price": ref_px,
+                                    "headroom": {k: v for k, v in headroom.items() if v is not None},
+                                },
+                            )
+                            logger.error(
+                                "PLACE_ORDER_FAILED symbol=%s code=%s ref_px=%s headroom=%s",
+                                symbol.upper(),
+                                res.code,
+                                ref_px,
+                                res.sizing.get("headroom") if res.sizing else {},
+                            )
+                            return res
+                        if max_q < qty:
+                            logger.warning(
+                                "ORDER_SIZE_CLAMPED symbol=%s action=%s requested=%s capped=%s ref_px=%.4f",
+                                symbol.upper(),
+                                action.upper(),
+                                qty,
+                                max_q,
+                                ref_px,
+                            )
+                            sizing_meta = {
+                                "requested": qty_requested,
+                                "capped_to": max_q,
+                                "ref_price": ref_px,
+                                "headroom": {k: v for k, v in headroom.items() if v is not None},
+                            }
+                            qty = max_q
+
             logger.info(
                 "ORDER_ATTEMPT symbol=%s action=%s qty=%s type=%s market_open=%s ref=%s "
                 "requested=%s final=%s tick=%s parent=%s status=SUBMITTING",
                 symbol.upper(),
                 action.upper(),
-                quantity,
+                qty,
                 order_type,
                 market_open,
                 f"{market_price:.6f}" if market_price is not None else "NA",
@@ -353,83 +633,152 @@ class IBKRConnection:
                 f"{min_tick:.6f}" if min_tick is not None else "NA",
                 parent_id if parent_id is not None else "-",
             )
-            
-            # Set appropriate TIF (Time In Force) for crypto vs equity
-            tif = 'IOC' if is_crypto else 'GTC'  # Crypto must use IOC, stocks can use GTC
-            
+
+            tif = 'IOC' if is_crypto else 'GTC'
+
             if order_type == 'LMT':
-                order = LimitOrder(action, quantity, limit_price, tif=tif, transmit=True)
-                if is_crypto:
-                    order.outsideRth = True  # Allow 24/7 trading for crypto
+                order = LimitOrder(action, qty, limit_price, tif=tif, transmit=True)
+                if is_crypto or equity_outside_rth:
+                    order.outsideRth = True
             elif order_type == 'STP':
-                order = StopOrder(action, quantity, aux_price, tif=tif, transmit=True)
-                if is_crypto:
-                    order.outsideRth = True  # Allow 24/7 trading for crypto
+                order = StopOrder(action, qty, aux_price, tif=tif, transmit=True)
+                if is_crypto or equity_outside_rth:
+                    order.outsideRth = True
                 if parent_id:
                     order.parentId = parent_id
             else:
-                order = MarketOrder(action, quantity, tif=tif, transmit=True)
-                if is_crypto:
-                    order.outsideRth = True  # Allow 24/7 trading for crypto
+                order = MarketOrder(action, qty, tif=tif, transmit=True)
+                if is_crypto or equity_outside_rth:
+                    order.outsideRth = True
 
             trade = self.get_ib().placeOrder(contract, order)
-            await asyncio.sleep(3)  # Increased wait time for order processing
+            await asyncio.sleep(3)
 
-            # Check order status after placement with better error handling
             if hasattr(trade, 'orderStatus') and trade.orderStatus:
                 status = trade.orderStatus.status
                 if status in ['Filled', 'Submitted', 'PendingSubmit', 'PreSubmitted']:
                     order_id = trade.order.orderId
                     asset_type = "CRYPTO" if is_crypto else "EQUITY"
                     price_str = f"{limit_price or aux_price or 'market'}"
-                    logger.info(f"Placed {asset_type} order {order_id}: {action} {quantity} shares of {symbol} at {price_str} (TIF: {tif})")
-                    return order_id
-                elif status == 'Inactive':
+                    logger.info(
+                        f"Placed {asset_type} order {order_id}: {action} {qty} shares of {symbol} at {price_str} (TIF: {tif})"
+                    )
+                    return PlaceOrderResult(
+                        order_id=order_id,
+                        ok=True,
+                        code="OK",
+                        message=f"{asset_type} order accepted ({status})",
+                        ib_status=status,
+                        quantity_requested=qty_requested,
+                        quantity_submitted=qty,
+                        sizing=sizing_meta,
+                    )
+                if status == 'Inactive':
                     logger.warning(f"Order for {symbol} is inactive - attempting retry after delay")
-                    
-                    # Wait and check if order becomes active
                     await asyncio.sleep(5)
-                    
-                    # Refresh the trade object to get updated status
+                    updated_trade = None
                     try:
-                        # Get updated trade status
-                        updated_trade = None
                         for existing_trade in self.get_ib().trades():
                             if existing_trade.order.orderId == trade.order.orderId:
                                 updated_trade = existing_trade
                                 break
-                        
+
                         if updated_trade and hasattr(updated_trade, 'orderStatus'):
                             updated_status = updated_trade.orderStatus.status
                             if updated_status in ['Filled', 'Submitted', 'PendingSubmit', 'PreSubmitted']:
                                 logger.info(f"Order for {symbol} became active after retry: {updated_status}")
-                                return trade.order.orderId
-                            else:
-                                logger.error(f"Order for {symbol} remains inactive after retry: {updated_status}")
-                        
+                                return PlaceOrderResult(
+                                    order_id=trade.order.orderId,
+                                    ok=True,
+                                    code="OK",
+                                    message=f"Order accepted after retry ({updated_status})",
+                                    ib_status=updated_status,
+                                    quantity_requested=qty_requested,
+                                    quantity_submitted=qty,
+                                    sizing=sizing_meta,
+                                )
+                            logger.error(f"Order for {symbol} remains inactive after retry: {updated_status}")
                     except Exception as retry_error:
                         logger.warning(f"Error during retry check for {symbol}: {retry_error}")
-                    
-                    # Cancel the inactive order to clean up
+
                     try:
                         self.get_ib().cancelOrder(trade.order)
                         logger.info(f"Cancelled inactive order for {symbol}")
                     except Exception as cancel_error:
                         logger.warning(f"Could not cancel inactive order: {cancel_error}")
-                    return None
-                elif status == 'Cancelled':
-                    logger.error(f"Order for {symbol} was cancelled by the system")
-                    return None
-                else:
-                    logger.error(f"Order failed for {symbol}: {status}")
-                    return None
-            else:
-                logger.error(f"No order status available for {symbol} - trade object may be invalid")
-                return None
-                
+
+                    diag_trade = updated_trade if updated_trade is not None else trade
+                    _os = getattr(diag_trade, "orderStatus", None) if diag_trade else None
+                    _ibst = getattr(_os, "status", None) if _os else None
+                    res = place_order_failure_from_trade(
+                        diag_trade,
+                        "ORDER_INACTIVE",
+                        f"Order inactive or rejected after retry (ib_status={_ibst})",
+                    )
+                    logger.error(
+                        "PLACE_ORDER_FAILED symbol=%s code=%s ib_status=%s ib_error_code=%s log_tail=%s",
+                        symbol.upper(),
+                        res.code,
+                        res.ib_status,
+                        res.ib_error_code,
+                        res.ib_log[-3:] if res.ib_log else [],
+                    )
+                    return res
+                if status == 'Cancelled':
+                    res = place_order_failure_from_trade(trade, "ORDER_CANCELLED", "Order cancelled by IB/TWS")
+                    logger.error(
+                        "PLACE_ORDER_FAILED symbol=%s code=%s ib_status=%s ib_error_code=%s",
+                        symbol.upper(),
+                        res.code,
+                        res.ib_status,
+                        res.ib_error_code,
+                    )
+                    return res
+                res = place_order_failure_from_trade(
+                    trade,
+                    "IB_STATUS_NOT_ACCEPTED",
+                    f"Order not in an accepted state: {status}",
+                )
+                logger.error(
+                    "PLACE_ORDER_FAILED symbol=%s code=%s ib_status=%s ib_error_code=%s log_tail=%s",
+                    symbol.upper(),
+                    res.code,
+                    res.ib_status,
+                    res.ib_error_code,
+                    res.ib_log[-3:] if res.ib_log else [],
+                )
+                return res
+
+            logs = _serialize_ib_trade_log(trade)
+            res = PlaceOrderResult(
+                ok=False,
+                code="NO_ORDER_STATUS",
+                message="No order status on trade object after placeOrder",
+                ib_log=logs,
+                ib_error_code=_ib_log_error_code(logs),
+            )
+            logger.error(
+                "PLACE_ORDER_FAILED symbol=%s code=%s ib_error_code=%s log=%s",
+                symbol.upper(),
+                res.code,
+                res.ib_error_code,
+                res.ib_log[-5:] if res.ib_log else [],
+            )
+            return res
+
         except Exception as e:
-            logger.error(f"Failed to place order for {symbol}: {str(e)}")
-            return None
+            res = PlaceOrderResult(
+                ok=False,
+                code="EXCEPTION",
+                message=str(e),
+            )
+            logger.error(
+                "PLACE_ORDER_FAILED symbol=%s code=%s message=%s",
+                symbol.upper(),
+                res.code,
+                res.message,
+            )
+            return res
 
     async def _get_market_reference_price(self, contract, symbol: str) -> Optional[float]:
         """Get best-effort reference price (last/market/bid/ask midpoint)."""
@@ -517,20 +866,15 @@ class IBKRConnection:
                 logger.warning("Not connected to IBKR for account equity check - using paper trading default")
                 return 100000.0  # Paper trading default
             
-            # Method 1: Try account summary with proper API call
             try:
-                # For ib_insync, reqAccountSummaryAsync takes positional arguments
-                account_values = await self.get_ib().reqAccountSummaryAsync(
-                    'All',
-                    'NetLiquidation'
-                )
-                
-                for value in account_values:
-                    if value.tag == 'NetLiquidation' and value.currency == 'USD':
-                        equity = float(value.value)
-                        logger.info(f"Account equity (summary): ${equity:,.2f}")
-                        return equity
-                        
+                ib = self.get_ib()
+                accounts = ib.managedAccounts() or []
+                acct = accounts[0] if accounts else ""
+                account_values = await ib.accountSummaryAsync(acct)
+                nl = _account_summary_tag_float(account_values, "NetLiquidation")
+                if nl is not None:
+                    logger.info(f"Account equity (summary): ${nl:,.2f}")
+                    return nl
             except Exception as e:
                 logger.warning(f"Account summary method failed: {e}")
             
