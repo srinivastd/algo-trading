@@ -208,6 +208,7 @@ def _load_journal_trades(conn: sqlite3.Connection, target: date) -> list[dict[st
             trade_id, run_id, symbol, side, status, order_id, stop_order_id, target_order_id,
             intended_entry_price, intended_shares, entry_fill_price, entry_fill_time,
             exit_fill_price, exit_fill_time, exit_reason, realized_pnl, slippage_bps,
+            classification, classification_score, classification_rationale,
             stop_loss, target, created_at, updated_at
         FROM trades
         ORDER BY created_at ASC
@@ -231,18 +232,30 @@ async def _load_ib_executions(connection: IBKRConnection, target: date) -> list[
     ib = connection.get_ib()
     execs = await ib.reqExecutionsAsync()
     rows: list[dict[str, Any]] = []
-    for ex in execs:
-        et_dt = _to_et_datetime(ex.time)
+    for item in execs:
+        # ib_insync may return Fill objects (with .execution/.contract) rather
+        # than plain Execution objects depending on API/version.
+        ex = getattr(item, "execution", item)
+        contract = getattr(item, "contract", None)
+        order_id = _to_float(getattr(ex, "orderId", None))
+        time_value = getattr(ex, "time", None)
+        et_dt = _to_et_datetime(time_value)
         if et_dt is None or et_dt.date() != target:
+            continue
+        symbol = getattr(ex, "symbol", None) or getattr(contract, "symbol", "")
+        side = getattr(ex, "side", "")
+        shares = _to_float(getattr(ex, "shares", None))
+        price = _to_float(getattr(ex, "price", None))
+        if order_id is None or shares is None or price is None:
             continue
         rows.append(
             {
-                "order_id": int(ex.orderId),
-                "exec_id": str(ex.execId),
-                "symbol": str(ex.symbol).upper(),
-                "side": str(ex.side),
-                "shares": float(ex.shares),
-                "price": float(ex.price),
+                "order_id": int(order_id),
+                "exec_id": str(getattr(ex, "execId", "")),
+                "symbol": str(symbol).upper(),
+                "side": str(side),
+                "shares": float(shares),
+                "price": float(price),
                 "time_et": et_dt.isoformat(),
             }
         )
@@ -281,7 +294,14 @@ async def reconcile_post_market(
         closed_pnl = 0.0
         for row in journal_rows:
             cls, score, rationale = _classify_trade(row)
-            con.execute("UPDATE trades SET classification = ? WHERE trade_id = ?", (cls, row["trade_id"]))
+            con.execute(
+                """
+                UPDATE trades
+                SET classification = ?, classification_score = ?, classification_rationale = ?
+                WHERE trade_id = ?
+                """,
+                (cls, score, rationale, row["trade_id"]),
+            )
             row["classification"] = cls
             row["classification_score"] = score
             row["classification_rationale"] = rationale
