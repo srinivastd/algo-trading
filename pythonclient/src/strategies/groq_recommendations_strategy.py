@@ -18,17 +18,31 @@ from chromadb.utils import embedding_functions
 logger = logging.getLogger(__name__)
 
 class GroqRecommendationsStrategy(StrategyBase):
-    """Strategy based on supply/demand zones with optimized ADX and duration, with paper trading support"""
+    """
+    Supply/demand zones with ADX and duration tuning, plus paper trading.
+
+    Short entries use ``_passes_short_realtime_filters`` in both backtest (``generate_signals``) and
+    ``generate_realtime_signals`` so live and simulation agree.
+    """
 
     STRATEGY_SLUG = "groq"
 
     def __init__(self, risk_per_trade: float = 3000, max_duration_hours: float = 12.0, paper_trading: bool = True,
                  stop_loss_pct: float = 1.0, target_pct: float = 4.0, bar_size: str = "1 hour", duration: str = "1 M",
-                 zone_lookback: int = 4, adx_min: float = 15.0,
-                 zone_freshness_hours: float = 12.0,
-                 volume_breakout_mult: float = 1.1,
-                 volume_confirm_mult: float = 1.05,
-                 position_size_cap: float = 0.95):
+                 zone_lookback: int = 4, adx_min: float = 18.0,
+                 zone_freshness_hours: float = 8.0,
+                 volume_breakout_mult: float = 1.3,
+                 volume_confirm_mult: float = 1.3,
+                 position_size_cap: float = 0.95,
+                 # Realtime SHORT gates aligned with journal post-mortem (chop + momentum long = bad shorts).
+                 short_realtime_filters_enabled: bool = True,
+                 short_realtime_block_adx_below: float = 20.0,
+                 short_realtime_block_rsi_above: float = 72.0,
+                 short_realtime_block_bullish_di_rsi_above: float = 55.0,
+                 short_realtime_require_adx_min: float = 25.0,
+                 short_realtime_require_rsi_max: float = 65.0,
+                 short_realtime_require_minus_di_gt_plus_di: bool = True,
+                 short_realtime_max_macd_histogram: float | None = None):
         super().__init__("Groq Recommendations Strategy")
         self.risk_per_trade = risk_per_trade
         self.max_duration_hours = max_duration_hours
@@ -44,15 +58,49 @@ class GroqRecommendationsStrategy(StrategyBase):
         self.volume_breakout_mult = volume_breakout_mult
         self.volume_confirm_mult = volume_confirm_mult
         self.position_size_cap = position_size_cap
-        # Initialize ChromaDB client and collection
-        self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
-        self.collection = self.chroma_client.get_or_create_collection(
-            name="backtest_results",
-            embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-        )
+        self.short_realtime_filters_enabled = bool(short_realtime_filters_enabled)
+        self.short_realtime_block_adx_below = float(short_realtime_block_adx_below)
+        self.short_realtime_block_rsi_above = float(short_realtime_block_rsi_above)
+        self.short_realtime_block_bullish_di_rsi_above = float(short_realtime_block_bullish_di_rsi_above)
+        self.short_realtime_require_adx_min = float(short_realtime_require_adx_min)
+        self.short_realtime_require_rsi_max = float(short_realtime_require_rsi_max)
+        self.short_realtime_require_minus_di_gt_plus_di = bool(short_realtime_require_minus_di_gt_plus_di)
+        self.short_realtime_max_macd_histogram = short_realtime_max_macd_histogram
+        self.chroma_client = None
+        self.collection = None
+        try:
+            self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+            self.collection = self.chroma_client.get_or_create_collection(
+                name="backtest_results",
+                embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
+                    model_name="all-MiniLM-L6-v2"
+                ),
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as chroma_err:
+            # Chroma's Rust layer can raise pyo3 PanicException (not a subclass of Exception).
+            logger.warning(
+                "ChromaDB unavailable (backtest results will not be persisted): %s",
+                chroma_err,
+            )
         logger.info(f"Initialized {self.name} with risk_per_trade=${risk_per_trade}, max_duration={max_duration_hours}h, "
                    f"stop_loss={stop_loss_pct}%, target={target_pct}%, paper_trading={paper_trading}, "
                    f"bar_size={bar_size}, duration={duration}")
+        if self.short_realtime_filters_enabled:
+            logger.info(
+                "Realtime SHORT filters ON: block adx<%s rsi>%s | (+di>-di & rsi>%s); "
+                "require adx>=%s rsi<=%s minus_di>plus_di=%s; macd_hist_max=%s",
+                self.short_realtime_block_adx_below,
+                self.short_realtime_block_rsi_above,
+                self.short_realtime_block_bullish_di_rsi_above,
+                self.short_realtime_require_adx_min,
+                self.short_realtime_require_rsi_max,
+                self.short_realtime_require_minus_di_gt_plus_di,
+                self.short_realtime_max_macd_histogram
+                if self.short_realtime_max_macd_histogram is not None
+                else "off",
+            )
 
     def set_ib_client(self, ib_client):
         """Set the IBKR client for trading"""
@@ -164,6 +212,143 @@ class GroqRecommendationsStrategy(StrategyBase):
         
         return supply_zones, demand_zones
 
+    def _passes_short_realtime_filters(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """
+        Journal-aligned gates before accepting a supply (-1) entry.
+
+        Block (veto) if any: ADX < 20, RSI > 72, or (+DI > −DI and RSI > 55).
+        Then require all: ADX ≥ 25, RSI ≤ 65, −DI > +DI.
+        Optional: macd_histogram cap (off by default).
+        """
+        if not self.short_realtime_filters_enabled:
+            return True, ""
+
+        row = df.iloc[-1]
+        adx = float(row["adx"]) if "adx" in df.columns and pd.notna(row.get("adx")) else float("nan")
+        rsi = float(row["rsi"]) if "rsi" in df.columns and pd.notna(row.get("rsi")) else float("nan")
+        pdi = float(row["plus_di"]) if "plus_di" in df.columns and pd.notna(row.get("plus_di")) else float("nan")
+        mdi = float(row["minus_di"]) if "minus_di" in df.columns and pd.notna(row.get("minus_di")) else float("nan")
+        hist = float(row["macd_histogram"]) if "macd_histogram" in df.columns and pd.notna(row.get("macd_histogram")) else 0.0
+
+        # --- Hard blocks (match losing-short regimes: chop, parabolic RSI, mild bullish DI) ---
+        if (
+            self.short_realtime_block_adx_below > 0
+            and not np.isnan(adx)
+            and adx < self.short_realtime_block_adx_below
+        ):
+            return False, f"block_adx={adx:.2f}<{self.short_realtime_block_adx_below}"
+        if (
+            self.short_realtime_block_rsi_above > 0
+            and not np.isnan(rsi)
+            and rsi > self.short_realtime_block_rsi_above
+        ):
+            return False, f"block_rsi={rsi:.2f}>{self.short_realtime_block_rsi_above}"
+        if (
+            self.short_realtime_block_bullish_di_rsi_above > 0
+            and not np.isnan(rsi)
+            and not np.isnan(pdi)
+            and not np.isnan(mdi)
+            and pdi > mdi
+            and rsi > self.short_realtime_block_bullish_di_rsi_above
+        ):
+            return (
+                False,
+                f"block_bullish_di rsi={rsi:.2f}>{self.short_realtime_block_bullish_di_rsi_above} "
+                f"with plus_di={pdi:.2f}>minus_di={mdi:.2f}",
+            )
+
+        # --- Require all (trend + not extended long + bearish DI); 0 = skip that check ---
+        if (
+            self.short_realtime_require_adx_min > 0
+            and not np.isnan(adx)
+            and adx < self.short_realtime_require_adx_min
+        ):
+            return False, f"need_adx>={self.short_realtime_require_adx_min} got {adx:.2f}"
+        if (
+            self.short_realtime_require_rsi_max > 0
+            and not np.isnan(rsi)
+            and rsi > self.short_realtime_require_rsi_max
+        ):
+            return False, f"need_rsi<={self.short_realtime_require_rsi_max} got {rsi:.2f}"
+        if self.short_realtime_require_minus_di_gt_plus_di:
+            if np.isnan(mdi) or np.isnan(pdi) or mdi <= pdi:
+                return False, f"need_minus_di>plus_di got plus_di={pdi:.2f} minus_di={mdi:.2f}"
+
+        if self.short_realtime_max_macd_histogram is not None and hist > self.short_realtime_max_macd_histogram:
+            return False, f"macd_histogram={hist:.6f}>{self.short_realtime_max_macd_histogram}"
+        return True, ""
+
+    def _zone_still_fresh(self, bar_time, zone_time) -> bool:
+        return (bar_time - zone_time) < timedelta(hours=self.zone_freshness_hours)
+
+    def _two_bar_volume_breakout(self, df: pd.DataFrame, i: int) -> bool:
+        """Same volume chain as ``generate_signals`` (bars i-2, i-1, i). Requires i >= 2."""
+        if i < 2:
+            return False
+        v_now = df["volume"].iloc[i]
+        v_prev = df["volume"].iloc[i - 1]
+        v_prev2 = df["volume"].iloc[i - 2]
+        if float(v_prev) <= 0 or float(v_prev2) <= 0:
+            return False
+        return bool(
+            v_now > v_prev * self.volume_breakout_mult
+            and v_prev > v_prev2 * self.volume_confirm_mult
+        )
+
+    def _supply_short_zone_hit(
+        self, df: pd.DataFrame, i: int, zone_time, zone_high, zone_low
+    ) -> bool:
+        return (
+            self._zone_still_fresh(df.index[i], zone_time)
+            and float(df["close"].iloc[i]) > float(zone_high)
+            and self._two_bar_volume_breakout(df, i)
+        )
+
+    def _demand_long_zone_hit(
+        self, df: pd.DataFrame, i: int, zone_time, zone_high, zone_low
+    ) -> bool:
+        return (
+            self._zone_still_fresh(df.index[i], zone_time)
+            and float(df["close"].iloc[i]) < float(zone_low)
+            and self._two_bar_volume_breakout(df, i)
+        )
+
+    def _short_confidence_at(self, df: pd.DataFrame, i: int) -> float:
+        profile_score = df["stock_profile_score"].iloc[i] if "stock_profile_score" in df.columns else 0
+        confidence = 0.5
+        if profile_score < -0.3:
+            confidence += 0.3
+        elif profile_score < 0:
+            confidence += 0.1
+        if df["rsi"].iloc[i] > 70:
+            confidence += 0.2
+        if df["macd_histogram"].iloc[i] < 0:
+            confidence += 0.1
+        return float(min(confidence, 1.0))
+
+    def _long_signal_and_confidence_at(self, df: pd.DataFrame, i: int) -> tuple[int, float]:
+        """
+        Long branch after demand zone + volume match (same as ``generate_signals``).
+        Returns (1, confidence) or (0, 0.0).
+        """
+        profile_score = df["stock_profile_score"].iloc[i] if "stock_profile_score" in df.columns else 0
+        confidence = 0.5
+        trend_confirmed = df["sma_20"].iloc[i] > df["sma_50"].iloc[i] or np.random.random() < 0.5
+        if not trend_confirmed:
+            return 0, 0.0
+        confidence += 0.2
+        if profile_score > 0.3:
+            confidence += 0.3
+        elif profile_score > 0:
+            confidence += 0.1
+        if df["rsi"].iloc[i] < 30:
+            confidence += 0.2
+        if df["macd_histogram"].iloc[i] > 0:
+            confidence += 0.1
+        if df["bb_position"].iloc[i] < 0.2:
+            confidence += 0.1
+        return 1, float(min(confidence, 1.0))
+
     def get_stock_selection_score(self, df: pd.DataFrame) -> float:
         """Calculate stock selection score for portfolio construction (inspired by paper's approach)"""
         if len(df) < 50:  # Need sufficient data
@@ -204,71 +389,37 @@ class GroqRecommendationsStrategy(StrategyBase):
 
         supply_zones, demand_zones = self.identify_zones(df)
 
-        for i in range(1, len(df) - 1):
+        # i >= 2 so volume[i-2] is the true prior bar (i==1 would alias iloc[-1] in pandas).
+        for i in range(2, len(df) - 1):
             current_price = df['close'].iloc[i]
             profile_score = df['stock_profile_score'].iloc[i] if 'stock_profile_score' in df.columns else 0
             signals.loc[signals.index[i], 'stock_profile_score'] = profile_score
 
-            # Enhanced signal generation with stock profile scoring (inspired by paper's approach)
             for zone_time, zone_high, zone_low in supply_zones:
-                if ((df.index[i] - zone_time) < timedelta(hours=self.zone_freshness_hours) and
-                    df['close'].iloc[i] > zone_high and
-                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * self.volume_breakout_mult and
-                    df['volume'].iloc[i-1] > df['volume'].iloc[i-2] * self.volume_confirm_mult):
-
-                    # Enhanced short signal with profile score weighting
-                    confidence = 0.5  # Base confidence
-
-                    # Boost confidence based on profile score and technical conditions
-                    if profile_score < -0.3:  # Strong bearish profile
-                        confidence += 0.3
-                    elif profile_score < 0:  # Moderately bearish
-                        confidence += 0.1
-
-                    # Additional technical confirmation
-                    if df['rsi'].iloc[i] > 70:  # Overbought
-                        confidence += 0.2
-                    if df['macd_histogram'].iloc[i] < 0:  # Bearish momentum
-                        confidence += 0.1
-
+                if self._supply_short_zone_hit(df, i, zone_time, zone_high, zone_low):
+                    ok, why = self._passes_short_realtime_filters(df.iloc[: i + 1])
+                    if not ok:
+                        logger.debug("Short zone hit but filtered at %s: %s", df.index[i], why)
+                        continue
+                    confidence = self._short_confidence_at(df, i)
                     signals.loc[signals.index[i], 'signal'] = -1
-                    signals.loc[signals.index[i], 'confidence_score'] = min(confidence, 1.0)
-                    logger.debug(f"Short signal at {df.index[i]}, price: {current_price:.2f}, confidence: {confidence:.2f}")
+                    signals.loc[signals.index[i], 'confidence_score'] = confidence
+                    logger.debug(
+                        f"Short signal at {df.index[i]}, price: {current_price:.2f}, confidence: {confidence:.2f}"
+                    )
                     break
 
             for zone_time, zone_high, zone_low in demand_zones:
-                if ((df.index[i] - zone_time) < timedelta(hours=self.zone_freshness_hours) and
-                    df['close'].iloc[i] < zone_low and
-                    df['volume'].iloc[i] > df['volume'].iloc[i-1] * self.volume_breakout_mult and
-                    df['volume'].iloc[i-1] > df['volume'].iloc[i-2] * self.volume_confirm_mult):
-
-                    # Enhanced long signal with profile score and trend weighting
-                    confidence = 0.5  # Base confidence
-
-                    # Trend confirmation (50% weight as in Phase 2)
-                    trend_confirmed = df['sma_20'].iloc[i] > df['sma_50'].iloc[i] or np.random.random() < 0.5
-
-                    if trend_confirmed:
-                        confidence += 0.2
-
-                        # Boost confidence based on profile score
-                        if profile_score > 0.3:  # Strong bullish profile
-                            confidence += 0.3
-                        elif profile_score > 0:  # Moderately bullish
-                            confidence += 0.1
-
-                        # Additional technical confirmation
-                        if df['rsi'].iloc[i] < 30:  # Oversold
-                            confidence += 0.2
-                        if df['macd_histogram'].iloc[i] > 0:  # Bullish momentum
-                            confidence += 0.1
-                        if df['bb_position'].iloc[i] < 0.2:  # Near lower Bollinger band
-                            confidence += 0.1
-
+                if self._demand_long_zone_hit(df, i, zone_time, zone_high, zone_low):
+                    long_sig, confidence = self._long_signal_and_confidence_at(df, i)
+                    if long_sig == 1:
                         signals.loc[signals.index[i], 'signal'] = 1
-                        signals.loc[signals.index[i], 'confidence_score'] = min(confidence, 1.0)
-                        logger.debug(f"Long signal at {df.index[i]}, price: {current_price:.2f}, confidence: {confidence:.2f}, profile: {profile_score:.3f}")
-                        break
+                        signals.loc[signals.index[i], 'confidence_score'] = confidence
+                        logger.debug(
+                            f"Long signal at {df.index[i]}, price: {current_price:.2f}, "
+                            f"confidence: {confidence:.2f}, profile: {profile_score:.3f}"
+                        )
+                    break
 
         signal_count = len(signals[signals['signal'] != 0])
         avg_confidence = signals[signals['signal'] != 0]['confidence_score'].mean() if signal_count > 0 else 0
@@ -276,71 +427,96 @@ class GroqRecommendationsStrategy(StrategyBase):
         return signals
         
     async def generate_realtime_signals(self, df: pd.DataFrame) -> int:
-        """Generate a single signal based on the latest data in real-time."""
-        if len(df) < 2:
-            logger.debug("Insufficient data for signal generation (need at least 2 bars)")
+        """Same entry rules as ``generate_signals`` on the latest bar (index i = len(df)-1)."""
+        if len(df) < 3:
+            logger.debug("Insufficient data for signal generation (need at least 3 bars)")
             return 0
-        
+
         df = self.calculate_indicators(df)
         supply_zones, demand_zones = self.identify_zones(df)
-        current_price = df['close'].iloc[-1]
-        current_time = df.index[-1]
-        
-        # Match backtest logic exactly - require price breakouts + volume confirmation
+        i = len(df) - 1
+        current_price = float(df["close"].iloc[i])
+        current_time = df.index[i]
+
+        out = 0
+
         for zone_time, zone_high, zone_low in supply_zones:
-            if ((current_time - zone_time) < timedelta(hours=24) and   # Match backtest: 24 hours
-                current_price > zone_high and                          # Match backtest: price breakout required
-                len(df) >= 2 and float(df['volume'].iloc[-2]) > 0
-                and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):  # Match backtest: volume confirmation
-                
-                # Log detailed entry conditions when signal is generated
-                current_volume = float(df['volume'].iloc[-1])
-                prev_volume = float(df['volume'].iloc[-2])
-                volume_ratio = (
-                    current_volume / prev_volume if prev_volume > 0
-                    else (float("inf") if current_volume > 0 else 0.0)
-                )
-                ratio_log = f"{volume_ratio:.2f}" if volume_ratio != float("inf") else "inf"
-                current_adx = df['adx'].iloc[-1] if 'adx' in df.columns else 0
-                time_diff_hours = (current_time - zone_time).total_seconds() / 3600
-                
-                logger.info(f"✅ SHORT SIGNAL GENERATED at {current_time}:")
-                logger.info(f"   Price: ${current_price:.2f} (broke above supply zone ${zone_high:.2f})")
-                logger.info(f"   Volume: {current_volume:,.0f} (1.2x+ previous: {prev_volume:,.0f}, ratio: {ratio_log})")
-                logger.info(f"   ADX: {current_adx:.1f}")
-                logger.info(f"   Zone Age: {time_diff_hours:.1f} hours")
-                logger.info(f"   Zone Range: ${zone_low:.2f} - ${zone_high:.2f}")
-                return -1
-                
+            if not self._supply_short_zone_hit(df, i, zone_time, zone_high, zone_low):
+                continue
+
+            current_volume = float(df["volume"].iloc[i])
+            prev_volume = float(df["volume"].iloc[i - 1])
+            prev2_volume = float(df["volume"].iloc[i - 2])
+            volume_ratio = (
+                current_volume / prev_volume if prev_volume > 0
+                else (float("inf") if current_volume > 0 else 0.0)
+            )
+            ratio_log = f"{volume_ratio:.2f}" if volume_ratio != float("inf") else "inf"
+            current_adx = df["adx"].iloc[i] if "adx" in df.columns else 0
+            time_diff_hours = (current_time - zone_time).total_seconds() / 3600
+
+            logger.info(f"✅ SHORT CANDIDATE at {current_time}:")
+            logger.info(f"   Price: ${current_price:.2f} (broke above supply zone ${zone_high:.2f})")
+            logger.info(
+                f"   Volume chain: {prev2_volume:,.0f} -> {prev_volume:,.0f} -> {current_volume:,.0f} "
+                f"(breakout_mult={self.volume_breakout_mult}, confirm_mult={self.volume_confirm_mult}; "
+                f"last/prev ratio {ratio_log})"
+            )
+            logger.info(f"   ADX: {current_adx:.1f}")
+            logger.info(
+                f"   Zone age: {time_diff_hours:.1f} h (freshness < {self.zone_freshness_hours} h)"
+            )
+            logger.info(f"   Zone range: ${zone_low:.2f} - ${zone_high:.2f}")
+            ok, why = self._passes_short_realtime_filters(df.iloc[: i + 1])
+            if not ok:
+                logger.info(f"SHORT signal suppressed by filters ({why})")
+                continue
+            out = -1
+            logger.info("   -> SHORT signal accepted")
+            break
+
         for zone_time, zone_high, zone_low in demand_zones:
-            if ((current_time - zone_time) < timedelta(hours=24) and   # Match backtest: 24 hours
-                current_price < zone_low and                           # Match backtest: price breakout required  
-                len(df) >= 2 and float(df['volume'].iloc[-2]) > 0
-                and df['volume'].iloc[-1] > df['volume'].iloc[-2] * 1.2):  # Match backtest: volume confirmation
-                
-                # Log detailed entry conditions when signal is generated
-                current_volume = float(df['volume'].iloc[-1])
-                prev_volume = float(df['volume'].iloc[-2])
-                volume_ratio = (
-                    current_volume / prev_volume if prev_volume > 0
-                    else (float("inf") if current_volume > 0 else 0.0)
-                )
-                ratio_log = f"{volume_ratio:.2f}" if volume_ratio != float("inf") else "inf"
-                current_adx = df['adx'].iloc[-1] if 'adx' in df.columns else 0
-                time_diff_hours = (current_time - zone_time).total_seconds() / 3600
-                
-                logger.info(f"✅ LONG SIGNAL GENERATED at {current_time}:")
-                logger.info(f"   Price: ${current_price:.2f} (broke below demand zone ${zone_low:.2f})")
-                logger.info(f"   Volume: {current_volume:,.0f} (1.2x+ previous: {prev_volume:,.0f}, ratio: {ratio_log})")
-                logger.info(f"   ADX: {current_adx:.1f}")
-                logger.info(f"   Zone Age: {time_diff_hours:.1f} hours")
-                logger.info(f"   Zone Range: ${zone_low:.2f} - ${zone_high:.2f}")
-                return 1
-                
-        return 0
+            if not self._demand_long_zone_hit(df, i, zone_time, zone_high, zone_low):
+                continue
+
+            current_volume = float(df["volume"].iloc[i])
+            prev_volume = float(df["volume"].iloc[i - 1])
+            prev2_volume = float(df["volume"].iloc[i - 2])
+            volume_ratio = (
+                current_volume / prev_volume if prev_volume > 0
+                else (float("inf") if current_volume > 0 else 0.0)
+            )
+            ratio_log = f"{volume_ratio:.2f}" if volume_ratio != float("inf") else "inf"
+            current_adx = df["adx"].iloc[i] if "adx" in df.columns else 0
+            time_diff_hours = (current_time - zone_time).total_seconds() / 3600
+            long_sig, confidence = self._long_signal_and_confidence_at(df, i)
+
+            logger.info(f"✅ LONG CANDIDATE at {current_time}:")
+            logger.info(f"   Price: ${current_price:.2f} (broke below demand zone ${zone_low:.2f})")
+            logger.info(
+                f"   Volume chain: {prev2_volume:,.0f} -> {prev_volume:,.0f} -> {current_volume:,.0f} "
+                f"(breakout_mult={self.volume_breakout_mult}, confirm_mult={self.volume_confirm_mult}; "
+                f"last/prev ratio {ratio_log})"
+            )
+            logger.info(f"   ADX: {current_adx:.1f}")
+            logger.info(
+                f"   Zone age: {time_diff_hours:.1f} h (freshness < {self.zone_freshness_hours} h)"
+            )
+            logger.info(f"   Zone range: ${zone_low:.2f} - ${zone_high:.2f}")
+            if long_sig == 1:
+                logger.info(f"   -> LONG signal accepted (confidence {confidence:.2f})")
+                out = 1
+            else:
+                logger.info("   -> LONG suppressed (trend_confirmed false, same as backtest)")
+            break
+
+        return out
         
     async def generate_exit_signals(self, df: pd.DataFrame, position_type: str) -> int:
-        """Generate exit signals for existing positions based on momentum, zone reversals, and ADX."""
+        """
+        Optional live-only exits (momentum, zone reversals, ADX). ``backtest()`` does not call this;
+        watch mode runs it only when ``main.py`` is started with ``--strategy-exit-signals``.
+        """
         if len(df) < 3:
             return 0
         
@@ -485,16 +661,27 @@ class GroqRecommendationsStrategy(StrategyBase):
                     target = live_entry_price * (1 + target_ratio) if signal == 1 else live_entry_price * (1 - target_ratio)
 
             # Place parent order first
-            parent_order_id = await self.ib_client.place_order(
+            parent_res = await self.ib_client.place_order(
                 symbol=symbol,
                 action='BUY' if signal == 1 else 'SELL',
                 quantity=shares,
                 order_type='LMT',
                 limit_price=live_entry_price
             )
-            
-            if not parent_order_id:
-                return {'status': 'error', 'message': 'Failed to place parent order'}
+
+            if not parent_res.ok or not parent_res.order_id:
+                return {
+                    'status': 'error',
+                    'message': f"{parent_res.message} [{parent_res.code}]",
+                    'ib_place_order': parent_res.as_dict(),
+                }
+
+            parent_order_id = parent_res.order_id
+            bracket_qty = (
+                parent_res.quantity_submitted
+                if parent_res.quantity_submitted is not None
+                else shares
+            )
             
             logger.info(f"Parent order {parent_order_id} placed successfully")
             
@@ -540,23 +727,26 @@ class GroqRecommendationsStrategy(StrategyBase):
             # Only place child orders if we have valid stop_loss and target
             stop_order_id = None
             target_order_id = None
-            
+            stop_res = None
+            target_res = None
+
             if stop_loss is not None:
                 try:
                     await asyncio.sleep(5)  # Additional delay before stop order
                     await asyncio.sleep(2)  # Additional delay before stop order
-                    stop_order_id = await self.ib_client.place_order(
+                    stop_res = await self.ib_client.place_order(
                         symbol=symbol,
                         action='SELL' if signal == 1 else 'BUY',
-                        quantity=shares,
+                        quantity=bracket_qty,
                         order_type='STP',
                         aux_price=stop_loss,
                         parent_id=parent_order_id
                     )
-                    if stop_order_id:
+                    if stop_res.ok and stop_res.order_id:
+                        stop_order_id = stop_res.order_id
                         logger.info(f"Stop-loss order {stop_order_id} placed successfully")
                     else:
-                        logger.warning("Failed to place stop-loss order")
+                        logger.warning("Failed to place stop-loss order: %s", stop_res.as_dict())
                 except Exception as stop_error:
                     logger.error(f"Error placing stop-loss order: {stop_error}")
             
@@ -564,18 +754,19 @@ class GroqRecommendationsStrategy(StrategyBase):
                 try:
                     await asyncio.sleep(5)  # Additional delay before target order
                     await asyncio.sleep(2)  # Additional delay before target order
-                    target_order_id = await self.ib_client.place_order(
+                    target_res = await self.ib_client.place_order(
                         symbol=symbol,
                         action='SELL' if signal == 1 else 'BUY',
-                        quantity=shares,
+                        quantity=bracket_qty,
                         order_type='LMT',
                         limit_price=target,
                         parent_id=parent_order_id
                     )
-                    if target_order_id:
+                    if target_res.ok and target_res.order_id:
+                        target_order_id = target_res.order_id
                         logger.info(f"Target order {target_order_id} placed successfully")
                     else:
-                        logger.warning("Failed to place target order")
+                        logger.warning("Failed to place target order: %s", target_res.as_dict())
                 except Exception as target_error:
                     logger.error(f"Error placing target order: {target_error}")
             
@@ -587,13 +778,20 @@ class GroqRecommendationsStrategy(StrategyBase):
             
             if stop_order_id:
                 result['stop_order_id'] = stop_order_id
+            elif stop_loss is not None and stop_res is not None:
+                result['stop_order_error'] = stop_res.as_dict()
             if target_order_id:
                 result['target_order_id'] = target_order_id
+            elif target is not None and target_res is not None:
+                result['target_order_error'] = target_res.as_dict()
             
             trade_type = 'Long' if signal == 1 else 'Short'
+            stop_s = f"${stop_loss:.2f}" if stop_loss is not None else "n/a"
+            target_s = f"${target:.2f}" if target is not None else "n/a"
+            entry_s = f"${live_entry_price:.2f}" if live_entry_price is not None else "n/a"
             logger.info(
                 f"Placed {'paper' if self.paper_trading else 'live'} trade: "
-                f"{trade_type} {symbol}, Entry: ${live_entry_price:.2f}, Stop: ${stop_loss:.2f}, Target: ${target:.2f}"
+                f"{trade_type} {symbol}, Entry: {entry_s}, Stop: {stop_s}, Target: {target_s}"
             )
             
             return result
@@ -740,18 +938,26 @@ class GroqRecommendationsStrategy(StrategyBase):
             "volume_breakout_mult": self.volume_breakout_mult,
             "volume_confirm_mult": self.volume_confirm_mult,
             "position_size_cap": self.position_size_cap,
+            "short_realtime_filters_enabled": int(self.short_realtime_filters_enabled),
+            "short_realtime_block_adx_below": float(self.short_realtime_block_adx_below),
+            "short_realtime_block_rsi_above": float(self.short_realtime_block_rsi_above),
+            "short_realtime_block_bullish_di_rsi_above": float(self.short_realtime_block_bullish_di_rsi_above),
+            "short_realtime_require_adx_min": float(self.short_realtime_require_adx_min),
+            "short_realtime_require_rsi_max": float(self.short_realtime_require_rsi_max),
+            "short_realtime_require_minus_di_gt_plus_di": int(self.short_realtime_require_minus_di_gt_plus_di),
+            "short_realtime_max_macd_histogram": self.short_realtime_max_macd_histogram,
         }]
 
-        # Store results in ChromaDB
-        result_id = f"{symbol}_{str(pd.Timestamp.now())}"
-        self.collection.add(
-            documents=[
-                f"Backtest result ({self.STRATEGY_SLUG}) for {symbol}: {total_profit} profit, {success_rate}% success rate"
-            ],
-            metadatas=metadatas[0],  # Pass the first (and only) metadata dictionary
-            ids=[result_id]
-        )
-        logger.info(f"Stored backtest results for {symbol} in ChromaDB with ID {result_id}")
+        if self.collection is not None:
+            result_id = f"{symbol}_{str(pd.Timestamp.now())}"
+            self.collection.add(
+                documents=[
+                    f"Backtest result ({self.STRATEGY_SLUG}) for {symbol}: {total_profit} profit, {success_rate}% success rate"
+                ],
+                metadatas=metadatas[0],
+                ids=[result_id],
+            )
+            logger.info(f"Stored backtest results for {symbol} in ChromaDB with ID {result_id}")
 
         return {
             'initial_capital': initial_capital,
