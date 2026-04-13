@@ -7,7 +7,7 @@ import logging
 import argparse
 import sys
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from uuid import uuid4
 import pytz
 import random
@@ -23,7 +23,6 @@ from strategies.mean_reversion_strategy import MeanReversionStrategy
 from ib_insync import Stock, util
 import json
 import os
-from ib_insync import ExecutionFilter
 from trade_journal import TradeJournal
 from trade_memory import TradeMemory
 
@@ -97,6 +96,25 @@ def _safe_float(v):
         return None
 
 
+def _journal_error_message_from_trade_result(trade_result: dict) -> str | None:
+    """Summarize strategy execute_trade errors for SQLite; full detail stays in market_data JSON."""
+    msg = trade_result.get("message")
+    ipo = trade_result.get("ib_place_order")
+    if not isinstance(ipo, dict) or not ipo:
+        return msg
+    parts = [str(msg or "order_error"), f"code={ipo.get('code')}"]
+    if ipo.get("ib_error_code") is not None:
+        parts.append(f"ib_error_code={ipo['ib_error_code']}")
+    if ipo.get("ib_status"):
+        parts.append(f"ib_status={ipo['ib_status']}")
+    logs = ipo.get("ib_log") or []
+    if isinstance(logs, list) and logs:
+        last = logs[-1]
+        if isinstance(last, dict) and last.get("message"):
+            parts.append(f"ib_log={last['message']}")
+    return " | ".join(parts)[:4000]
+
+
 def _infer_regime(indicators: dict) -> tuple[str, float | None, float | None, str]:
     adx = _safe_float(indicators.get("adx"))
     vol_ratio = _safe_float(indicators.get("vol_ratio"))
@@ -135,6 +153,22 @@ def _positions_snapshot(positions):
     return rows
 
 
+def _infer_stop_target(entry_price: float, is_long: bool, strategy) -> tuple[float | None, float | None]:
+    stop_pct = _safe_float(getattr(strategy, "stop_loss_pct", None))
+    target_pct = _safe_float(getattr(strategy, "target_pct", None))
+    if entry_price <= 0 or stop_pct is None or target_pct is None:
+        return None, None
+    if is_long:
+        return (
+            float(entry_price * (1 - stop_pct / 100.0)),
+            float(entry_price * (1 + target_pct / 100.0)),
+        )
+    return (
+        float(entry_price * (1 + stop_pct / 100.0)),
+        float(entry_price * (1 - target_pct / 100.0)),
+    )
+
+
 async def watch_mode(
     symbols,
     strategy,
@@ -145,9 +179,26 @@ async def watch_mode(
     memory: TradeMemory | None = None,
     run_id: str | None = None,
     snapshot_interval_sec: int = 60,
+    use_strategy_exit_signals: bool = False,
 ):
     """Real-time watching mode for multiple stocks"""
     logger.info(f"Starting real-time watch for {symbols} with check interval {check_interval} seconds")
+    if use_strategy_exit_signals:
+        logger.info(
+            "Exit path: stop / target / max_duration, plus strategy.generate_exit_signals when implemented"
+        )
+    else:
+        logger.info(
+            "Exit path: stop, target, and max_duration only (matches GroqRecommendationsStrategy.backtest). "
+            "Override with --strategy-exit-signals to run generate_exit_signals first."
+        )
+
+    allow_outside_rth = getattr(connection, "_allow_equity_orders_when_market_closed", False)
+    if allow_outside_rth:
+        logger.warning(
+            "Watch loop runs outside US RTH (connection allow_equity_orders_when_market_closed); "
+            "real-time bars use extended hours where IB sends them"
+        )
 
     # Load or recover active trades on startup
     active_trades = await load_active_trades(connection)
@@ -178,6 +229,9 @@ async def watch_mode(
         trade_counter += 1
         return f"TRADE_{trade_id_prefix}_{trade_counter:06d}"
 
+    def _next_bootstrap_trade_id(symbol: str) -> str:
+        return f"BOOTSTRAP_{trade_id_prefix}_{symbol.upper()}_{uuid4().hex[:6]}"
+
     async def setup_market_data(contract):
         try:
             await connection.get_ib().qualifyContractsAsync(contract)
@@ -187,7 +241,7 @@ async def watch_mode(
                 contract=contract,
                 barSize=5,
                 whatToShow='TRADES',
-                useRTH=True
+                useRTH=not allow_outside_rth,
             )
 
             symbol_upper = contract.symbol.upper()
@@ -288,11 +342,17 @@ async def watch_mode(
     try:
         while True:
             current_time = datetime.now(pytz.timezone('US/Eastern'))
-            # Skip if outside market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
-            if current_time.weekday() >= 5 or not (9 <= current_time.hour < 16):
-                logger.info("Outside market hours, skipping this cycle...")
-                await asyncio.sleep(check_interval)
-                continue
+            # Match IBKRConnection.is_market_open (US equity RTH) unless paper allow-closed-market.
+            if not allow_outside_rth:
+                if current_time.weekday() >= 5:
+                    logger.info("Outside market hours (weekend), skipping this cycle...")
+                    await asyncio.sleep(check_interval)
+                    continue
+                tod = current_time.time()
+                if tod < time(9, 30) or tod > time(16, 0):
+                    logger.info("Outside market hours, skipping this cycle...")
+                    await asyncio.sleep(check_interval)
+                    continue
 
             # STEP 1: Check existing positions for exit signals
             try:
@@ -308,6 +368,105 @@ async def watch_mode(
                         avg_cost = float(position.avgCost)
 
                         logger.debug(f"Checking position: {pos_symbol}, Size: {position_size}, Avg Cost: ${avg_cost:.2f}")
+
+                        # Bootstrap inherited positions from broker into managed active-trade
+                        # state before allowing any auto-exit logic to execute.
+                        existing_at = active_trades.get(pos_symbol, {})
+                        if not existing_at.get("trade_id"):
+                            is_long = position_size > 0
+                            bootstrap_trade_id = _next_bootstrap_trade_id(pos_symbol)
+                            bootstrap_entry_time = existing_at.get("entry_time", current_time)
+                            if isinstance(bootstrap_entry_time, str):
+                                try:
+                                    bootstrap_entry_time = datetime.fromisoformat(bootstrap_entry_time)
+                                except ValueError:
+                                    bootstrap_entry_time = current_time
+                            inferred_entry = float(avg_cost)
+                            inferred_stop, inferred_target = _infer_stop_target(inferred_entry, is_long, strategy)
+                            bootstrap_signal = 1 if is_long else -1
+                            bootstrap_regime = "inherited_position"
+                            bootstrap_indicators = {"source": "bootstrap", "avg_cost": inferred_entry}
+
+                            active_trades[pos_symbol] = {
+                                **existing_at,
+                                "trade_id": bootstrap_trade_id,
+                                "entry_time": bootstrap_entry_time,
+                                "entry_price": inferred_entry,
+                                "shares": abs(float(position_size)),
+                                "is_long": is_long,
+                                "stop_loss": inferred_stop,
+                                "target": inferred_target,
+                                "signal_value": bootstrap_signal,
+                                "entry_regime": existing_at.get("entry_regime", bootstrap_regime),
+                                "indicator_snapshot": existing_at.get("indicator_snapshot", bootstrap_indicators),
+                                "bootstrap_inferred": True,
+                            }
+                            save_active_trades_cache(active_trades)
+
+                            market_data_logger.info(
+                                json.dumps(
+                                    {
+                                        "timestamp": current_time.isoformat(),
+                                        "trade_id": bootstrap_trade_id,
+                                        "symbol": pos_symbol,
+                                        "action": "position_bootstrap",
+                                        "bootstrap_details": {
+                                            "entry_price": inferred_entry,
+                                            "shares": abs(float(position_size)),
+                                            "is_long": is_long,
+                                            "stop_loss": inferred_stop,
+                                            "target": inferred_target,
+                                            "entry_time": bootstrap_entry_time.isoformat()
+                                            if hasattr(bootstrap_entry_time, "isoformat")
+                                            else str(bootstrap_entry_time),
+                                        },
+                                    }
+                                )
+                            )
+                            logger.info(
+                                f"Bootstrapped inherited position {pos_symbol} into managed trade {bootstrap_trade_id}"
+                            )
+
+                            if journal and run_id:
+                                try:
+                                    journal.log_trade_attempt(
+                                        trade_id=bootstrap_trade_id,
+                                        run_id=run_id,
+                                        symbol=pos_symbol,
+                                        side="LONG" if is_long else "SHORT",
+                                        signal_value=bootstrap_signal,
+                                        intended_entry_price=inferred_entry,
+                                        intended_shares=max(1, int(abs(position_size))),
+                                        stop_loss=inferred_stop,
+                                        target=inferred_target,
+                                        indicator_snapshot=bootstrap_indicators,
+                                        memory_consulted=False,
+                                        memory_verdict={"source": "bootstrap"},
+                                    )
+                                    journal.mark_trade_entry_fill(
+                                        trade_id=bootstrap_trade_id,
+                                        entry_fill_price=inferred_entry,
+                                        entry_fill_time=bootstrap_entry_time,
+                                        slippage_bps=0.0,
+                                        status="open",
+                                    )
+                                    journal.record_fill(
+                                        trade_id=bootstrap_trade_id,
+                                        order_id=None,
+                                        exec_id=f"BOOTSTRAP_{bootstrap_trade_id}",
+                                        symbol=pos_symbol,
+                                        side="BUY" if is_long else "SELL",
+                                        qty=abs(float(position_size)),
+                                        price=inferred_entry,
+                                        commission=None,
+                                        time=bootstrap_entry_time,
+                                        is_entry=True,
+                                    )
+                                except Exception as bootstrap_journal_err:
+                                    logger.warning(
+                                        f"Trade journal bootstrap logging failed for {bootstrap_trade_id}: "
+                                        f"{bootstrap_journal_err}"
+                                    )
 
                         # Ensure we have market data for this position
                         if pos_symbol not in data_dict:
@@ -330,11 +489,58 @@ async def watch_mode(
                         if len(data_dict[pos_symbol]) >= 2:
                             df = strategy.calculate_indicators(data_dict[pos_symbol].copy())
 
-                            # Generate exit signal for this position
-                            if position_size > 0:  # Long position
-                                exit_signal = await strategy.generate_exit_signals(df, 'long')
-                            else:  # Short position
-                                exit_signal = await strategy.generate_exit_signals(df, 'short')
+                            # Optional strategy exits (Groq backtest does not use these; default off).
+                            if use_strategy_exit_signals:
+                                if position_size > 0:
+                                    exit_signal = await strategy.generate_exit_signals(df, "long")
+                                else:
+                                    exit_signal = await strategy.generate_exit_signals(df, "short")
+                            else:
+                                exit_signal = 0
+
+                            # Backtest-aligned guardrails for live watch mode:
+                            # enforce stop/target/time exits using the stored entry context.
+                            at = active_trades.get(pos_symbol, {})
+                            current_price = float(df['close'].iloc[-1])
+                            exit_reason = "strategy_signal" if exit_signal != 0 else ""
+                            is_long = position_size > 0
+
+                            stop_loss = _safe_float(at.get('stop_loss'))
+                            target_price = _safe_float(at.get('target'))
+
+                            # Stop/target checks mirror backtest's directional logic.
+                            if stop_loss is not None and target_price is not None:
+                                if is_long:
+                                    if current_price <= stop_loss:
+                                        exit_signal = 1
+                                        exit_reason = "stop_loss"
+                                    elif current_price >= target_price:
+                                        exit_signal = 1
+                                        exit_reason = "target"
+                                else:
+                                    if current_price >= stop_loss:
+                                        exit_signal = -1
+                                        exit_reason = "stop_loss"
+                                    elif current_price <= target_price:
+                                        exit_signal = -1
+                                        exit_reason = "target"
+
+                            # Time-based exit if position has been held too long.
+                            max_dur_h = _safe_float(getattr(strategy, "max_duration_hours", None))
+                            entry_time = at.get("entry_time")
+                            if entry_time and isinstance(entry_time, str):
+                                try:
+                                    entry_time = datetime.fromisoformat(entry_time)
+                                except ValueError:
+                                    entry_time = None
+                            if (
+                                max_dur_h is not None
+                                and max_dur_h > 0
+                                and entry_time is not None
+                                and (current_time - entry_time).total_seconds() / 3600.0 >= max_dur_h
+                            ):
+                                exit_signal = 1 if is_long else -1
+                                exit_reason = "time"
 
                             # Log position monitoring
                             position_data = {
@@ -344,21 +550,32 @@ async def watch_mode(
                                 'position_details': {
                                     'position_size': position_size,
                                     'avg_cost': avg_cost,
-                                    'current_price': float(df['close'].iloc[-1]),
-                                    'unrealized_pnl': position_size * (float(df['close'].iloc[-1]) - avg_cost),
+                                    'current_price': current_price,
+                                    'unrealized_pnl': position_size * (current_price - avg_cost),
                                     'exit_signal': int(exit_signal),
                                     'position_type': 'long' if position_size > 0 else 'short',
-                                    'max_duration_hours': strategy.max_duration_hours
+                                    'max_duration_hours': strategy.max_duration_hours,
+                                    'stop_loss': stop_loss,
+                                    'target': target_price,
+                                    'exit_reason': exit_reason or "hold",
                                 }
                             }
                             market_data_logger.info(json.dumps(position_data))
 
                             # Execute exit trade if signal indicates
                             if exit_signal != 0:
-                                logger.info(f"Exit signal {exit_signal} generated for position {pos_symbol}")
+                                if not at.get("trade_id"):
+                                    logger.warning(
+                                        f"Skipping exit for {pos_symbol}: position is unmanaged (no trade_id context)"
+                                    )
+                                    continue
                                 exit_action = 'SELL' if position_size > 0 else 'BUY'
                                 exit_quantity = abs(int(position_size))
                                 trade_id = active_trades.get(pos_symbol, {}).get('trade_id', 'UNKNOWN_TRADE')
+                                logger.info(
+                                    f"Exit signal {exit_signal} generated for position {pos_symbol} "
+                                    f"(trade_id={trade_id}, reason={exit_reason or 'strategy_signal'})"
+                                )
 
                                 exit_data = {
                                     'timestamp': current_time.isoformat(),
@@ -369,10 +586,10 @@ async def watch_mode(
                                         'exit_signal': exit_signal,
                                         'exit_action': exit_action,
                                         'exit_quantity': exit_quantity,
-                                        'current_price': float(df['close'].iloc[-1]),
+                                        'current_price': current_price,
                                         'position_size': position_size,
                                         'avg_cost': avg_cost,
-                                        'exit_reason': 'strategy_signal'
+                                        'exit_reason': exit_reason or 'strategy_signal'
                                     }
                                 }
                                 market_data_logger.info(json.dumps(exit_data))
@@ -380,7 +597,7 @@ async def watch_mode(
                                 exit_result = await strategy.execute_trade(
                                     symbol=pos_symbol,
                                     signal=-1 if position_size > 0 else 1,  # Opposite signal to close
-                                    entry_price=df['close'].iloc[-1],
+                                    entry_price=current_price,
                                     shares=exit_quantity,
                                     stop_loss=None,
                                     target=None
@@ -396,19 +613,19 @@ async def watch_mode(
                                 market_data_logger.info(json.dumps(exit_result_data))
 
                                 if exit_result['status'] == 'success':
-                                    pnl = position_size * (float(df['close'].iloc[-1]) - avg_cost)
+                                    pnl = position_size * (current_price - avg_cost)
                                     logger.info(
                                         f"TRADE {trade_id}: Closed position {pos_symbol}: "
-                                        f"{exit_action} {exit_quantity} shares at ${df['close'].iloc[-1]:.2f}, PnL: ${pnl:.2f}"
+                                        f"{exit_action} {exit_quantity} shares at ${current_price:.2f}, PnL: ${pnl:.2f}"
                                     )
                                     at = active_trades.get(pos_symbol, {})
                                     if journal and trade_id != "UNKNOWN_TRADE":
                                         try:
                                             journal.close_trade(
                                                 trade_id=trade_id,
-                                                exit_fill_price=float(df['close'].iloc[-1]),
+                                                exit_fill_price=current_price,
                                                 exit_fill_time=current_time,
-                                                exit_reason="strategy_signal",
+                                                exit_reason=exit_reason or "strategy_signal",
                                                 realized_pnl=float(pnl),
                                                 status="closed",
                                             )
@@ -419,7 +636,7 @@ async def watch_mode(
                                                 symbol=pos_symbol,
                                                 side=exit_action,
                                                 qty=exit_quantity,
-                                                price=float(df['close'].iloc[-1]),
+                                                price=current_price,
                                                 commission=None,
                                                 time=current_time,
                                                 is_entry=False,
@@ -436,13 +653,13 @@ async def watch_mode(
                                                 side="LONG" if at.get("is_long", position_size > 0) else "SHORT",
                                                 signal_value=int(at.get("signal_value", -1 if position_size > 0 else 1)),
                                                 entry_price=_safe_float(at.get("entry_price")),
-                                                exit_price=float(df['close'].iloc[-1]),
+                                                exit_price=current_price,
                                                 realized_pnl=float(pnl),
                                                 shares=_safe_float(at.get("shares", exit_quantity)),
                                                 entry_time=at.get("entry_time"),
                                                 exit_time=current_time,
                                                 entry_regime=at.get("entry_regime"),
-                                                exit_reason="strategy_signal",
+                                                exit_reason=exit_reason or "strategy_signal",
                                                 indicators=at.get("indicator_snapshot", {}),
                                             )
                                         except Exception as memory_err:
@@ -627,16 +844,26 @@ async def watch_mode(
                                     journal.update_trade_execution_result(
                                         trade_id=trade_id,
                                         status="error",
-                                        error_message=trade_result.get('message'),
+                                        error_message=_journal_error_message_from_trade_result(trade_result),
                                     )
                             except Exception as journal_err:
                                 logger.warning(f"Trade journal result logging failed for {trade_id}: {journal_err}")
 
                         if trade_result['status'] == 'success':
                             await asyncio.sleep(5)
-                            exec_filter = ExecutionFilter(symbol=symbol, time="1 D")
-                            executions = await connection.get_ib().reqExecutionsAsync(exec_filter)
-                            matching_execs = [exec for exec in executions if exec.orderId == trade_result['order_id']]
+                            executions = await connection.get_ib().reqExecutionsAsync()
+                            matching_execs = []
+                            for item in executions:
+                                ex = getattr(item, "execution", item)
+                                contract = getattr(item, "contract", None)
+                                ex_symbol = getattr(ex, "symbol", None) or getattr(contract, "symbol", None)
+                                order_id = getattr(ex, "orderId", None)
+                                if (
+                                    ex_symbol
+                                    and str(ex_symbol).upper() == symbol.upper()
+                                    and order_id == trade_result['order_id']
+                                ):
+                                    matching_execs.append(ex)
                             if matching_execs:
                                 fill_time = matching_execs[0].time.astimezone(pytz.timezone('US/Eastern'))
                                 fill_price = float(matching_execs[0].price)
@@ -652,6 +879,8 @@ async def watch_mode(
                                 'entry_price': entry_price,
                                 'shares': shares,
                                 'is_long': is_long,
+                                'stop_loss': float(stop_loss),
+                                'target': float(target),
                                 'signal_value': int(signal),
                                 'entry_regime': regime,
                                 'indicator_snapshot': indicators,
@@ -730,23 +959,34 @@ def save_active_trades_cache(active_trades):
 async def load_active_trades(connection):
     try:
         active = {}
+        ib = connection.get_ib()
+        all_exec_items = await ib.reqExecutionsAsync()
         # Query open positions
-        positions = await connection.get_ib().reqPositionsAsync()
+        positions = await ib.reqPositionsAsync()
         for pos in positions:
             if pos.position != 0:
                 symbol = pos.contract.symbol.upper()
-                exec_filter = ExecutionFilter(symbol=symbol, time="1 D")  # Last day
-                executions = await connection.get_ib().reqExecutionsAsync(exec_filter)
-                if executions:
-                    # Use latest fill time (assume single or last fill for simplicity)
-                    latest_exec = max(executions, key=lambda e: e.time)
+                matching_execs = []
+                for item in all_exec_items:
+                    ex = getattr(item, "execution", item)
+                    contract = getattr(item, "contract", None)
+                    ex_symbol = getattr(ex, "symbol", None) or getattr(contract, "symbol", None)
+                    ex_time = getattr(ex, "time", None)
+                    if ex_symbol and str(ex_symbol).upper() == symbol and ex_time is not None:
+                        matching_execs.append(ex)
+
+                if matching_execs:
+                    # Use latest fill time by execution timestamp.
+                    latest_exec = max(matching_execs, key=lambda e: getattr(e, "time", datetime.min))
                     entry_time = latest_exec.time.astimezone(pytz.timezone('US/Eastern'))
-                    active[symbol] = {
-                        'entry_time': entry_time,
-                        'shares': abs(pos.position),
-                        'is_long': pos.position > 0,
-                        # Add other needed fields
-                    }
+                else:
+                    entry_time = datetime.now(pytz.timezone('US/Eastern'))
+
+                active[symbol] = {
+                    'entry_time': entry_time,
+                    'shares': abs(float(pos.position)),
+                    'is_long': float(pos.position) > 0,
+                }
         # Save cache
         save_active_trades_cache(active)
         logger.info(f"Loaded {len(active)} active trades from IBKR")
@@ -765,24 +1005,94 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--client-id", type=int, default=1, help="IBKR client ID")
     parser.add_argument("--paper", action="store_true", help="Use paper trading")
+    parser.add_argument(
+        "--allow-closed-market",
+        action="store_true",
+        help="Paper only: submit US equity orders even when local regular session is closed "
+        "(sets outsideRth; IB may queue, fill in extended hours, or reject—use for connectivity/sizing checks)",
+    )
     parser.add_argument("--live", action="store_true", help="Use live trading")
     parser.add_argument("--watch", action="store_true", help="Watch mode only")
+    parser.add_argument(
+        "--strategy-exit-signals",
+        action="store_true",
+        help="Watch mode: call strategy.generate_exit_signals before stop/target/time (legacy Groq zone/momentum "
+        "exits). Default off so live matches Groq backtest, which exits only on stop, target, and max_duration.",
+    )
     parser.add_argument("--check-interval", type=int, default=60, help="Check interval in seconds")
     parser.add_argument("--backtest-only", action="store_true", help="Run backtest only")
     parser.add_argument("--risk-per-trade", type=float, default=1000.0, help="Risk per trade in dollars")
     parser.add_argument("--max-duration", type=float, default=12.0, help="Maximum trade duration in hours")
     parser.add_argument("--stop-loss", type=float, default=1.0, help="Stop loss percentage")
     parser.add_argument("--target", type=float, default=4.0, help="Target profit percentage")
+    parser.add_argument(
+        "--rsi-oversold",
+        type=float,
+        default=30.0,
+        help="Mean reversion only: RSI threshold for long entries",
+    )
+    parser.add_argument(
+        "--rsi-overbought",
+        type=float,
+        default=70.0,
+        help="Mean reversion only: RSI threshold for short entries",
+    )
     parser.add_argument("--initial-capital", type=float, default=50000.0, help="Initial capital for backtest")
     parser.add_argument("--rebalance-period", type=int, default=60, help="Portfolio rebalance period in minutes")
     parser.add_argument("--vwap-threshold", type=float, default=0.5, help="VWAP threshold for entry")
     parser.add_argument("--phase2-rules", action="store_true", help="Use Phase 2 trading rules")
     parser.add_argument("--zone-lookback", type=int, default=4, help="Bars to look back for supply/demand zones")
-    parser.add_argument("--adx-min", type=float, default=15.0, help="Minimum ADX for zone validity")
-    parser.add_argument("--zone-freshness-hours", type=float, default=12.0, help="Max hours a zone stays valid")
-    parser.add_argument("--volume-breakout-mult", type=float, default=1.1, help="Volume multiplier for breakout bar")
-    parser.add_argument("--volume-confirm-mult", type=float, default=1.05, help="Volume multiplier for confirmation bar")
+    parser.add_argument("--adx-min", type=float, default=18.0, help="Minimum ADX for zone validity")
+    parser.add_argument("--zone-freshness-hours", type=float, default=8.0, help="Max hours a zone stays valid")
+    parser.add_argument("--volume-breakout-mult", type=float, default=1.3, help="Volume multiplier for breakout bar")
+    parser.add_argument("--volume-confirm-mult", type=float, default=1.3, help="Volume multiplier for confirmation bar")
     parser.add_argument("--position-size-cap", type=float, default=0.95, help="Max fraction of capital per position")
+    parser.add_argument(
+        "--no-groq-short-filters",
+        action="store_true",
+        help="Groq watch: disable journal-aligned ADX/RSI/DI SHORT gates (supply breakout still applies)",
+    )
+    parser.add_argument(
+        "--groq-short-block-adx-below",
+        type=float,
+        default=20.0,
+        help="Groq watch: block SHORT if ADX is below this (0=disable this veto)",
+    )
+    parser.add_argument(
+        "--groq-short-block-rsi-above",
+        type=float,
+        default=72.0,
+        help="Groq watch: block SHORT if RSI is above this (0=disable)",
+    )
+    parser.add_argument(
+        "--groq-short-block-bullish-di-rsi-above",
+        type=float,
+        default=55.0,
+        help="Groq watch: block SHORT when plus_di>minus_di AND RSI exceeds this (0=disable)",
+    )
+    parser.add_argument(
+        "--groq-short-require-adx-min",
+        type=float,
+        default=25.0,
+        help="Groq watch: require ADX >= this for SHORT (28=stricter; 0=skip)",
+    )
+    parser.add_argument(
+        "--groq-short-require-rsi-max",
+        type=float,
+        default=65.0,
+        help="Groq watch: require RSI <= this for SHORT (60=stricter; 0=skip)",
+    )
+    parser.add_argument(
+        "--groq-short-no-require-minus-di",
+        action="store_true",
+        help="Groq watch: do not require minus_di > plus_di for SHORT",
+    )
+    parser.add_argument(
+        "--groq-short-max-macd-histogram",
+        type=float,
+        default=None,
+        help="Groq watch: require macd_histogram <= this value for SHORT (omit to disable; e.g. 0)",
+    )
     parser.add_argument("--no-journal", action="store_true", help="Disable SQLite trade journaling in watch mode")
     parser.add_argument("--journal-db", default=str(_PYTHONCLIENT_ROOT / "trade_journal.db"), help="Path to SQLite journal db")
     parser.add_argument("--journal-snapshot-interval", type=int, default=60, help="Seconds between account/position snapshots in journal")
@@ -817,13 +1127,25 @@ async def main():
         "volume_breakout_mult": args.volume_breakout_mult,
         "volume_confirm_mult": args.volume_confirm_mult,
         "position_size_cap": args.position_size_cap,
+        "short_realtime_filters_enabled": not args.no_groq_short_filters,
+        "short_realtime_block_adx_below": args.groq_short_block_adx_below,
+        "short_realtime_block_rsi_above": args.groq_short_block_rsi_above,
+        "short_realtime_block_bullish_di_rsi_above": args.groq_short_block_bullish_di_rsi_above,
+        "short_realtime_require_adx_min": args.groq_short_require_adx_min,
+        "short_realtime_require_rsi_max": args.groq_short_require_rsi_max,
+        "short_realtime_require_minus_di_gt_plus_di": not args.groq_short_no_require_minus_di,
+        "short_realtime_max_macd_histogram": args.groq_short_max_macd_histogram,
     }
     
     if args.strategy == "groq":
         strategy = GroqRecommendationsStrategy(**strategy_params, **groq_extra)
         logger.info(f"Strategy initialized with: stop_loss_pct={strategy.stop_loss_pct}%, target_pct={strategy.target_pct}%, risk_per_trade=${strategy.risk_per_trade}")
     elif args.strategy == "mean_reversion":
-        strategy = MeanReversionStrategy(**strategy_params)
+        strategy = MeanReversionStrategy(
+            **strategy_params,
+            rsi_oversold=args.rsi_oversold,
+            rsi_overbought=args.rsi_overbought,
+        )
         logger.info(f"Mean Reversion Strategy initialized with: stop_loss_pct={strategy.stop_loss_pct}%, target_pct={strategy.target_pct}%, risk_per_trade=${strategy.risk_per_trade}")
     else:
         raise ValueError(f"Unknown strategy: {args.strategy}")
@@ -847,7 +1169,21 @@ async def main():
     # Use paper trading port (4002) for both backtest-only and paper trading modes
     # Only use live trading port (7497) when explicitly requested with --live
     port = 4002 if args.backtest_only or not args.live else 7497
-    connection = IBKRConnection(host="127.0.0.1", port=port, client_id=client_id)
+    allow_closed_market = bool(args.paper and args.allow_closed_market and not args.live)
+    if args.allow_closed_market and not args.paper:
+        logger.warning("--allow-closed-market ignored (requires --paper)")
+    if args.allow_closed_market and args.live:
+        logger.warning("--allow-closed-market ignored in --live mode")
+    connection = IBKRConnection(
+        host="127.0.0.1",
+        port=port,
+        client_id=client_id,
+        allow_equity_orders_when_market_closed=allow_closed_market,
+    )
+    if allow_closed_market:
+        logger.warning(
+            "Paper mode: equity orders allowed outside local RTH (outsideRth); not a substitute for real session behavior"
+        )
     journal = None
     if not args.no_journal:
         try:
@@ -903,7 +1239,12 @@ async def main():
                     run_id = journal.start_run(
                         strategy=args.strategy,
                         symbols=[s.upper() for s in args.symbols],
-                        params={**strategy_params, **groq_extra, "check_interval": args.check_interval},
+                        params={
+                            **strategy_params,
+                            **groq_extra,
+                            "check_interval": args.check_interval,
+                            "strategy_exit_signals": args.strategy_exit_signals,
+                        },
                     )
                 except Exception as run_err:
                     logger.warning(f"Could not start trade journal run: {run_err}")
@@ -919,6 +1260,7 @@ async def main():
                     memory=memory,
                     run_id=run_id,
                     snapshot_interval_sec=args.journal_snapshot_interval,
+                    use_strategy_exit_signals=args.strategy_exit_signals,
                 )
             finally:
                 if journal and run_id:
@@ -1043,7 +1385,12 @@ async def main():
                             run_id = journal.start_run(
                                 strategy=args.strategy,
                                 symbols=[s.upper() for s in args.symbols],
-                                params={**strategy_params, **groq_extra, "check_interval": args.check_interval},
+                                params={
+                                    **strategy_params,
+                                    **groq_extra,
+                                    "check_interval": args.check_interval,
+                                    "strategy_exit_signals": args.strategy_exit_signals,
+                                },
                             )
                         except Exception as run_err:
                             logger.warning(f"Could not start trade journal run: {run_err}")
@@ -1059,6 +1406,7 @@ async def main():
                             memory=memory,
                             run_id=run_id,
                             snapshot_interval_sec=args.journal_snapshot_interval,
+                            use_strategy_exit_signals=args.strategy_exit_signals,
                         )
                     finally:
                         if journal and run_id:
