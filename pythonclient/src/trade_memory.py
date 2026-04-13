@@ -70,7 +70,10 @@ class TradeMemory:
                     model_name="all-MiniLM-L6-v2"
                 ),
             )
-        except Exception as e:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            # Chroma Rust layer can raise PanicException (not Exception).
             self._init_error = str(e)
             self._collection = None
 

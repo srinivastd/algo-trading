@@ -31,6 +31,16 @@ def _sanitize_json(value: Any) -> Any:
     return value
 
 
+def _finite_number(value: Any) -> bool:
+    try:
+        if value is None:
+            return False
+        v = float(value)
+        return not (math.isnan(v) or math.isinf(v))
+    except (TypeError, ValueError):
+        return False
+
+
 class TradeJournal:
     """Persistent journal for watch-mode decisions and outcomes."""
 
@@ -188,6 +198,20 @@ class TradeJournal:
                     ON execution_quality(symbol, time_of_day_bucket, order_type);
                 """
             )
+            # Lightweight schema migration for existing DBs created before
+            # classification scoring fields were introduced.
+            self._ensure_column(con, "trades", "classification_score", "INTEGER")
+            self._ensure_column(con, "trades", "classification_rationale", "TEXT")
+
+    @staticmethod
+    def _column_exists(con: sqlite3.Connection, table: str, column: str) -> bool:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(str(r[1]) == column for r in rows)
+
+    def _ensure_column(self, con: sqlite3.Connection, table: str, column: str, ddl_type: str) -> None:
+        if self._column_exists(con, table, column):
+            return
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
 
     def start_run(self, strategy: str, symbols: list[str], params: Mapping[str, Any]) -> str:
         run_id = f"RUN_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -456,6 +480,86 @@ class TradeJournal:
                     _to_iso(exit_fill_time),
                     exit_reason,
                     realized_pnl,
+                    datetime.utcnow().isoformat(),
+                    trade_id,
+                ),
+            )
+
+    def merge_indicator_snapshot(
+        self,
+        *,
+        trade_id: str,
+        patch: Mapping[str, Any],
+        fill_keys: tuple[str, ...] = ("adx", "rsi", "plus_di", "minus_di"),
+    ) -> bool:
+        """
+        Shallow-merge numeric indicator fields into ``indicator_snapshot_json`` for keys
+        that are missing or non-finite in the stored snapshot. Preserves bootstrap metadata.
+        Returns True if at least one key was written.
+        """
+        if not patch:
+            return False
+        now = datetime.utcnow().isoformat()
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT indicator_snapshot_json FROM trades WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            raw = row[0] or "{}"
+            try:
+                cur = json.loads(raw) if isinstance(raw, str) else {}
+            except json.JSONDecodeError:
+                cur = {}
+            if not isinstance(cur, dict):
+                cur = {}
+            merged = dict(cur)
+            changed = False
+            patch_s = _sanitize_json(dict(patch))
+            if not isinstance(patch_s, dict):
+                return False
+            for k in fill_keys:
+                if k not in patch_s:
+                    continue
+                pv = patch_s[k]
+                if not _finite_number(pv):
+                    continue
+                if k not in merged or not _finite_number(merged.get(k)):
+                    merged[k] = pv
+                    changed = True
+            if not changed:
+                return False
+            con.execute(
+                """
+                UPDATE trades
+                SET indicator_snapshot_json = ?, updated_at = ?
+                WHERE trade_id = ?
+                """,
+                (self._dump_json(merged), now, trade_id),
+            )
+        return True
+
+    def set_trade_classification(
+        self,
+        *,
+        trade_id: str,
+        classification: str | None,
+        classification_score: int | None = None,
+        classification_rationale: str | None = None,
+    ) -> None:
+        """Post-hoc or automated quality / review labels on `trades` rows."""
+        with self._conn() as con:
+            con.execute(
+                """
+                UPDATE trades
+                SET classification = ?, classification_score = ?, classification_rationale = ?, updated_at = ?
+                WHERE trade_id = ?
+                """,
+                (
+                    classification,
+                    classification_score,
+                    classification_rationale,
                     datetime.utcnow().isoformat(),
                     trade_id,
                 ),
