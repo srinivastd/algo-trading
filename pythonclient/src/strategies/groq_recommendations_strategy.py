@@ -770,12 +770,17 @@ class GroqRecommendationsStrategy(StrategyBase):
                 except Exception as target_error:
                     logger.error(f"Error placing target order: {target_error}")
             
-            # Return success even if child orders failed
+            # Return success even if child orders failed.
+            # Expose stop/target actually sent to IB (after live-entry rescaling) so watch_mode
+            # can align soft exits with bracket orders.
             result = {
                 'status': 'success',
-                'order_id': parent_order_id
+                'order_id': parent_order_id,
+                'effective_stop_loss': float(stop_loss) if stop_loss is not None else None,
+                'effective_target': float(target) if target is not None else None,
+                'live_entry_anchor': float(live_entry_price),
             }
-            
+
             if stop_order_id:
                 result['stop_order_id'] = stop_order_id
             elif stop_loss is not None and stop_res is not None:

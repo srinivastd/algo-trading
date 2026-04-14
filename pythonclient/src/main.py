@@ -873,14 +873,21 @@ async def watch_mode(
                                 fill_price = entry_price
                                 fill_qty = float(shares)
 
+                            # Groq execute_trade rescales stop/target to live_entry_anchor; use those
+                            # for exit checks so soft exits match bracket limits.
+                            eff_sl = _safe_float(trade_result.get("effective_stop_loss"))
+                            eff_tg = _safe_float(trade_result.get("effective_target"))
+                            mon_stop = float(eff_sl) if eff_sl is not None else float(stop_loss)
+                            mon_target = float(eff_tg) if eff_tg is not None else float(target)
+
                             active_trades[symbol.upper()] = {
                                 'entry_time': fill_time,
                                 'trade_id': trade_id,
-                                'entry_price': entry_price,
+                                'entry_price': fill_price,
                                 'shares': shares,
                                 'is_long': is_long,
-                                'stop_loss': float(stop_loss),
-                                'target': float(target),
+                                'stop_loss': mon_stop,
+                                'target': mon_target,
                                 'signal_value': int(signal),
                                 'entry_regime': regime,
                                 'indicator_snapshot': indicators,
@@ -1003,7 +1010,12 @@ def parse_args():
     parser.add_argument("--strategy", default="groq", help="Trading strategy to use")
     parser.add_argument("--force-refresh", action="store_true", help="Force refresh historical data")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--client-id", type=int, default=1, help="IBKR client ID")
+    parser.add_argument(
+        "--client-id",
+        type=int,
+        default=None,
+        help="IBKR API client ID (default: random 1–1000 if omitted, to avoid error 326 when another session uses the same id)",
+    )
     parser.add_argument("--paper", action="store_true", help="Use paper trading")
     parser.add_argument(
         "--allow-closed-market",
@@ -1102,14 +1114,14 @@ def parse_args():
 
 async def main():
     args = parse_args()
-    
+
     # Configure logging
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    
+
     # Initialize strategy with mode-specific parameters
     strategy_params = {
         "risk_per_trade": args.risk_per_trade,

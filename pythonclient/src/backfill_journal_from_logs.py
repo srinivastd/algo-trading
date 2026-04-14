@@ -482,6 +482,25 @@ def backfill_from_market_log(
     journal = TradeJournal(journal_db)
 
     date_key = target_date.isoformat()
+    bf_like = f"BF_{date_key.replace('-', '')}_%"
+    if not replace:
+        con_chk = sqlite3.connect(journal_db)
+        try:
+            row = con_chk.execute(
+                "SELECT COUNT(*) FROM trades WHERE trade_id LIKE ?",
+                (bf_like,),
+            ).fetchone()
+            n_existing = int(row[0] if row else 0)
+        finally:
+            con_chk.close()
+        if n_existing:
+            raise SystemExit(
+                f"Journal already has {n_existing} backfill row(s) for {date_key} "
+                f"(trade_id LIKE {bf_like!r}). Replaying the log would reuse the same BF_* ids and hit "
+                f"UNIQUE(trade_id).\n"
+                f"Re-run with --replace to delete those rows first, then insert again."
+            )
+
     if replace:
         stats.rows_deleted = _delete_existing_backfill_rows(journal_db, date_key)
 
@@ -685,7 +704,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--replace",
         action="store_true",
-        help="Delete previous backfill rows for this date before insert",
+        help="Delete previous BF_* backfill rows for this date before insert (required to re-run the same --date)",
     )
     parser.add_argument("--enrich-ib", action="store_true", help="Enrich backfilled rows with IB executions")
     parser.add_argument("--host", default="127.0.0.1")
