@@ -42,7 +42,17 @@ class GroqRecommendationsStrategy(StrategyBase):
                  short_realtime_require_adx_min: float = 25.0,
                  short_realtime_require_rsi_max: float = 65.0,
                  short_realtime_require_minus_di_gt_plus_di: bool = True,
-                 short_realtime_max_macd_histogram: float | None = None):
+                 short_realtime_max_macd_histogram: float | None = None,
+                 # Long-side entry controls
+                 long_require_sma_trend: bool = True,
+                 long_realtime_filters_enabled: bool = False,
+                 long_block_high_adx: float | None = None,
+                 long_block_high_adx_rsi: float | None = None,
+                 long_di_mode: str = "off",
+                 long_di_adx_floor: float = 0.0,
+                 long_di_pullback_spread: float = 5.0,
+                 max_atr_pct: float | None = None,
+                 max_volume_ratio: float | None = None):
         super().__init__("Groq Recommendations Strategy")
         self.risk_per_trade = risk_per_trade
         self.max_duration_hours = max_duration_hours
@@ -66,6 +76,15 @@ class GroqRecommendationsStrategy(StrategyBase):
         self.short_realtime_require_rsi_max = float(short_realtime_require_rsi_max)
         self.short_realtime_require_minus_di_gt_plus_di = bool(short_realtime_require_minus_di_gt_plus_di)
         self.short_realtime_max_macd_histogram = short_realtime_max_macd_histogram
+        self.long_require_sma_trend = bool(long_require_sma_trend)
+        self.long_realtime_filters_enabled = bool(long_realtime_filters_enabled)
+        self.long_block_high_adx = long_block_high_adx
+        self.long_block_high_adx_rsi = long_block_high_adx_rsi
+        self.long_di_mode = long_di_mode if long_di_mode in ("off", "trend", "pullback") else "off"
+        self.long_di_adx_floor = float(long_di_adx_floor)
+        self.long_di_pullback_spread = float(long_di_pullback_spread)
+        self.max_atr_pct = float(max_atr_pct) if max_atr_pct is not None else None
+        self.max_volume_ratio = float(max_volume_ratio) if max_volume_ratio is not None else None
         self.chroma_client = None
         self.collection = None
         try:
@@ -101,6 +120,15 @@ class GroqRecommendationsStrategy(StrategyBase):
                 if self.short_realtime_max_macd_histogram is not None
                 else "off",
             )
+        logger.info(
+            "Long controls: sma_trend=%s, realtime_filters=%s, di_mode=%s, "
+            "max_atr_pct=%s, max_volume_ratio=%s",
+            self.long_require_sma_trend,
+            self.long_realtime_filters_enabled,
+            self.long_di_mode,
+            self.max_atr_pct if self.max_atr_pct is not None else "off",
+            self.max_volume_ratio if self.max_volume_ratio is not None else "off",
+        )
 
     def set_ib_client(self, ib_client):
         """Set the IBKR client for trading"""
@@ -278,6 +306,88 @@ class GroqRecommendationsStrategy(StrategyBase):
             return False, f"macd_histogram={hist:.6f}>{self.short_realtime_max_macd_histogram}"
         return True, ""
 
+    def _passes_long_realtime_filters(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """
+        Journal-aligned gates before accepting a demand (+1) entry.
+
+        All sub-rules default to off; behaviour only changes when the caller
+        opts in via constructor params or CLI flags.
+
+        Checks (in order):
+        1. Regime: ATR-as-%-of-price ceiling  (shared with shorts via max_atr_pct)
+        2. Volume: volume_ratio ceiling        (shared with shorts via max_volume_ratio)
+        3. ADX + RSI combined late-trend veto  (long_block_high_adx + long_block_high_adx_rsi)
+        4. DI directional rule                 (long_di_mode: off / trend / pullback)
+        """
+        if not self.long_realtime_filters_enabled:
+            return True, ""
+
+        row = df.iloc[-1]
+        close = float(row["close"]) if pd.notna(row.get("close")) else float("nan")
+        adx = float(row["adx"]) if "adx" in df.columns and pd.notna(row.get("adx")) else float("nan")
+        rsi = float(row["rsi"]) if "rsi" in df.columns and pd.notna(row.get("rsi")) else float("nan")
+        pdi = float(row["plus_di"]) if "plus_di" in df.columns and pd.notna(row.get("plus_di")) else float("nan")
+        mdi = float(row["minus_di"]) if "minus_di" in df.columns and pd.notna(row.get("minus_di")) else float("nan")
+        atr = float(row["atr"]) if "atr" in df.columns and pd.notna(row.get("atr")) else float("nan")
+        vol_ratio = float(row["volume_ratio"]) if "volume_ratio" in df.columns and pd.notna(row.get("volume_ratio")) else float("nan")
+
+        # 1 — Regime: high ATR% = too volatile for new entries
+        if self.max_atr_pct is not None and not np.isnan(atr) and not np.isnan(close) and close > 0:
+            atr_pct = atr / close
+            if atr_pct > self.max_atr_pct:
+                return False, f"atr_pct={atr_pct:.4f}>{self.max_atr_pct}"
+
+        # 2 — Volume: extreme volume_ratio = chase risk
+        if self.max_volume_ratio is not None and not np.isnan(vol_ratio):
+            if vol_ratio > self.max_volume_ratio:
+                return False, f"volume_ratio={vol_ratio:.2f}>{self.max_volume_ratio}"
+
+        # 3 — ADX + RSI combined: block longs in late/stretched trends
+        if (
+            self.long_block_high_adx is not None
+            and self.long_block_high_adx_rsi is not None
+            and not np.isnan(adx)
+            and not np.isnan(rsi)
+            and adx > self.long_block_high_adx
+            and rsi > self.long_block_high_adx_rsi
+        ):
+            return (
+                False,
+                f"late_trend_veto adx={adx:.2f}>{self.long_block_high_adx} "
+                f"rsi={rsi:.2f}>{self.long_block_high_adx_rsi}",
+            )
+
+        # 4 — DI directional rule
+        if self.long_di_mode == "trend":
+            if np.isnan(pdi) or np.isnan(mdi) or pdi <= mdi:
+                return False, f"di_trend_need +di>-di got +di={pdi:.2f} -di={mdi:.2f}"
+            if self.long_di_adx_floor > 0 and (np.isnan(adx) or adx < self.long_di_adx_floor):
+                return False, f"di_trend_need adx>={self.long_di_adx_floor} got {adx:.2f}"
+        elif self.long_di_mode == "pullback":
+            if np.isnan(pdi) or np.isnan(mdi):
+                return False, f"di_pullback_need indicators got +di={pdi} -di={mdi}"
+            spread = mdi - pdi
+            if spread < self.long_di_pullback_spread:
+                return False, f"di_pullback_need (-di)-(+di)>={self.long_di_pullback_spread} got {spread:.2f}"
+
+        return True, ""
+
+    def _passes_short_regime_filters(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """Shared regime/volume gates applied to short entries (ATR%, volume_ratio)."""
+        row = df.iloc[-1]
+        close = float(row["close"]) if pd.notna(row.get("close")) else float("nan")
+        atr = float(row["atr"]) if "atr" in df.columns and pd.notna(row.get("atr")) else float("nan")
+        vol_ratio = float(row["volume_ratio"]) if "volume_ratio" in df.columns and pd.notna(row.get("volume_ratio")) else float("nan")
+
+        if self.max_atr_pct is not None and not np.isnan(atr) and not np.isnan(close) and close > 0:
+            atr_pct = atr / close
+            if atr_pct > self.max_atr_pct:
+                return False, f"atr_pct={atr_pct:.4f}>{self.max_atr_pct}"
+        if self.max_volume_ratio is not None and not np.isnan(vol_ratio):
+            if vol_ratio > self.max_volume_ratio:
+                return False, f"volume_ratio={vol_ratio:.2f}>{self.max_volume_ratio}"
+        return True, ""
+
     def _zone_still_fresh(self, bar_time, zone_time) -> bool:
         return (bar_time - zone_time) < timedelta(hours=self.zone_freshness_hours)
 
@@ -333,10 +443,11 @@ class GroqRecommendationsStrategy(StrategyBase):
         """
         profile_score = df["stock_profile_score"].iloc[i] if "stock_profile_score" in df.columns else 0
         confidence = 0.5
-        trend_confirmed = df["sma_20"].iloc[i] > df["sma_50"].iloc[i] or np.random.random() < 0.5
-        if not trend_confirmed:
+        sma_bullish = df["sma_20"].iloc[i] > df["sma_50"].iloc[i]
+        if self.long_require_sma_trend and not sma_bullish:
             return 0, 0.0
-        confidence += 0.2
+        if sma_bullish:
+            confidence += 0.2
         if profile_score > 0.3:
             confidence += 0.3
         elif profile_score > 0:
@@ -397,6 +508,10 @@ class GroqRecommendationsStrategy(StrategyBase):
 
             for zone_time, zone_high, zone_low in supply_zones:
                 if self._supply_short_zone_hit(df, i, zone_time, zone_high, zone_low):
+                    rok, rwhy = self._passes_short_regime_filters(df.iloc[: i + 1])
+                    if not rok:
+                        logger.debug("Short zone hit but regime-filtered at %s: %s", df.index[i], rwhy)
+                        continue
                     ok, why = self._passes_short_realtime_filters(df.iloc[: i + 1])
                     if not ok:
                         logger.debug("Short zone hit but filtered at %s: %s", df.index[i], why)
@@ -411,6 +526,10 @@ class GroqRecommendationsStrategy(StrategyBase):
 
             for zone_time, zone_high, zone_low in demand_zones:
                 if self._demand_long_zone_hit(df, i, zone_time, zone_high, zone_low):
+                    lok, lwhy = self._passes_long_realtime_filters(df.iloc[: i + 1])
+                    if not lok:
+                        logger.debug("Long zone hit but filtered at %s: %s", df.index[i], lwhy)
+                        continue
                     long_sig, confidence = self._long_signal_and_confidence_at(df, i)
                     if long_sig == 1:
                         signals.loc[signals.index[i], 'signal'] = 1
@@ -467,6 +586,10 @@ class GroqRecommendationsStrategy(StrategyBase):
                 f"   Zone age: {time_diff_hours:.1f} h (freshness < {self.zone_freshness_hours} h)"
             )
             logger.info(f"   Zone range: ${zone_low:.2f} - ${zone_high:.2f}")
+            rok, rwhy = self._passes_short_regime_filters(df.iloc[: i + 1])
+            if not rok:
+                logger.info(f"SHORT signal suppressed by regime filters ({rwhy})")
+                continue
             ok, why = self._passes_short_realtime_filters(df.iloc[: i + 1])
             if not ok:
                 logger.info(f"SHORT signal suppressed by filters ({why})")
@@ -489,7 +612,6 @@ class GroqRecommendationsStrategy(StrategyBase):
             ratio_log = f"{volume_ratio:.2f}" if volume_ratio != float("inf") else "inf"
             current_adx = df["adx"].iloc[i] if "adx" in df.columns else 0
             time_diff_hours = (current_time - zone_time).total_seconds() / 3600
-            long_sig, confidence = self._long_signal_and_confidence_at(df, i)
 
             logger.info(f"✅ LONG CANDIDATE at {current_time}:")
             logger.info(f"   Price: ${current_price:.2f} (broke below demand zone ${zone_low:.2f})")
@@ -503,11 +625,16 @@ class GroqRecommendationsStrategy(StrategyBase):
                 f"   Zone age: {time_diff_hours:.1f} h (freshness < {self.zone_freshness_hours} h)"
             )
             logger.info(f"   Zone range: ${zone_low:.2f} - ${zone_high:.2f}")
+            lok, lwhy = self._passes_long_realtime_filters(df.iloc[: i + 1])
+            if not lok:
+                logger.info(f"LONG signal suppressed by filters ({lwhy})")
+                continue
+            long_sig, confidence = self._long_signal_and_confidence_at(df, i)
             if long_sig == 1:
                 logger.info(f"   -> LONG signal accepted (confidence {confidence:.2f})")
                 out = 1
             else:
-                logger.info("   -> LONG suppressed (trend_confirmed false, same as backtest)")
+                logger.info("   -> LONG suppressed (sma_trend check, same as backtest)")
             break
 
         return out
@@ -770,12 +897,17 @@ class GroqRecommendationsStrategy(StrategyBase):
                 except Exception as target_error:
                     logger.error(f"Error placing target order: {target_error}")
             
-            # Return success even if child orders failed
+            # Return success even if child orders failed.
+            # Expose stop/target actually sent to IB (after live-entry rescaling) so watch_mode
+            # can align soft exits with bracket orders.
             result = {
                 'status': 'success',
-                'order_id': parent_order_id
+                'order_id': parent_order_id,
+                'effective_stop_loss': float(stop_loss) if stop_loss is not None else None,
+                'effective_target': float(target) if target is not None else None,
+                'live_entry_anchor': float(live_entry_price),
             }
-            
+
             if stop_order_id:
                 result['stop_order_id'] = stop_order_id
             elif stop_loss is not None and stop_res is not None:
@@ -946,6 +1078,15 @@ class GroqRecommendationsStrategy(StrategyBase):
             "short_realtime_require_rsi_max": float(self.short_realtime_require_rsi_max),
             "short_realtime_require_minus_di_gt_plus_di": int(self.short_realtime_require_minus_di_gt_plus_di),
             "short_realtime_max_macd_histogram": self.short_realtime_max_macd_histogram,
+            "long_require_sma_trend": int(self.long_require_sma_trend),
+            "long_realtime_filters_enabled": int(self.long_realtime_filters_enabled),
+            "long_block_high_adx": self.long_block_high_adx,
+            "long_block_high_adx_rsi": self.long_block_high_adx_rsi,
+            "long_di_mode": self.long_di_mode,
+            "long_di_adx_floor": self.long_di_adx_floor,
+            "long_di_pullback_spread": self.long_di_pullback_spread,
+            "max_atr_pct": self.max_atr_pct,
+            "max_volume_ratio": self.max_volume_ratio,
         }]
 
         if self.collection is not None:
