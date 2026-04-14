@@ -1105,6 +1105,61 @@ def parse_args():
         default=None,
         help="Groq watch: require macd_histogram <= this value for SHORT (omit to disable; e.g. 0)",
     )
+    # --- Long-side entry controls ---
+    parser.add_argument(
+        "--groq-no-long-sma-trend",
+        action="store_true",
+        help="Groq: allow long entries even when SMA20 < SMA50 (default: require SMA20 > SMA50)",
+    )
+    parser.add_argument(
+        "--groq-long-filters",
+        action="store_true",
+        help="Groq: enable long-side realtime filters (ATR%%, volume_ratio, ADX+RSI veto, DI mode). "
+        "Without this flag, all long sub-filters are skipped.",
+    )
+    parser.add_argument(
+        "--groq-max-atr-pct",
+        type=float,
+        default=None,
+        help="Groq: block entries (long+short) when ATR/close > this (e.g. 0.08 = 8%%). Omit to disable.",
+    )
+    parser.add_argument(
+        "--groq-max-volume-ratio",
+        type=float,
+        default=None,
+        help="Groq: block entries (long+short) when volume_ratio > this (e.g. 3.0). Omit to disable.",
+    )
+    parser.add_argument(
+        "--groq-long-block-high-adx",
+        type=float,
+        default=None,
+        help="Groq long: block when ADX exceeds this AND RSI exceeds --groq-long-block-high-adx-rsi. "
+        "Both must be set to activate the combined veto.",
+    )
+    parser.add_argument(
+        "--groq-long-block-high-adx-rsi",
+        type=float,
+        default=None,
+        help="Groq long: RSI threshold for the ADX+RSI late-trend veto (see --groq-long-block-high-adx).",
+    )
+    parser.add_argument(
+        "--groq-long-di-mode",
+        choices=["off", "trend", "pullback"],
+        default="off",
+        help="Groq long DI rule: 'trend' requires +DI>-DI, 'pullback' requires -DI-+DI>=spread. Default off.",
+    )
+    parser.add_argument(
+        "--groq-long-di-adx-floor",
+        type=float,
+        default=0.0,
+        help="Groq long DI trend mode: also require ADX >= this floor (0=skip).",
+    )
+    parser.add_argument(
+        "--groq-long-di-pullback-spread",
+        type=float,
+        default=5.0,
+        help="Groq long DI pullback mode: require (-DI)-(+DI) >= this spread.",
+    )
     parser.add_argument("--no-journal", action="store_true", help="Disable SQLite trade journaling in watch mode")
     parser.add_argument("--journal-db", default=str(_PYTHONCLIENT_ROOT / "trade_journal.db"), help="Path to SQLite journal db")
     parser.add_argument("--journal-snapshot-interval", type=int, default=60, help="Seconds between account/position snapshots in journal")
@@ -1147,6 +1202,15 @@ async def main():
         "short_realtime_require_rsi_max": args.groq_short_require_rsi_max,
         "short_realtime_require_minus_di_gt_plus_di": not args.groq_short_no_require_minus_di,
         "short_realtime_max_macd_histogram": args.groq_short_max_macd_histogram,
+        "long_require_sma_trend": not args.groq_no_long_sma_trend,
+        "long_realtime_filters_enabled": args.groq_long_filters,
+        "long_block_high_adx": args.groq_long_block_high_adx,
+        "long_block_high_adx_rsi": args.groq_long_block_high_adx_rsi,
+        "long_di_mode": args.groq_long_di_mode,
+        "long_di_adx_floor": args.groq_long_di_adx_floor,
+        "long_di_pullback_spread": args.groq_long_di_pullback_spread,
+        "max_atr_pct": args.groq_max_atr_pct,
+        "max_volume_ratio": args.groq_max_volume_ratio,
     }
     
     if args.strategy == "groq":
