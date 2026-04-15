@@ -202,6 +202,7 @@ class TradeJournal:
             # classification scoring fields were introduced.
             self._ensure_column(con, "trades", "classification_score", "INTEGER")
             self._ensure_column(con, "trades", "classification_rationale", "TEXT")
+            self._ensure_column(con, "daily_snapshots", "ib_daily_pnl", "REAL")
 
     @staticmethod
     def _column_exists(con: sqlite3.Connection, table: str, column: str) -> bool:
@@ -573,6 +574,7 @@ class TradeJournal:
         positions: list[dict[str, Any]],
         unrealized_pnl: float | None,
         realized_pnl_today: float | None,
+        ib_daily_pnl: float | None = None,
     ) -> None:
         iso = _to_iso(timestamp)
         day = iso.split("T", 1)[0]
@@ -580,8 +582,8 @@ class TradeJournal:
             con.execute(
                 """
                 INSERT INTO daily_snapshots(
-                    date, time, net_liquidation, positions_json, unrealized_pnl, realized_pnl_today
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    date, time, net_liquidation, positions_json, unrealized_pnl, realized_pnl_today, ib_daily_pnl
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     day,
@@ -590,5 +592,188 @@ class TradeJournal:
                     self._dump_json(positions),
                     unrealized_pnl,
                     realized_pnl_today,
+                    ib_daily_pnl,
                 ),
             )
+
+    @staticmethod
+    def _daily_snapshot_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        pos_raw = row["positions_json"] or "[]"
+        try:
+            positions = json.loads(pos_raw) if isinstance(pos_raw, str) else pos_raw
+        except json.JSONDecodeError:
+            positions = []
+        return {
+            "snapshot_id": row["id"],
+            "date": row["date"],
+            "time": row["time"],
+            "net_liquidation": row["net_liquidation"],
+            "unrealized_pnl": row["unrealized_pnl"],
+            "realized_pnl_today": row["realized_pnl_today"],
+            "ib_daily_pnl": row["ib_daily_pnl"],
+            "positions": positions,
+        }
+
+    def _journal_closed_realized_for_calendar_day(self, day_yyyy_mm_dd: str) -> float | None:
+        """
+        Sum of ``realized_pnl`` for closed trades whose ``exit_fill_time`` calendar day matches
+        ``day_yyyy_mm_dd`` (ISO date). Used when IB ``reqPnL`` fields were not persisted (NULL).
+        """
+        with self._conn() as con:
+            row = con.execute(
+                """
+                SELECT COUNT(*), SUM(realized_pnl)
+                FROM trades
+                WHERE LOWER(TRIM(status)) = 'closed'
+                  AND exit_fill_time IS NOT NULL
+                  AND length(trim(exit_fill_time)) >= 10
+                  AND substr(trim(exit_fill_time), 1, 10) = ?
+                """,
+                (day_yyyy_mm_dd,),
+            ).fetchone()
+        if row is None:
+            return None
+        n, s = int(row[0] or 0), row[1]
+        if n == 0:
+            return None
+        if s is None:
+            return None
+        return float(s)
+
+    def _enrich_snapshot_pnl_fallbacks(self, d: dict[str, Any]) -> None:
+        """Fill NULL IB P&amp;L columns from journal exits on the snapshot calendar day (display/API)."""
+        day = d.get("date")
+        if not day or not isinstance(day, str):
+            return
+        if d.get("realized_pnl_today") is not None and d.get("ib_daily_pnl") is not None:
+            return
+        jr = self._journal_closed_realized_for_calendar_day(day)
+        if jr is None:
+            return
+        if d.get("realized_pnl_today") is None:
+            d["realized_pnl_today"] = jr
+            d["realized_pnl_today_src"] = "journal"
+        if d.get("ib_daily_pnl") is None:
+            d["ib_daily_pnl"] = jr
+            d["ib_daily_pnl_src"] = "journal"
+
+    def get_latest_daily_snapshot(self) -> dict[str, Any] | None:
+        """Latest row from ``daily_snapshots`` (IB reqPnL + NL + positions)."""
+        with self._conn() as con:
+            row = con.execute(
+                """
+                SELECT id, date, time, net_liquidation, unrealized_pnl, realized_pnl_today, ib_daily_pnl, positions_json
+                FROM daily_snapshots
+                ORDER BY time DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        d = self._daily_snapshot_row_to_dict(row)
+        self._enrich_snapshot_pnl_fallbacks(d)
+        return d
+
+    def get_daily_snapshot_by_id(self, snapshot_id: int) -> dict[str, Any] | None:
+        """Single ``daily_snapshots`` row by primary key (for UI ``id=…`` lines)."""
+        with self._conn() as con:
+            row = con.execute(
+                """
+                SELECT id, date, time, net_liquidation, unrealized_pnl, realized_pnl_today, ib_daily_pnl, positions_json
+                FROM daily_snapshots
+                WHERE id = ?
+                """,
+                (int(snapshot_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        d = self._daily_snapshot_row_to_dict(row)
+        self._enrich_snapshot_pnl_fallbacks(d)
+        return d
+
+    def get_recent_daily_snapshots(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Most recent ``daily_snapshots`` rows (newest first)."""
+        lim = max(1, min(int(limit), 500))
+        with self._conn() as con:
+            rows = con.execute(
+                """
+                SELECT id, date, time, net_liquidation, unrealized_pnl, realized_pnl_today, ib_daily_pnl, positions_json
+                FROM daily_snapshots
+                ORDER BY time DESC
+                LIMIT ?
+                """,
+                (lim,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            d = self._daily_snapshot_row_to_dict(row)
+            self._enrich_snapshot_pnl_fallbacks(d)
+            out.append(d)
+        return out
+
+    def get_activity_by_symbol(self) -> list[dict[str, Any]]:
+        """
+        Per-ticker counts from ``trades``: open positions, closed trades, wins / losses / flat,
+        and sum of realized P&amp;L on closed trades. Win = closed with ``realized_pnl &gt; 0``, etc.
+        """
+        with self._conn() as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                """
+                SELECT
+                    UPPER(TRIM(symbol)) AS symbol,
+                    SUM(CASE WHEN LOWER(TRIM(status)) = 'open' THEN 1 ELSE 0 END) AS open_count,
+                    SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) AS closed,
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND realized_pnl IS NOT NULL
+                                 AND realized_pnl > 0
+                            THEN 1 ELSE 0
+                        END
+                    ) AS wins,
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND realized_pnl IS NOT NULL
+                                 AND realized_pnl < 0
+                            THEN 1 ELSE 0
+                        END
+                    ) AS losses,
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND (realized_pnl IS NULL OR realized_pnl = 0)
+                            THEN 1 ELSE 0
+                        END
+                    ) AS flat,
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                            THEN COALESCE(realized_pnl, 0)
+                            ELSE 0
+                        END
+                    ) AS total_realized_pnl
+                FROM trades
+                GROUP BY UPPER(TRIM(symbol))
+                HAVING SUM(CASE WHEN LOWER(TRIM(status)) = 'open' THEN 1 ELSE 0 END) > 0
+                    OR SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) > 0
+                ORDER BY
+                    SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN COALESCE(realized_pnl, 0) ELSE 0 END) DESC,
+                    symbol ASC
+                """
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "symbol": r["symbol"],
+                    "open": int(r["open_count"] or 0),
+                    "closed": int(r["closed"] or 0),
+                    "wins": int(r["wins"] or 0),
+                    "losses": int(r["losses"] or 0),
+                    "flat": int(r["flat"] or 0),
+                    "total_realized_pnl": float(r["total_realized_pnl"] or 0.0),
+                }
+            )
+        return out

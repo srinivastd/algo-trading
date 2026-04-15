@@ -59,6 +59,7 @@ class PlaceOrderResult:
     quantity_requested: Optional[int] = None
     quantity_submitted: Optional[int] = None
     sizing: Optional[Dict[str, Any]] = None
+    margin_gates: Optional[Dict[str, Any]] = None
 
     def as_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -80,40 +81,127 @@ class PlaceOrderResult:
             d["quantity_submitted"] = self.quantity_submitted
         if self.sizing:
             d["sizing"] = self.sizing
+        if self.margin_gates:
+            d["margin_gates"] = self.margin_gates
         return d
 
 
 def _account_summary_tag_float(rows: List[Any], tag: str) -> Optional[float]:
-    """Best-effort parse of a numeric account summary field (USD / BASE)."""
-    picked: Optional[float] = None
-    for v in rows:
-        if getattr(v, "tag", None) != tag:
-            continue
-        cur = getattr(v, "currency", None)
-        if cur not in ("USD", "BASE"):
-            continue
-        try:
-            picked = float(v.value)
-        except (TypeError, ValueError):
-            continue
-    return picked
+    """
+    Numeric account summary field with **live US-style** currency priority.
 
-
-def _account_summary_tag_str(rows: List[Any], tag: str) -> Optional[str]:
-    """String account summary field (USD / BASE / empty currency)."""
+    IB sends one row per (tag, currency). For parity with TWS Account Window (US accounts):
+    **USD** first, then **BASE** (totals in account base currency), then **empty** currency
+    (IB sometimes uses this for account-wide scalars). If none of those exist but there is
+    **exactly one** other currency row, use it and log at DEBUG (single-currency edge case).
+    If several non-USD/BASE currencies disagree, return None — we do **not** pick an
+    arbitrary EUR vs GBP row (that would not match how you read risk in TWS).
+    """
+    matches: List[tuple[str, float]] = []
     for v in rows:
         if getattr(v, "tag", None) != tag:
             continue
         cur = getattr(v, "currency", None) or ""
-        if cur not in ("USD", "BASE", ""):
+        try:
+            matches.append((cur, float(v.value)))
+        except (TypeError, ValueError):
             continue
+
+    if not matches:
+        return None
+
+    for pref in ("USD", "BASE", ""):
+        for cur, val in matches:
+            if cur == pref:
+                return val
+
+    others = [(c, val) for c, val in matches if c not in ("USD", "BASE", "")]
+    if len(others) == 1:
+        cur, val = others[0]
+        logger.debug(
+            "account summary tag=%s value from sole non-USD/BASE currency row %s (verify vs TWS if unexpected)",
+            tag,
+            cur,
+        )
+        return val
+    if len(others) > 1:
+        logger.debug(
+            "account summary tag=%s omitted: multiple non-USD/BASE rows %s (ambiguous vs live display)",
+            tag,
+            [c for c, _ in others],
+        )
+    return None
+
+
+def _account_summary_tag_str(rows: List[Any], tag: str) -> Optional[str]:
+    """String account summary field; same currency priority as ``_account_summary_tag_float``."""
+    matches: List[tuple[str, str]] = []
+    for v in rows:
+        if getattr(v, "tag", None) != tag:
+            continue
+        cur = getattr(v, "currency", None) or ""
         val = getattr(v, "value", None)
         if val is None:
             continue
         s = str(val).strip()
         if s:
-            return s
+            matches.append((cur, s))
+
+    if not matches:
+        return None
+
+    for pref in ("USD", "BASE", ""):
+        for cur, s in matches:
+            if cur == pref:
+                return s
+
+    others = [(c, s) for c, s in matches if c not in ("USD", "BASE", "")]
+    if len(others) == 1:
+        cur, s = others[0]
+        logger.debug(
+            "account summary tag=%s string from sole non-USD/BASE currency row %s",
+            tag,
+            cur,
+        )
+        return s
+    if len(others) > 1:
+        logger.debug(
+            "account summary tag=%s string omitted: multiple non-USD/BASE rows %s",
+            tag,
+            [c for c, _ in others],
+        )
     return None
+
+
+def _ib_pnl_float_value(x: Any) -> Optional[float]:
+    """IB ``PnL`` fields use nan until the first gateway tick."""
+    if x is None:
+        return None
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
+
+
+def _portfolio_unrealized_total(ib: IB, account: str) -> Optional[float]:
+    """Sum ``PortfolioItem.unrealizedPNL`` when account-level ``reqPnL`` is still NaN."""
+    try:
+        items = ib.portfolio(account)
+    except Exception:
+        return None
+    if not items:
+        return None
+    total = 0.0
+    any_ok = False
+    for it in items:
+        v = _ib_pnl_float_value(getattr(it, "unrealizedPNL", None))
+        if v is not None:
+            any_ok = True
+            total += v
+    return total if any_ok else None
 
 
 def _affordable_max_shares(
@@ -175,6 +263,7 @@ class IBKRConnection:
         port: int = 4002,
         client_id: int = 0,
         allow_equity_orders_when_market_closed: bool = False,
+        lax_paper: bool = False,
     ):
         """
         Initialize IBKR connection with host, port, and client ID.
@@ -191,6 +280,7 @@ class IBKRConnection:
         self.port = port
         self.client_id = client_id
         self._allow_equity_orders_when_market_closed = allow_equity_orders_when_market_closed
+        self._lax_paper = bool(lax_paper)
         self._connected = False
         self.client = self.ib  # For compatibility with main.py
 
@@ -492,6 +582,182 @@ class IBKRConnection:
             "highest_severity": _account_summary_tag_str(rows, "HighestSeverity"),
         }
 
+    async def get_account_pnl_ib_snapshot(self) -> Dict[str, Optional[float]]:
+        """
+        Account-level P&L from IB ``reqPnL`` (TWS/Gateway P&L stream).
+
+        ``daily_pnl`` / ``unrealized_pnl`` / ``realized_pnl`` match IB's definitions for the
+        subscription (realized is the closed-leg component IB attributes to the session).
+        Use for journal ``daily_snapshots`` / dashboards; per-trade realized still comes from
+        executions if you need fill-level truth.
+
+        **Important:** A ``reqPnL`` subscription often exists with all fields still ``nan`` until
+        the first ticks arrive. We **always** wait for non-nan values (short bounded poll). If
+        account-level unrealized is still missing, we fall back to summing ``ib.portfolio()``
+        ``unrealizedPNL`` (same numbers TWS uses for open positions when streaming catches up).
+        """
+        empty: Dict[str, Optional[float]] = {
+            "daily_pnl": None,
+            "unrealized_pnl": None,
+            "realized_pnl": None,
+        }
+        if not self.is_connected():
+            return empty
+        try:
+            ib = self.get_ib()
+            accounts = ib.managedAccounts() or []
+            acct = accounts[0] if accounts else ""
+            if not acct:
+                return empty
+            if not ib.pnl(acct, ""):
+                ib.reqPnL(acct, "")
+            # Always wait: if a subscription already existed, the old code skipped this and
+            # persisted SQL NULL from nan forever.
+            for _ in range(60):
+                await asyncio.sleep(0.1)
+                rows = ib.pnl(acct, "")
+                if not rows:
+                    break
+                p0 = rows[0]
+                if (
+                    _ib_pnl_float_value(p0.realizedPnL) is not None
+                    or _ib_pnl_float_value(p0.unrealizedPnL) is not None
+                    or _ib_pnl_float_value(p0.dailyPnL) is not None
+                ):
+                    break
+            rows = ib.pnl(acct, "")
+            if not rows:
+                return empty
+            p = rows[0]
+            daily = _ib_pnl_float_value(p.dailyPnL)
+            unreal = _ib_pnl_float_value(p.unrealizedPnL)
+            real = _ib_pnl_float_value(p.realizedPnL)
+            if unreal is None:
+                unreal = _portfolio_unrealized_total(ib, acct)
+            return {
+                "daily_pnl": daily,
+                "unrealized_pnl": unreal,
+                "realized_pnl": real,
+            }
+        except Exception as e:
+            logger.debug("get_account_pnl_ib_snapshot failed: %s", e)
+            return empty
+
+    def cancel_account_pnl_subscription(self) -> None:
+        """Release IB P&L stream (call when tearing down a watch session)."""
+        try:
+            ib = self.get_ib()
+            accounts = ib.managedAccounts() or []
+            if not accounts:
+                return
+            acct = accounts[0]
+            if ib.pnl(acct, ""):
+                ib.cancelPnL(acct, "")
+        except Exception as e:
+            logger.debug("cancel_account_pnl_subscription: %s", e)
+
+    async def pre_trade_check(self, symbol: str, action: str = "BUY", quantity: int = 100) -> Dict[str, Any]:
+        """
+        Comprehensive pre-trade gate that makes **paper behave like live**.
+
+        - Uses ``get_account_margin_gate_snapshot()`` (DayTradesRemaining, SettledCash, BuyingPower...).
+        - **PDT**: blocks if DayTradesRemaining==0.
+        - **Settlement**: checks SettledCash for CASH accounts.
+        - **Buying power**: uses get_account_sizing_headroom().
+        - **--lax-paper** (paper only) bypasses all gates for diagnostics.
+
+        Returns dict with "allowed", "reason", full gates, etc.
+        """
+        gates = await self.get_account_margin_gate_snapshot()
+        result = {
+            "allowed": True,
+            "reason": "OK",
+            "margin_gates": gates,
+            "day_trades_remaining": gates.get("day_trades_remaining"),
+            "settled_cash": gates.get("settled_cash"),
+            "buying_power": gates.get("buying_power"),
+            "suggested_max_shares": None,
+            "lax_paper": self._lax_paper,
+        }
+
+        if not self.is_connected():
+            result.update({"allowed": False, "reason": "NOT_CONNECTED"})
+            return result
+
+        if self._lax_paper:
+            logger.warning(
+                "LAX_PAPER_MODE enabled — skipping PDT, settlement, and buying-power gates. "
+                "Use ONLY for diagnostics. Live trading will be strict."
+            )
+            return result
+
+        dtr = gates.get("day_trades_remaining")
+        if dtr is not None:
+            try:
+                dtr_float = float(dtr)
+                if dtr_float == 0.0:
+                    result.update({
+                        "allowed": False,
+                        "reason": "PDT_LIMIT_EXCEEDED (DayTradesRemaining=0)",
+                    })
+                    logger.warning(
+                        "PRE_TRADE_REJECTED symbol=%s action=%s reason=PDT_LIMIT_EXCEEDED "
+                        "DayTradesRemaining=0 — paper/live will be blocked until next session rollover",
+                        symbol.upper(), action.upper()
+                    )
+                    return result
+                elif dtr_float > 0 and dtr_float < 4:
+                    logger.info(
+                        "PRE_TRADE_WARNING symbol=%s action=%s DayTradesRemaining=%.0f (close to PDT limit)",
+                        symbol.upper(), action.upper(), dtr_float
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        # Settlement check for cash accounts
+        acct_type = gates.get("account_type", "")
+        settled = gates.get("settled_cash")
+        if "CASH" in str(acct_type).upper() and settled is not None:
+            est_cost = quantity * 150.0  # rough estimate; better to use current price
+            if settled < est_cost * 1.1:  # 10% buffer
+                result.update({
+                    "allowed": False,
+                    "reason": f"INSUFFICIENT_SETTLED_CASH (settled=${settled:,.0f}, need~${est_cost*1.1:,.0f})",
+                })
+                logger.warning(
+                    "PRE_TRADE_REJECTED symbol=%s action=%s reason=INSUFFICIENT_SETTLED_CASH "
+                    "settled_cash=%.2f est_cost=%.2f account_type=%s",
+                    symbol.upper(), action.upper(), settled, est_cost, acct_type
+                )
+                return result
+
+        # Buying power / available funds check
+        headroom = await self.get_account_sizing_headroom()
+        bp = headroom.get("buying_power") or headroom.get("available_funds")
+        if bp is not None and bp > 0:
+            # Rough per-share estimate
+            est_price = 50.0  # placeholder; real price would be better
+            max_shares = int(bp * 0.85 / est_price)  # conservative
+            result["suggested_max_shares"] = max_shares
+            if quantity > max_shares * 2:  # very loose buffer
+                result.update({
+                    "allowed": False,
+                    "reason": f"INSUFFICIENT_BUYING_POWER (bp=${bp:,.0f}, max_shares~{max_shares})",
+                })
+                logger.warning(
+                    "PRE_TRADE_REJECTED symbol=%s action=%s qty=%s reason=INSUFFICIENT_BUYING_POWER "
+                    "buying_power=%.0f max_shares_est=%d",
+                    symbol.upper(), action.upper(), quantity, bp, max_shares
+                )
+                return result
+
+        logger.debug(
+            "PRE_TRADE_ALLOWED symbol=%s action=%s dtr=%s bp=%.0f settled=%.0f acct=%s",
+            symbol.upper(), action.upper(),
+            result["day_trades_remaining"], bp or 0, settled or 0, acct_type or "?"
+        )
+        return result
+
     async def place_order(self, symbol: str, action: str, quantity: int, order_type: str,
                          limit_price: float = None, aux_price: float = None,
                          parent_id: int = None) -> PlaceOrderResult:
@@ -513,6 +779,28 @@ class IBKRConnection:
                 return res
 
             logger.debug(f"Validating symbol {symbol} before placing order...")
+
+            # NEW: Comprehensive regulatory / account gate (PDT, buying power, settlement)
+            # This is the main protection that makes paper behave like live.
+            precheck = await self.pre_trade_check(symbol, action, qty_requested)
+            if not precheck.get("allowed", False):
+                res = PlaceOrderResult(
+                    ok=False,
+                    code=precheck.get("reason", "PRE_TRADE_REJECTED").split()[0],
+                    message=precheck.get("reason", "Pre-trade gate failed"),
+                    margin_gates=precheck.get("margin_gates"),
+                )
+                logger.error(
+                    "PRE_TRADE_REJECTED symbol=%s action=%s qty=%s reason=%s gates=%s",
+                    symbol.upper(),
+                    action.upper(),
+                    qty_requested,
+                    precheck.get("reason"),
+                    {k: v for k, v in (precheck.get("margin_gates") or {}).items()
+                     if k in ("day_trades_remaining", "settled_cash", "buying_power")}
+                )
+                return res
+
             if not await self.validate_symbol(symbol):
                 res = PlaceOrderResult(
                     ok=False,

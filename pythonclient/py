@@ -1,4 +1,7 @@
 #!/usr/bin/env sh
-# Use project deps (pytz, ib_insync, …). From pythonclient/: ./py src/main.py …
+# Use project deps (pytz, ib_insync, …). From pythonclient/:
+#   ./py src/main.py --paper                     # paper trading (now has strict PDT/settlement gates)
+#   ./py src/main.py --paper --lax-paper         # disable gates for diagnostics only
+#   ./py src/journal_dashboard.py                # trade journal / IB P&L UI (default :8765)
 cd "$(dirname "$0")" || exit 1
 exec ./.bt_run_venv/bin/python3 "$@"

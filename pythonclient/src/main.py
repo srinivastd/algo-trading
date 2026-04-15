@@ -178,6 +178,16 @@ def _log_ib_margin_gates(snap: dict) -> None:
                 )
 
 
+def _log_ib_account_pnl(pnl_ib: dict) -> None:
+    """Log IB reqPnL fields; same numbers persisted to journal ``daily_snapshots``."""
+    logger.info(
+        "IB_ACCOUNT_PNL daily=%s unrealized=%s realized_today=%s",
+        _fmt_gate_num(pnl_ib.get("daily_pnl")),
+        _fmt_gate_num(pnl_ib.get("unrealized_pnl")),
+        _fmt_gate_num(pnl_ib.get("realized_pnl")),
+    )
+
+
 async def watch_mode(
     symbols,
     strategy,
@@ -320,19 +330,26 @@ async def watch_mode(
                     positions = await connection.get_ib().reqPositionsAsync()
                     pos_rows = _positions_snapshot(positions)
                     equity = await connection.get_account_equity()
+                    pnl_ib = await connection.get_account_pnl_ib_snapshot()
                     journal.insert_daily_snapshot(
                         timestamp=now,
                         net_liquidation=_safe_float(equity),
                         positions=pos_rows,
-                        unrealized_pnl=None,
-                        realized_pnl_today=None,
+                        unrealized_pnl=pnl_ib.get("unrealized_pnl"),
+                        realized_pnl_today=pnl_ib.get("realized_pnl"),
+                        ib_daily_pnl=pnl_ib.get("daily_pnl"),
                     )
+                    _log_ib_account_pnl(pnl_ib)
                 except asyncio.CancelledError:
                     raise
                 except Exception as snapshot_err:
                     logger.warning(f"Trade journal snapshot failed: {snapshot_err}")
 
         snapshot_task = asyncio.create_task(_snapshot_loop())
+        try:
+            _log_ib_account_pnl(await connection.get_account_pnl_ib_snapshot())
+        except Exception as pnl_log_err:
+            logger.debug("Initial IB account PnL log skipped: %s", pnl_log_err)
 
     margin_gates_task = None
     if paper_margin_gates_interval_sec and paper_margin_gates_interval_sec > 0:
@@ -793,6 +810,10 @@ async def watch_mode(
             connection.get_ib().barUpdateEvent -= on_bar_update
         except Exception:
             pass
+        try:
+            connection.cancel_account_pnl_subscription()
+        except Exception:
+            pass
 
 def save_active_trades_cache(active_trades):
     cache_data = {
@@ -854,6 +875,12 @@ def parse_args():
         default=600,
         metavar="SEC",
         help="Paper: re-log IB margin/settled cash/PDT (DayTradesRemaining) tags every SEC in watch mode; 0=startup log only. Default 600.",
+    )
+    parser.add_argument(
+        "--lax-paper",
+        action="store_true",
+        help="Paper only: disable strict pre-trade gates (PDT, settled cash, buying power). "
+             "Use ONLY for diagnostics. Live always uses strict gates. Default for paper is now STRICT.",
     )
     parser.add_argument("--live", action="store_true", help="Use live trading")
     parser.add_argument("--watch", action="store_true", help="Watch mode only")
@@ -938,15 +965,19 @@ async def main():
     # Only use live trading port (7497) when explicitly requested with --live
     port = 4002 if args.backtest_only or not args.live else 7497
     allow_closed_market = bool(args.paper and args.allow_closed_market and not args.live)
+    lax_paper = bool(args.paper and args.lax_paper and not args.live)
     if args.allow_closed_market and not args.paper:
         logger.warning("--allow-closed-market ignored (requires --paper)")
     if args.allow_closed_market and args.live:
         logger.warning("--allow-closed-market ignored in --live mode")
+    if args.lax_paper and not args.paper:
+        logger.warning("--lax-paper ignored (only affects paper)")
     connection = IBKRConnection(
         host="127.0.0.1",
         port=port,
         client_id=client_id,
         allow_equity_orders_when_market_closed=allow_closed_market,
+        lax_paper=lax_paper,
     )
     if allow_closed_market:
         logger.warning(
