@@ -7,7 +7,7 @@ import logging
 import argparse
 import sys
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from uuid import uuid4
 import pytz
 import random
@@ -149,6 +149,12 @@ async def watch_mode(
     """Real-time watching mode for multiple stocks"""
     logger.info(f"Starting real-time watch for {symbols} with check interval {check_interval} seconds")
 
+    allow_outside_rth = getattr(connection, "_allow_equity_orders_when_market_closed", False)
+    if allow_outside_rth:
+        logger.warning(
+            "Watch loop runs outside US RTH (--allow-closed-market); real-time bars use extended hours where IB sends them"
+        )
+
     # Load or recover active trades on startup
     active_trades = await load_active_trades(connection)
 
@@ -187,7 +193,7 @@ async def watch_mode(
                 contract=contract,
                 barSize=5,
                 whatToShow='TRADES',
-                useRTH=True
+                useRTH=not allow_outside_rth,
             )
 
             symbol_upper = contract.symbol.upper()
@@ -288,11 +294,17 @@ async def watch_mode(
     try:
         while True:
             current_time = datetime.now(pytz.timezone('US/Eastern'))
-            # Skip if outside market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
-            if current_time.weekday() >= 5 or not (9 <= current_time.hour < 16):
-                logger.info("Outside market hours, skipping this cycle...")
-                await asyncio.sleep(check_interval)
-                continue
+            # Match IBKRConnection.is_market_open (US equity RTH) unless paper allow-closed-market.
+            if not allow_outside_rth:
+                if current_time.weekday() >= 5:
+                    logger.info("Outside market hours (weekend), skipping this cycle...")
+                    await asyncio.sleep(check_interval)
+                    continue
+                tod = current_time.time()
+                if tod < time(9, 30) or tod > time(16, 0):
+                    logger.info("Outside market hours, skipping this cycle...")
+                    await asyncio.sleep(check_interval)
+                    continue
 
             # STEP 1: Check existing positions for exit signals
             try:
@@ -765,6 +777,11 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--client-id", type=int, default=1, help="IBKR client ID")
     parser.add_argument("--paper", action="store_true", help="Use paper trading")
+    parser.add_argument(
+        "--allow-closed-market",
+        action="store_true",
+        help="Paper only: run watch loop and equity orders outside US RTH (extended-hours diagnostics)",
+    )
     parser.add_argument("--live", action="store_true", help="Use live trading")
     parser.add_argument("--watch", action="store_true", help="Watch mode only")
     parser.add_argument("--check-interval", type=int, default=60, help="Check interval in seconds")
@@ -847,7 +864,21 @@ async def main():
     # Use paper trading port (4002) for both backtest-only and paper trading modes
     # Only use live trading port (7497) when explicitly requested with --live
     port = 4002 if args.backtest_only or not args.live else 7497
-    connection = IBKRConnection(host="127.0.0.1", port=port, client_id=client_id)
+    allow_closed_market = bool(args.paper and args.allow_closed_market and not args.live)
+    if args.allow_closed_market and not args.paper:
+        logger.warning("--allow-closed-market ignored (requires --paper)")
+    if args.allow_closed_market and args.live:
+        logger.warning("--allow-closed-market ignored in --live mode")
+    connection = IBKRConnection(
+        host="127.0.0.1",
+        port=port,
+        client_id=client_id,
+        allow_equity_orders_when_market_closed=allow_closed_market,
+    )
+    if allow_closed_market:
+        logger.warning(
+            "Paper mode: equity orders allowed outside local RTH (outsideRth); not a substitute for real session behavior"
+        )
     journal = None
     if not args.no_journal:
         try:
