@@ -135,6 +135,49 @@ def _positions_snapshot(positions):
     return rows
 
 
+def _fmt_gate_num(v) -> str:
+    if v is None:
+        return "—"
+    if isinstance(v, float):
+        return f"{v:,.2f}"
+    return str(v)
+
+
+def _log_ib_margin_gates(snap: dict) -> None:
+    """Log IB account summary tags that mirror live margin, settlement, and PDT gates."""
+    parts = [
+        f"type={snap.get('account_type') or '—'}",
+        f"NL={_fmt_gate_num(snap.get('net_liquidation'))}",
+        f"cash={_fmt_gate_num(snap.get('total_cash_value'))}",
+        f"settled={_fmt_gate_num(snap.get('settled_cash'))}",
+        f"BP={_fmt_gate_num(snap.get('buying_power'))}",
+        f"excessLiq={_fmt_gate_num(snap.get('excess_liquidity'))}",
+        f"avail={_fmt_gate_num(snap.get('available_funds'))}",
+        f"fullAvail={_fmt_gate_num(snap.get('full_available_funds'))}",
+        f"dayTradesLeft={_fmt_gate_num(snap.get('day_trades_remaining'))}",
+        f"cushion={_fmt_gate_num(snap.get('cushion'))}",
+        f"severity={snap.get('highest_severity') or '—'}",
+    ]
+    logger.info("IB_MARGIN_GATES %s", " ".join(parts))
+    dtr = snap.get("day_trades_remaining")
+    if dtr is not None:
+        try:
+            fd = float(dtr)
+        except (TypeError, ValueError):
+            fd = None
+        if fd is not None:
+            if fd == 0.0:
+                logger.warning(
+                    "IB PDT gate: DayTradesRemaining=0 — day-trade capacity exhausted until rollover; "
+                    "confirm in Account Management vs live behavior."
+                )
+            elif fd < 0:
+                logger.info(
+                    "IB PDT gate: DayTradesRemaining=%s (IB: unlimited day trades for this account tag)",
+                    dtr,
+                )
+
+
 async def watch_mode(
     symbols,
     strategy,
@@ -145,6 +188,7 @@ async def watch_mode(
     memory: TradeMemory | None = None,
     run_id: str | None = None,
     snapshot_interval_sec: int = 60,
+    paper_margin_gates_interval_sec: int = 0,
 ):
     """Real-time watching mode for multiple stocks"""
     logger.info(f"Starting real-time watch for {symbols} with check interval {check_interval} seconds")
@@ -289,6 +333,22 @@ async def watch_mode(
                     logger.warning(f"Trade journal snapshot failed: {snapshot_err}")
 
         snapshot_task = asyncio.create_task(_snapshot_loop())
+
+    margin_gates_task = None
+    if paper_margin_gates_interval_sec and paper_margin_gates_interval_sec > 0:
+
+        async def _margin_gates_loop():
+            while True:
+                await asyncio.sleep(paper_margin_gates_interval_sec)
+                try:
+                    snap = await connection.get_account_margin_gate_snapshot()
+                    _log_ib_margin_gates(snap)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as loop_err:
+                    logger.warning("Paper margin gates periodic log failed: %s", loop_err)
+
+        margin_gates_task = asyncio.create_task(_margin_gates_loop())
 
     # Start watching loop
     try:
@@ -723,6 +783,12 @@ async def watch_mode(
                 await snapshot_task
             except asyncio.CancelledError:
                 pass
+        if margin_gates_task:
+            margin_gates_task.cancel()
+            try:
+                await margin_gates_task
+            except asyncio.CancelledError:
+                pass
         try:
             connection.get_ib().barUpdateEvent -= on_bar_update
         except Exception:
@@ -781,6 +847,13 @@ def parse_args():
         "--allow-closed-market",
         action="store_true",
         help="Paper only: run watch loop and equity orders outside US RTH (extended-hours diagnostics)",
+    )
+    parser.add_argument(
+        "--paper-margin-gates-interval",
+        type=int,
+        default=600,
+        metavar="SEC",
+        help="Paper: re-log IB margin/settled cash/PDT (DayTradesRemaining) tags every SEC in watch mode; 0=startup log only. Default 600.",
     )
     parser.add_argument("--live", action="store_true", help="Use live trading")
     parser.add_argument("--watch", action="store_true", help="Watch mode only")
@@ -906,6 +979,12 @@ async def main():
             logger.error("Failed to connect to IBKR Gateway after multiple attempts")
             return
         logger.info("Successfully connected to IBKR Gateway")
+
+        if args.paper:
+            try:
+                _log_ib_margin_gates(await connection.get_account_margin_gate_snapshot())
+            except Exception as gate_err:
+                logger.warning("IB margin gate snapshot failed: %s", gate_err)
             
         # Get account information
         logger.info("Fetching account information...")
@@ -950,6 +1029,9 @@ async def main():
                     memory=memory,
                     run_id=run_id,
                     snapshot_interval_sec=args.journal_snapshot_interval,
+                    paper_margin_gates_interval_sec=(
+                        args.paper_margin_gates_interval if args.paper else 0
+                    ),
                 )
             finally:
                 if journal and run_id:

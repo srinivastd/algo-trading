@@ -99,6 +99,23 @@ def _account_summary_tag_float(rows: List[Any], tag: str) -> Optional[float]:
     return picked
 
 
+def _account_summary_tag_str(rows: List[Any], tag: str) -> Optional[str]:
+    """String account summary field (USD / BASE / empty currency)."""
+    for v in rows:
+        if getattr(v, "tag", None) != tag:
+            continue
+        cur = getattr(v, "currency", None) or ""
+        if cur not in ("USD", "BASE", ""):
+            continue
+        val = getattr(v, "value", None)
+        if val is None:
+            continue
+        s = str(val).strip()
+        if s:
+            return s
+    return None
+
+
 def _affordable_max_shares(
     ref_price: float,
     headroom: Dict[str, Optional[float]],
@@ -428,6 +445,51 @@ class IBKRConnection:
             "available_funds": _account_summary_tag_float(rows, "AvailableFunds"),
             "net_liquidation": _account_summary_tag_float(rows, "NetLiquidation"),
             "equity_with_loan": _account_summary_tag_float(rows, "EquityWithLoanValue"),
+        }
+
+    async def get_account_margin_gate_snapshot(self) -> Dict[str, Any]:
+        """
+        IB account summary fields that mirror live margin/cash/PDT gates (paper or live).
+
+        Use alongside ``get_account_sizing_headroom`` / ``place_order`` rejections (e.g.
+        INSUFFICIENT_BUYING_POWER). DayTradesRemaining: -1 means unlimited day trades per IB.
+        """
+        empty: Dict[str, Any] = {
+            "account_type": None,
+            "net_liquidation": None,
+            "total_cash_value": None,
+            "settled_cash": None,
+            "buying_power": None,
+            "excess_liquidity": None,
+            "available_funds": None,
+            "full_available_funds": None,
+            "day_trades_remaining": None,
+            "cushion": None,
+            "highest_severity": None,
+        }
+        if not self.is_connected():
+            return empty
+        try:
+            ib = self.get_ib()
+            accounts = ib.managedAccounts() or []
+            acct = accounts[0] if accounts else ""
+            rows = await ib.accountSummaryAsync(acct)
+        except Exception as e:
+            logger.debug("get_account_margin_gate_snapshot failed: %s", e)
+            return empty
+        dtr = _account_summary_tag_float(rows, "DayTradesRemaining")
+        return {
+            "account_type": _account_summary_tag_str(rows, "AccountType"),
+            "net_liquidation": _account_summary_tag_float(rows, "NetLiquidation"),
+            "total_cash_value": _account_summary_tag_float(rows, "TotalCashValue"),
+            "settled_cash": _account_summary_tag_float(rows, "SettledCash"),
+            "buying_power": _account_summary_tag_float(rows, "BuyingPower"),
+            "excess_liquidity": _account_summary_tag_float(rows, "ExcessLiquidity"),
+            "available_funds": _account_summary_tag_float(rows, "AvailableFunds"),
+            "full_available_funds": _account_summary_tag_float(rows, "FullAvailableFunds"),
+            "day_trades_remaining": dtr,
+            "cushion": _account_summary_tag_float(rows, "Cushion"),
+            "highest_severity": _account_summary_tag_str(rows, "HighestSeverity"),
         }
 
     async def place_order(self, symbol: str, action: str, quantity: int, order_type: str,
