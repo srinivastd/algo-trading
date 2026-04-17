@@ -711,19 +711,104 @@ class TradeJournal:
             out.append(d)
         return out
 
-    def get_activity_by_symbol(self) -> list[dict[str, Any]]:
+    def get_journal_exit_day_aggregate(self, date_yyyy_mm_dd: str) -> dict[str, Any]:
+        """
+        Account-wide totals from ``trades`` for rows **closed** on calendar day ``date_yyyy_mm_dd``
+        (``exit_fill_time`` ISO date prefix). Compare to IB ``daily_snapshots`` P&amp;L when
+        diagnosing dashboard mismatches.
+        """
+        with self._conn() as con:
+            row = con.execute(
+                """
+                SELECT
+                    COUNT(*) AS n_closed,
+                    COALESCE(SUM(realized_pnl), 0) AS sum_realized,
+                    SUM(CASE WHEN UPPER(TRIM(side)) = 'LONG' THEN 1 ELSE 0 END) AS n_closed_long,
+                    SUM(CASE WHEN UPPER(TRIM(side)) = 'SHORT' THEN 1 ELSE 0 END) AS n_closed_short
+                FROM trades
+                WHERE LOWER(TRIM(status)) = 'closed'
+                  AND exit_fill_time IS NOT NULL
+                  AND length(trim(exit_fill_time)) >= 10
+                  AND substr(trim(exit_fill_time), 1, 10) = ?
+                """,
+                (date_yyyy_mm_dd,),
+            ).fetchone()
+            open_n = con.execute(
+                """
+                SELECT COUNT(*) FROM trades WHERE LOWER(TRIM(status)) = 'open'
+                """
+            ).fetchone()
+        n_closed = int(row["n_closed"] or 0) if row else 0
+        return {
+            "date": date_yyyy_mm_dd,
+            "closed_trade_rows": n_closed,
+            "closed_long": int(row["n_closed_long"] or 0) if row else 0,
+            "closed_short": int(row["n_closed_short"] or 0) if row else 0,
+            "sum_realized_pnl": float(row["sum_realized"] or 0.0) if row else 0.0,
+            "open_trade_rows_total": int(open_n[0] or 0) if open_n else 0,
+        }
+
+    def get_activity_by_symbol(self, date_yyyy_mm_dd: str | None = None) -> list[dict[str, Any]]:
         """
         Per-ticker counts from ``trades``: open positions, closed trades, wins / losses / flat,
         and sum of realized P&amp;L on closed trades. Win = closed with ``realized_pnl &gt; 0``, etc.
+
+        Each row also includes ``open_long`` / ``open_short`` and ``closed_long`` / ``closed_short``
+        from the ``side`` column.
+
+        If ``date_yyyy_mm_dd`` is provided (ISO YYYY-MM-DD), filters closed-trade stats to that
+        calendar day (based on ``exit_fill_time``). Open positions are always current.
         """
+        date_filter = ""
+        params: list[str] = []
+        if date_yyyy_mm_dd:
+            date_filter = """
+                  AND (
+                      (LOWER(TRIM(status)) != 'closed')
+                      OR (
+                          exit_fill_time IS NOT NULL
+                          AND length(trim(exit_fill_time)) >= 10
+                          AND substr(trim(exit_fill_time), 1, 10) = ?
+                      )
+                  )
+            """
+            params = [date_yyyy_mm_dd]
+
         with self._conn() as con:
             con.row_factory = sqlite3.Row
-            rows = con.execute(
-                """
+            query = f"""
                 SELECT
                     UPPER(TRIM(symbol)) AS symbol,
                     SUM(CASE WHEN LOWER(TRIM(status)) = 'open' THEN 1 ELSE 0 END) AS open_count,
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'open'
+                                 AND UPPER(TRIM(side)) = 'LONG'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS open_long,
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'open'
+                                 AND UPPER(TRIM(side)) = 'SHORT'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS open_short,
                     SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) AS closed,
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND UPPER(TRIM(side)) = 'LONG'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS closed_long,
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND UPPER(TRIM(side)) = 'SHORT'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS closed_short,
                     SUM(
                         CASE
                             WHEN LOWER(TRIM(status)) = 'closed'
@@ -755,6 +840,7 @@ class TradeJournal:
                         END
                     ) AS total_realized_pnl
                 FROM trades
+                WHERE 1=1 {date_filter}
                 GROUP BY UPPER(TRIM(symbol))
                 HAVING SUM(CASE WHEN LOWER(TRIM(status)) = 'open' THEN 1 ELSE 0 END) > 0
                     OR SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) > 0
@@ -762,18 +848,44 @@ class TradeJournal:
                     SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN COALESCE(realized_pnl, 0) ELSE 0 END) DESC,
                     symbol ASC
                 """
-            ).fetchall()
+            rows = con.execute(query, params).fetchall()
+
         out: list[dict[str, Any]] = []
         for r in rows:
             out.append(
                 {
                     "symbol": r["symbol"],
                     "open": int(r["open_count"] or 0),
+                    "open_long": int(r["open_long"] or 0),
+                    "open_short": int(r["open_short"] or 0),
                     "closed": int(r["closed"] or 0),
+                    "closed_long": int(r["closed_long"] or 0),
+                    "closed_short": int(r["closed_short"] or 0),
                     "wins": int(r["wins"] or 0),
                     "losses": int(r["losses"] or 0),
                     "flat": int(r["flat"] or 0),
                     "total_realized_pnl": float(r["total_realized_pnl"] or 0.0),
+                    "date_filter": date_yyyy_mm_dd or "all-time",
                 }
             )
         return out
+
+    def get_available_dates(self) -> list[str]:
+        """Return distinct calendar dates (YYYY-MM-DD) from daily_snapshots and trades, newest first."""
+        with self._conn() as con:
+            rows = con.execute("""
+                SELECT DISTINCT date
+                FROM (
+                    SELECT date FROM daily_snapshots
+                    UNION
+                    SELECT substr(trim(exit_fill_time), 1, 10) as date FROM trades
+                        WHERE exit_fill_time IS NOT NULL AND length(trim(exit_fill_time)) >= 10
+                    UNION
+                    SELECT substr(trim(entry_fill_time), 1, 10) as date FROM trades
+                        WHERE entry_fill_time IS NOT NULL AND length(trim(entry_fill_time)) >= 10
+                ) dates
+                WHERE date IS NOT NULL AND date != ''
+                ORDER BY date DESC
+                LIMIT 90
+            """).fetchall()
+        return [row[0] for row in rows if row[0]]

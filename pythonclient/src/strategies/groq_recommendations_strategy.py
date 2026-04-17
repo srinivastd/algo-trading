@@ -29,7 +29,8 @@ class GroqRecommendationsStrategy(StrategyBase):
 
     def __init__(self, risk_per_trade: float = 3000, max_duration_hours: float = 12.0, paper_trading: bool = True,
                  stop_loss_pct: float = 1.0, target_pct: float = 4.0, bar_size: str = "1 hour", duration: str = "1 M",
-                 zone_lookback: int = 4, adx_min: float = 18.0,
+                 zone_lookback: int = 4, adx_min: float = 25.0,
+                 long_min_rsi: float = 0.0,
                  zone_freshness_hours: float = 8.0,
                  volume_breakout_mult: float = 1.3,
                  volume_confirm_mult: float = 1.3,
@@ -54,6 +55,7 @@ class GroqRecommendationsStrategy(StrategyBase):
         self.duration = duration
         self.zone_lookback = zone_lookback
         self.adx_min = adx_min
+        self.long_min_rsi = float(long_min_rsi)
         self.zone_freshness_hours = zone_freshness_hours
         self.volume_breakout_mult = volume_breakout_mult
         self.volume_confirm_mult = volume_confirm_mult
@@ -84,9 +86,11 @@ class GroqRecommendationsStrategy(StrategyBase):
                 "ChromaDB unavailable (backtest results will not be persisted): %s",
                 chroma_err,
             )
-        logger.info(f"Initialized {self.name} with risk_per_trade=${risk_per_trade}, max_duration={max_duration_hours}h, "
-                   f"stop_loss={stop_loss_pct}%, target={target_pct}%, paper_trading={paper_trading}, "
-                   f"bar_size={bar_size}, duration={duration}")
+        logger.info(
+            f"Initialized {self.name} with risk_per_trade=${risk_per_trade}, max_duration={max_duration_hours}h, "
+            f"stop_loss={stop_loss_pct}%, target={target_pct}%, paper_trading={paper_trading}, "
+            f"bar_size={bar_size}, duration={duration}, adx_min={self.adx_min}, long_min_rsi={self.long_min_rsi}"
+        )
         if self.short_realtime_filters_enabled:
             logger.info(
                 "Realtime SHORT filters ON: block adx<%s rsi>%s | (+di>-di & rsi>%s); "
@@ -331,6 +335,14 @@ class GroqRecommendationsStrategy(StrategyBase):
         Long branch after demand zone + volume match (same as ``generate_signals``).
         Returns (1, confidence) or (0, 0.0).
         """
+        if self.long_min_rsi > 0:
+            rsi = (
+                float(df["rsi"].iloc[i])
+                if "rsi" in df.columns and pd.notna(df["rsi"].iloc[i])
+                else float("nan")
+            )
+            if np.isnan(rsi) or rsi <= self.long_min_rsi:
+                return 0, 0.0
         profile_score = df["stock_profile_score"].iloc[i] if "stock_profile_score" in df.columns else 0
         confidence = 0.5
         trend_confirmed = df["sma_20"].iloc[i] > df["sma_50"].iloc[i] or np.random.random() < 0.5
@@ -490,6 +502,7 @@ class GroqRecommendationsStrategy(StrategyBase):
             current_adx = df["adx"].iloc[i] if "adx" in df.columns else 0
             time_diff_hours = (current_time - zone_time).total_seconds() / 3600
             long_sig, confidence = self._long_signal_and_confidence_at(df, i)
+            cur_rsi = float(df["rsi"].iloc[i]) if "rsi" in df.columns and pd.notna(df["rsi"].iloc[i]) else float("nan")
 
             logger.info(f"✅ LONG CANDIDATE at {current_time}:")
             logger.info(f"   Price: ${current_price:.2f} (broke below demand zone ${zone_low:.2f})")
@@ -503,11 +516,18 @@ class GroqRecommendationsStrategy(StrategyBase):
                 f"   Zone age: {time_diff_hours:.1f} h (freshness < {self.zone_freshness_hours} h)"
             )
             logger.info(f"   Zone range: ${zone_low:.2f} - ${zone_high:.2f}")
+            if not np.isnan(cur_rsi):
+                logger.info(f"   RSI: {cur_rsi:.1f} (long_min_rsi={self.long_min_rsi})")
             if long_sig == 1:
                 logger.info(f"   -> LONG signal accepted (confidence {confidence:.2f})")
                 out = 1
             else:
-                logger.info("   -> LONG suppressed (trend_confirmed false, same as backtest)")
+                if self.long_min_rsi > 0 and (np.isnan(cur_rsi) or cur_rsi <= self.long_min_rsi):
+                    logger.info(
+                        f"   -> LONG suppressed (need rsi>{self.long_min_rsi}, got {cur_rsi})"
+                    )
+                else:
+                    logger.info("   -> LONG suppressed (trend_confirmed false, same as backtest)")
             break
 
         return out
@@ -934,6 +954,7 @@ class GroqRecommendationsStrategy(StrategyBase):
             "max_duration_hours": float(self.max_duration_hours),
             "zone_lookback": self.zone_lookback,
             "adx_min": self.adx_min,
+            "long_min_rsi": float(self.long_min_rsi),
             "zone_freshness_hours": self.zone_freshness_hours,
             "volume_breakout_mult": self.volume_breakout_mult,
             "volume_confirm_mult": self.volume_confirm_mult,

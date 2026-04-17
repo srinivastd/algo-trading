@@ -199,6 +199,8 @@ async def watch_mode(
     run_id: str | None = None,
     snapshot_interval_sec: int = 60,
     paper_margin_gates_interval_sec: int = 0,
+    allow_shorts: bool = False,
+    daily_loss_stop_pct: float = 0.02,
 ):
     """Real-time watching mode for multiple stocks"""
     logger.info(f"Starting real-time watch for {symbols} with check interval {check_interval} seconds")
@@ -367,10 +369,18 @@ async def watch_mode(
 
         margin_gates_task = asyncio.create_task(_margin_gates_loop())
 
+    # Daily kill-switch: halt NEW entries when down > X% vs start-of-day net liquidation.
+    # Exits are still allowed so we can flatten risk.
+    et_tz = pytz.timezone("US/Eastern")
+    daily_day = None
+    day_start_net_liq: float | None = None
+    entries_halted_for_day = False
+    last_halt_log_day = None
+
     # Start watching loop
     try:
         while True:
-            current_time = datetime.now(pytz.timezone('US/Eastern'))
+            current_time = datetime.now(et_tz)
             # Match IBKRConnection.is_market_open (US equity RTH) unless paper allow-closed-market.
             if not allow_outside_rth:
                 if current_time.weekday() >= 5:
@@ -382,6 +392,45 @@ async def watch_mode(
                     logger.info("Outside market hours, skipping this cycle...")
                     await asyncio.sleep(check_interval)
                     continue
+
+            # Reset daily baseline at ET calendar rollover.
+            if daily_day != current_time.date():
+                daily_day = current_time.date()
+                day_start_net_liq = None
+                entries_halted_for_day = False
+                last_halt_log_day = None
+
+            # Evaluate kill-switch against net liquidation drawdown.
+            # We use net liq (equity) rather than "daily realized" to make this robust even when journaling is off.
+            try:
+                net_liq = _safe_float(await connection.get_account_equity())
+            except Exception as eq_err:
+                net_liq = None
+                logger.debug("Daily kill-switch net liq fetch failed: %s", eq_err)
+
+            if net_liq is not None and net_liq > 0:
+                if day_start_net_liq is None:
+                    day_start_net_liq = float(net_liq)
+                    logger.info(
+                        "DAILY_BASELINE day=%s start_net_liq=%.2f loss_stop_pct=%.2f%% shorts_enabled=%s",
+                        daily_day,
+                        day_start_net_liq,
+                        float(daily_loss_stop_pct) * 100.0,
+                        bool(allow_shorts),
+                    )
+                else:
+                    dd = (float(net_liq) - float(day_start_net_liq)) / float(day_start_net_liq)
+                    if (not entries_halted_for_day) and dd <= -abs(float(daily_loss_stop_pct)):
+                        entries_halted_for_day = True
+                        logger.error(
+                            "DAILY_KILL_SWITCH TRIPPED day=%s start_net_liq=%.2f net_liq=%.2f drawdown=%.2f%% (limit=%.2f%%). "
+                            "Halting NEW entries for the rest of the day; exits still allowed.",
+                            daily_day,
+                            day_start_net_liq,
+                            float(net_liq),
+                            dd * 100.0,
+                            abs(float(daily_loss_stop_pct)) * 100.0,
+                        )
 
             # STEP 1: Check existing positions for exit signals
             try:
@@ -555,6 +604,17 @@ async def watch_mode(
                     logger.debug(f"Waiting for more data for {symbol} (need at least 5 bars)")
 
             # STEP 3: Generate entry signals and execute trades
+            if entries_halted_for_day:
+                if last_halt_log_day != daily_day:
+                    logger.warning(
+                        "NEW_ENTRIES_HALTED day=%s reason=DAILY_KILL_SWITCH (loss > %.2f%%)",
+                        daily_day,
+                        abs(float(daily_loss_stop_pct)) * 100.0,
+                    )
+                    last_halt_log_day = daily_day
+                await asyncio.sleep(check_interval)
+                continue
+
             signals = []
             for symbol in symbols:
                 symbol_upper = symbol.upper()
@@ -609,6 +669,12 @@ async def watch_mode(
                             logger.warning(f"Trade journal signal logging failed for {symbol_upper}: {journal_err}")
 
                     if signal != 0:
+                        if int(signal) == -1 and not allow_shorts:
+                            logger.info(
+                                "Skipping SHORT entry for %s (shorts disabled; use --enable-shorts to allow).",
+                                symbol_upper,
+                            )
+                            continue
                         signals.append(f"{symbol}: {signal}")
                         logger.debug(f"Generated signal {signal} for {symbol}")
                         trade_id = _next_trade_id()
@@ -865,6 +931,18 @@ def parse_args():
     parser.add_argument("--client-id", type=int, default=1, help="IBKR client ID")
     parser.add_argument("--paper", action="store_true", help="Use paper trading")
     parser.add_argument(
+        "--enable-shorts",
+        action="store_true",
+        help="Allow NEW short entries in watch mode (default: off; focus on LONG only).",
+    )
+    parser.add_argument(
+        "--daily-loss-stop-pct",
+        type=float,
+        default=0.02,
+        metavar="PCT",
+        help="Daily kill-switch: if net liquidation drawdown exceeds this fraction (e.g. 0.02=2%%), halt NEW entries for the rest of the ET day. Exits still allowed. Default 0.02.",
+    )
+    parser.add_argument(
         "--allow-closed-market",
         action="store_true",
         help="Paper only: run watch loop and equity orders outside US RTH (extended-hours diagnostics)",
@@ -895,7 +973,14 @@ def parse_args():
     parser.add_argument("--vwap-threshold", type=float, default=0.5, help="VWAP threshold for entry")
     parser.add_argument("--phase2-rules", action="store_true", help="Use Phase 2 trading rules")
     parser.add_argument("--zone-lookback", type=int, default=4, help="Bars to look back for supply/demand zones")
-    parser.add_argument("--adx-min", type=float, default=15.0, help="Minimum ADX for zone validity")
+    parser.add_argument("--adx-min", type=float, default=25.0, help="Minimum ADX for zone validity")
+    parser.add_argument(
+        "--long-min-rsi",
+        type=float,
+        default=0.0,
+        metavar="R",
+        help="Groq strategy: for LONG entries only, require last-bar RSI > R (0 = off).",
+    )
     parser.add_argument("--zone-freshness-hours", type=float, default=12.0, help="Max hours a zone stays valid")
     parser.add_argument("--volume-breakout-mult", type=float, default=1.1, help="Volume multiplier for breakout bar")
     parser.add_argument("--volume-confirm-mult", type=float, default=1.05, help="Volume multiplier for confirmation bar")
@@ -930,6 +1015,7 @@ async def main():
     groq_extra = {
         "zone_lookback": args.zone_lookback,
         "adx_min": args.adx_min,
+        "long_min_rsi": args.long_min_rsi,
         "zone_freshness_hours": args.zone_freshness_hours,
         "volume_breakout_mult": args.volume_breakout_mult,
         "volume_confirm_mult": args.volume_confirm_mult,
@@ -1063,6 +1149,8 @@ async def main():
                     paper_margin_gates_interval_sec=(
                         args.paper_margin_gates_interval if args.paper else 0
                     ),
+                    allow_shorts=bool(args.enable_shorts),
+                    daily_loss_stop_pct=float(args.daily_loss_stop_pct),
                 )
             finally:
                 if journal and run_id:
@@ -1203,6 +1291,8 @@ async def main():
                             memory=memory,
                             run_id=run_id,
                             snapshot_interval_sec=args.journal_snapshot_interval,
+                            allow_shorts=bool(args.enable_shorts),
+                            daily_loss_stop_pct=float(args.daily_loss_stop_pct),
                         )
                     finally:
                         if journal and run_id:
