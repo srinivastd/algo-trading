@@ -171,6 +171,26 @@ class TradeJournal:
                 CREATE INDEX IF NOT EXISTS idx_orders_trade
                     ON orders(trade_id);
 
+                CREATE TABLE IF NOT EXISTS ib_executions (
+                    exec_id TEXT PRIMARY KEY,
+                    order_id INTEGER NOT NULL,
+                    perm_id INTEGER,
+                    client_id INTEGER,
+                    symbol TEXT NOT NULL,
+                    side TEXT,
+                    shares REAL NOT NULL,
+                    price REAL NOT NULL,
+                    time TEXT NOT NULL,
+                    commission REAL,
+                    trade_id TEXT,
+                    ingested_at TEXT NOT NULL,
+                    FOREIGN KEY (trade_id) REFERENCES trades(trade_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_ib_executions_order
+                    ON ib_executions(order_id);
+                CREATE INDEX IF NOT EXISTS idx_ib_executions_symbol_time
+                    ON ib_executions(symbol, time);
+
                 CREATE TABLE IF NOT EXISTS daily_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     date TEXT NOT NULL,
@@ -203,6 +223,43 @@ class TradeJournal:
             self._ensure_column(con, "trades", "classification_score", "INTEGER")
             self._ensure_column(con, "trades", "classification_rationale", "TEXT")
             self._ensure_column(con, "daily_snapshots", "ib_daily_pnl", "REAL")
+            self._ensure_ib_executions_table(con)
+            self._ensure_fills_exec_id_unique_index(con)
+
+    def _ensure_ib_executions_table(self, con: sqlite3.Connection) -> None:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ib_executions (
+                exec_id TEXT PRIMARY KEY,
+                order_id INTEGER NOT NULL,
+                perm_id INTEGER,
+                client_id INTEGER,
+                symbol TEXT NOT NULL,
+                side TEXT,
+                shares REAL NOT NULL,
+                price REAL NOT NULL,
+                time TEXT NOT NULL,
+                commission REAL,
+                trade_id TEXT,
+                ingested_at TEXT NOT NULL,
+                FOREIGN KEY (trade_id) REFERENCES trades(trade_id)
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ib_executions_order ON ib_executions(order_id)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ib_executions_symbol_time ON ib_executions(symbol, time)"
+        )
+
+    def _ensure_fills_exec_id_unique_index(self, con: sqlite3.Connection) -> None:
+        con.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_fills_exec_id
+            ON fills(exec_id) WHERE exec_id IS NOT NULL AND length(exec_id) > 0
+            """
+        )
 
     @staticmethod
     def _column_exists(con: sqlite3.Connection, table: str, column: str) -> bool:
@@ -397,6 +454,49 @@ class TradeJournal:
                 ),
             )
 
+    def resolve_trade_id_for_order(self, order_id: int | None) -> str | None:
+        """Resolve ``trade_id`` from ``orders`` or bracket columns on ``trades``."""
+        if order_id is None or int(order_id) <= 0:
+            return None
+        oid = int(order_id)
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT trade_id FROM orders WHERE order_id = ? AND trade_id IS NOT NULL LIMIT 1",
+                (oid,),
+            ).fetchone()
+            if row and row[0]:
+                return str(row[0])
+            row = con.execute(
+                """
+                SELECT trade_id FROM trades
+                WHERE order_id = ? OR stop_order_id = ? OR target_order_id = ?
+                LIMIT 1
+                """,
+                (oid, oid, oid),
+            ).fetchone()
+            if row and row[0]:
+                return str(row[0])
+        return None
+
+    @staticmethod
+    def _infer_is_entry_for_order(
+        con: sqlite3.Connection, trade_id: str, order_id: int
+    ) -> bool:
+        row = con.execute(
+            "SELECT order_id, stop_order_id, target_order_id FROM trades WHERE trade_id = ?",
+            (trade_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        entry_oid, stop_oid, tgt_oid = row[0], row[1], row[2]
+        if entry_oid is not None and int(entry_oid) == int(order_id):
+            return True
+        if stop_oid is not None and int(stop_oid) == int(order_id):
+            return False
+        if tgt_oid is not None and int(tgt_oid) == int(order_id):
+            return False
+        return False
+
     def record_fill(
         self,
         *,
@@ -411,26 +511,189 @@ class TradeJournal:
         time: Any,
         is_entry: bool,
     ) -> None:
+        ex = (exec_id or "").strip()
         with self._conn() as con:
+            if ex:
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO fills(
+                        trade_id, order_id, exec_id, symbol, side, qty, price, commission, time, is_entry
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_id,
+                        order_id,
+                        ex,
+                        symbol.upper(),
+                        side,
+                        float(qty),
+                        float(price),
+                        commission,
+                        _to_iso(time),
+                        1 if is_entry else 0,
+                    ),
+                )
+            else:
+                con.execute(
+                    """
+                    INSERT INTO fills(
+                        trade_id, order_id, exec_id, symbol, side, qty, price, commission, time, is_entry
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_id,
+                        order_id,
+                        None,
+                        symbol.upper(),
+                        side,
+                        float(qty),
+                        float(price),
+                        commission,
+                        _to_iso(time),
+                        1 if is_entry else 0,
+                    ),
+                )
+
+    def ingest_ib_execution_fill(self, fill: Any) -> None:
+        """
+        Real-time path: persist IB ``Fill`` / execution into ``ib_executions`` and ``fills``
+        when ``exec_id`` is present (deduped) and ``order_id`` maps to a ``trade_id``.
+        """
+        ex = getattr(fill, "execution", None)
+        contract = getattr(fill, "contract", None)
+        if ex is None:
+            return
+        exec_id = (getattr(ex, "execId", None) or "").strip()
+        if not exec_id:
+            return
+        try:
+            oid = int(getattr(ex, "orderId", 0) or 0)
+        except (TypeError, ValueError):
+            oid = 0
+        sym = str(getattr(contract, "symbol", "") or "").strip().upper()
+        if not sym:
+            return
+        side = getattr(ex, "side", None)
+        try:
+            shares = float(getattr(ex, "shares", 0) or 0)
+            price = float(getattr(ex, "price", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        t = getattr(ex, "time", None)
+        comm: float | None = None
+        cr = getattr(fill, "commissionReport", None)
+        if cr is not None:
+            try:
+                c = float(getattr(cr, "commission", 0) or 0)
+                comm = c
+            except (TypeError, ValueError):
+                pass
+        try:
+            perm_id = int(getattr(ex, "permId", 0) or 0) or None
+        except (TypeError, ValueError):
+            perm_id = None
+        try:
+            client_id = int(getattr(ex, "clientId", 0) or 0) or None
+        except (TypeError, ValueError):
+            client_id = None
+
+        now = datetime.utcnow().isoformat()
+        with self._conn() as con:
+            tid: str | None = None
+            if oid > 0:
+                row = con.execute(
+                    "SELECT trade_id FROM orders WHERE order_id = ? AND trade_id IS NOT NULL LIMIT 1",
+                    (oid,),
+                ).fetchone()
+                if row and row[0]:
+                    tid = str(row[0])
+                if not tid:
+                    row = con.execute(
+                        """
+                        SELECT trade_id FROM trades
+                        WHERE order_id = ? OR stop_order_id = ? OR target_order_id = ?
+                        LIMIT 1
+                        """,
+                        (oid, oid, oid),
+                    ).fetchone()
+                    if row and row[0]:
+                        tid = str(row[0])
             con.execute(
                 """
-                INSERT INTO fills(
-                    trade_id, order_id, exec_id, symbol, side, qty, price, commission, time, is_entry
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO ib_executions(
+                    exec_id, order_id, perm_id, client_id, symbol, side, shares, price, time,
+                    commission, trade_id, ingested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(exec_id) DO UPDATE SET
+                    commission = COALESCE(excluded.commission, ib_executions.commission),
+                    trade_id = COALESCE(excluded.trade_id, ib_executions.trade_id),
+                    ingested_at = excluded.ingested_at
                 """,
                 (
-                    trade_id,
-                    order_id,
                     exec_id,
-                    symbol.upper(),
-                    side,
-                    float(qty),
-                    float(price),
-                    commission,
-                    _to_iso(time),
-                    1 if is_entry else 0,
+                    oid,
+                    perm_id,
+                    client_id,
+                    sym,
+                    str(side) if side is not None else None,
+                    shares,
+                    price,
+                    _to_iso(t),
+                    comm,
+                    tid,
+                    now,
                 ),
             )
+            if tid and oid > 0:
+                is_entry = self._infer_is_entry_for_order(con, tid, oid)
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO fills(
+                        trade_id, order_id, exec_id, symbol, side, qty, price, commission, time, is_entry
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        tid,
+                        oid,
+                        exec_id,
+                        sym,
+                        str(side) if side is not None else None,
+                        shares,
+                        price,
+                        comm,
+                        _to_iso(t),
+                        1 if is_entry else 0,
+                    ),
+                )
+
+    def apply_ib_commission_report(self, fill: Any, commission: float | None) -> None:
+        """Update ``ib_executions`` and ``fills`` when IB sends a standalone commission report."""
+        ex = getattr(fill, "execution", None)
+        if ex is None or commission is None:
+            return
+        exec_id = (getattr(ex, "execId", None) or "").strip()
+        if not exec_id:
+            return
+        with self._conn() as con:
+            con.execute(
+                "UPDATE ib_executions SET commission = ? WHERE exec_id = ?",
+                (float(commission), exec_id),
+            )
+            con.execute(
+                "UPDATE fills SET commission = ? WHERE exec_id = ?",
+                (float(commission), exec_id),
+            )
+
+    def backfill_executions_from_ib_fills(self, fills: list[Any]) -> int:
+        """Ingest a batch from ``reqExecutionsAsync`` (e.g. at watch startup). Returns count processed."""
+        n = 0
+        for f in fills or []:
+            try:
+                self.ingest_ib_execution_fill(f)
+                n += 1
+            except Exception:
+                continue
+        return n
 
     def mark_trade_entry_fill(
         self,
@@ -674,6 +937,28 @@ class TradeJournal:
         self._enrich_snapshot_pnl_fallbacks(d)
         return d
 
+    def get_daily_snapshot_last_for_date(self, date_yyyy_mm_dd: str) -> dict[str, Any] | None:
+        """Last ``daily_snapshots`` row for calendar ``date`` column (matches persisted snapshot day)."""
+        if not date_yyyy_mm_dd or len(date_yyyy_mm_dd) < 10:
+            return None
+        day = date_yyyy_mm_dd[:10]
+        with self._conn() as con:
+            row = con.execute(
+                """
+                SELECT id, date, time, net_liquidation, unrealized_pnl, realized_pnl_today, ib_daily_pnl, positions_json
+                FROM daily_snapshots
+                WHERE date = ?
+                ORDER BY time DESC
+                LIMIT 1
+                """,
+                (day,),
+            ).fetchone()
+        if row is None:
+            return None
+        d = self._daily_snapshot_row_to_dict(row)
+        self._enrich_snapshot_pnl_fallbacks(d)
+        return d
+
     def get_daily_snapshot_by_id(self, snapshot_id: int) -> dict[str, Any] | None:
         """Single ``daily_snapshots`` row by primary key (for UI ``id=…`` lines)."""
         with self._conn() as con:
@@ -705,6 +990,30 @@ class TradeJournal:
                 (lim,),
             ).fetchall()
         out = []
+        for row in rows:
+            d = self._daily_snapshot_row_to_dict(row)
+            self._enrich_snapshot_pnl_fallbacks(d)
+            out.append(d)
+        return out
+
+    def get_recent_daily_snapshots_for_date(self, date_yyyy_mm_dd: str, limit: int = 100) -> list[dict[str, Any]]:
+        """``daily_snapshots`` rows for a single calendar ``date`` (newest first)."""
+        if not date_yyyy_mm_dd or len(date_yyyy_mm_dd) < 10:
+            return []
+        day = date_yyyy_mm_dd[:10]
+        lim = max(1, min(int(limit), 500))
+        with self._conn() as con:
+            rows = con.execute(
+                """
+                SELECT id, date, time, net_liquidation, unrealized_pnl, realized_pnl_today, ib_daily_pnl, positions_json
+                FROM daily_snapshots
+                WHERE date = ?
+                ORDER BY time DESC
+                LIMIT ?
+                """,
+                (day, lim),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
         for row in rows:
             d = self._daily_snapshot_row_to_dict(row)
             self._enrich_snapshot_pnl_fallbacks(d)
@@ -756,11 +1065,18 @@ class TradeJournal:
         Each row also includes ``open_long`` / ``open_short`` and ``closed_long`` / ``closed_short``
         from the ``side`` column.
 
+        ``opened`` / ``exited``: with a **day** filter, ``opened`` = rows whose ``entry_fill_time``
+        falls on that calendar day; ``exited`` = rows closed that day (same count as ``closed`` in
+        that mode). **All-time:** ``opened`` = total ``trades`` rows for the symbol; ``exited`` =
+        lifetime closed count.
+
         If ``date_yyyy_mm_dd`` is provided (ISO YYYY-MM-DD), filters closed-trade stats to that
         calendar day (based on ``exit_fill_time``). Open positions are always current.
         """
         date_filter = ""
         params: list[str] = []
+        opened_expr: str
+        exited_expr: str
         if date_yyyy_mm_dd:
             date_filter = """
                   AND (
@@ -772,7 +1088,53 @@ class TradeJournal:
                       )
                   )
             """
-            params = [date_yyyy_mm_dd]
+            opened_expr = """
+                    SUM(
+                        CASE
+                            WHEN entry_fill_time IS NOT NULL
+                                 AND length(trim(entry_fill_time)) >= 10
+                                 AND substr(trim(entry_fill_time), 1, 10) = ?
+                            THEN 1 ELSE 0
+                        END
+                    ) AS opened_count,
+            """
+            exited_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND exit_fill_time IS NOT NULL
+                                 AND length(trim(exit_fill_time)) >= 10
+                                 AND substr(trim(exit_fill_time), 1, 10) = ?
+                            THEN 1 ELSE 0
+                        END
+                    ) AS exited_count,
+            """
+        else:
+            opened_expr = "COUNT(*) AS opened_count,\n"
+            exited_expr = """
+                    SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) AS exited_count,
+            """
+
+        if date_yyyy_mm_dd:
+            having_clause = """
+                HAVING SUM(CASE WHEN LOWER(TRIM(status)) = 'open' THEN 1 ELSE 0 END) > 0
+                    OR SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) > 0
+                    OR SUM(
+                        CASE
+                            WHEN entry_fill_time IS NOT NULL
+                                 AND length(trim(entry_fill_time)) >= 10
+                                 AND substr(trim(entry_fill_time), 1, 10) = ?
+                            THEN 1 ELSE 0
+                        END
+                    ) > 0
+            """
+            params = [date_yyyy_mm_dd, date_yyyy_mm_dd, date_yyyy_mm_dd, date_yyyy_mm_dd]
+        else:
+            having_clause = """
+                HAVING SUM(CASE WHEN LOWER(TRIM(status)) = 'open' THEN 1 ELSE 0 END) > 0
+                    OR SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) > 0
+            """
+            params = []
 
         with self._conn() as con:
             con.row_factory = sqlite3.Row
@@ -794,6 +1156,8 @@ class TradeJournal:
                             THEN 1 ELSE 0
                         END
                     ) AS open_short,
+                    {opened_expr}
+                    {exited_expr}
                     SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) AS closed,
                     SUM(
                         CASE
@@ -842,8 +1206,7 @@ class TradeJournal:
                 FROM trades
                 WHERE 1=1 {date_filter}
                 GROUP BY UPPER(TRIM(symbol))
-                HAVING SUM(CASE WHEN LOWER(TRIM(status)) = 'open' THEN 1 ELSE 0 END) > 0
-                    OR SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) > 0
+                {having_clause}
                 ORDER BY
                     SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN COALESCE(realized_pnl, 0) ELSE 0 END) DESC,
                     symbol ASC
@@ -858,6 +1221,8 @@ class TradeJournal:
                     "open": int(r["open_count"] or 0),
                     "open_long": int(r["open_long"] or 0),
                     "open_short": int(r["open_short"] or 0),
+                    "opened": int(r["opened_count"] or 0),
+                    "exited": int(r["exited_count"] or 0),
                     "closed": int(r["closed"] or 0),
                     "closed_long": int(r["closed_long"] or 0),
                     "closed_short": int(r["closed_short"] or 0),
@@ -869,6 +1234,280 @@ class TradeJournal:
                 }
             )
         return out
+
+    @staticmethod
+    def _compact_param_value(value: Any, max_str: int = 96, depth: int = 0) -> Any:
+        """Shrink nested structures for dashboard / API payloads."""
+        if depth > 3:
+            return "…"
+        if isinstance(value, dict):
+            items = list(value.items())[:28]
+            return {str(k): TradeJournal._compact_param_value(v, max_str, depth + 1) for k, v in items}
+        if isinstance(value, (list, tuple)):
+            seq = list(value)[:24]
+            return [TradeJournal._compact_param_value(v, max_str, depth + 1) for v in seq]
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return None
+        if isinstance(value, str) and len(value) > max_str:
+            return value[: max_str - 1] + "…"
+        return value
+
+    @staticmethod
+    def _split_indicator_entry_exit(snapshot: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Split ``indicator_snapshot_json`` into entry vs exit-ish keys (``exit_*`` prefix)."""
+        entry: dict[str, Any] = {}
+        exitish: dict[str, Any] = {}
+        for k, v in snapshot.items():
+            ks = str(k).lower()
+            if ks.startswith("exit_"):
+                exitish[str(k)] = v
+            else:
+                entry[str(k)] = v
+        return entry, exitish
+
+    def get_trades_touching_calendar_day(
+        self, date_yyyy_mm_dd: str, *, limit: int = 400
+    ) -> list[dict[str, Any]]:
+        """
+        Rows from ``trades`` whose **entry** or **exit** fill timestamp falls on ``date_yyyy_mm_dd``
+        (calendar prefix on ISO strings). Includes ``fills`` quantity sums and parsed indicator
+        snapshot (entry params vs any ``exit_*`` keys stored in the same JSON).
+
+        Sorted by symbol, then most recent exit or entry time.
+        """
+        day = date_yyyy_mm_dd.strip()[:10]
+        if len(day) != 10:
+            return []
+        lim = max(1, min(int(limit), 800))
+        with self._conn() as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                """
+                SELECT
+                    t.trade_id,
+                    t.run_id,
+                    t.symbol,
+                    t.side,
+                    t.status,
+                    t.signal_value,
+                    t.intended_entry_price,
+                    t.intended_shares,
+                    t.stop_loss,
+                    t.target,
+                    t.entry_fill_price,
+                    t.entry_fill_time,
+                    t.exit_fill_price,
+                    t.exit_fill_time,
+                    t.exit_reason,
+                    t.realized_pnl,
+                    t.commission,
+                    t.order_id,
+                    t.indicator_snapshot_json,
+                    (
+                        SELECT COALESCE(SUM(f.qty), 0)
+                        FROM fills f
+                        WHERE f.trade_id = t.trade_id AND f.is_entry = 1
+                    ) AS entry_qty_sum,
+                    (
+                        SELECT COALESCE(SUM(f.qty), 0)
+                        FROM fills f
+                        WHERE f.trade_id = t.trade_id AND f.is_entry = 0
+                    ) AS exit_qty_sum
+                FROM trades t
+                WHERE
+                    (
+                        t.entry_fill_time IS NOT NULL
+                        AND length(trim(t.entry_fill_time)) >= 10
+                        AND substr(trim(t.entry_fill_time), 1, 10) = ?
+                    )
+                    OR (
+                        t.exit_fill_time IS NOT NULL
+                        AND length(trim(t.exit_fill_time)) >= 10
+                        AND substr(trim(t.exit_fill_time), 1, 10) = ?
+                    )
+                ORDER BY UPPER(TRIM(t.symbol)) ASC,
+                    COALESCE(t.exit_fill_time, t.entry_fill_time, t.created_at) DESC
+                LIMIT ?
+                """,
+                (day, day, lim),
+            ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            raw_json = r["indicator_snapshot_json"] or "{}"
+            try:
+                snap = json.loads(raw_json) if isinstance(raw_json, str) else {}
+            except json.JSONDecodeError:
+                snap = {}
+            if not isinstance(snap, dict):
+                snap = {}
+            entry_keys, exit_keys = self._split_indicator_entry_exit(snap)
+            et = (r["entry_fill_time"] or "").strip()
+            xt = (r["exit_fill_time"] or "").strip()
+            entry_day = et[:10] if len(et) >= 10 else None
+            exit_day = xt[:10] if len(xt) >= 10 else None
+            touch_parts: list[str] = []
+            if entry_day == day:
+                touch_parts.append("entry")
+            if exit_day == day:
+                touch_parts.append("exit")
+            out.append(
+                {
+                    "trade_id": r["trade_id"],
+                    "run_id": r["run_id"],
+                    "symbol": (r["symbol"] or "").strip().upper(),
+                    "side": (r["side"] or "").strip().upper(),
+                    "status": (r["status"] or "").strip().lower(),
+                    "signal_value": int(r["signal_value"] or 0),
+                    "intended_shares": int(r["intended_shares"] or 0),
+                    "intended_entry_price": float(r["intended_entry_price"] or 0.0),
+                    "stop_loss": float(r["stop_loss"]) if r["stop_loss"] is not None else None,
+                    "target": float(r["target"]) if r["target"] is not None else None,
+                    "entry_fill_qty": float(r["entry_qty_sum"] or 0.0),
+                    "exit_fill_qty": float(r["exit_qty_sum"] or 0.0),
+                    "entry_fill_price": float(r["entry_fill_price"]) if r["entry_fill_price"] is not None else None,
+                    "entry_fill_time": r["entry_fill_time"],
+                    "exit_fill_price": float(r["exit_fill_price"]) if r["exit_fill_price"] is not None else None,
+                    "exit_fill_time": r["exit_fill_time"],
+                    "exit_reason": r["exit_reason"],
+                    "realized_pnl": float(r["realized_pnl"]) if r["realized_pnl"] is not None else None,
+                    "commission": float(r["commission"]) if r["commission"] is not None else None,
+                    "order_id": int(r["order_id"]) if r["order_id"] is not None else None,
+                    "entry_calendar_day": entry_day,
+                    "exit_calendar_day": exit_day,
+                    "touch": "+".join(touch_parts) if touch_parts else "",
+                    "entry_params": self._compact_param_value(entry_keys),
+                    "exit_params_from_snapshot": self._compact_param_value(exit_keys),
+                }
+            )
+        return out
+
+    def purge_journal_before_calendar_date(self, first_day_to_keep: str) -> dict[str, int]:
+        """
+        Remove misleading history **strictly before** ``first_day_to_keep`` (``YYYY-MM-DD``).
+
+        Deletes ``daily_snapshots`` with ``date`` before that day; ``runs`` whose ``started_at``
+        date is before that day (and dependent ``signals``, ``trades``, ``fills``, ``orders``,
+        ``ib_executions`` rows); ``market_regimes`` and ``execution_quality`` rows dated before
+        that day; and any remaining ``ib_executions`` with fill ``time`` before that day.
+
+        Rows on or after ``first_day_to_keep`` are kept.
+        """
+        day = first_day_to_keep.strip()[:10]
+        if len(day) != 10 or day[4] != "-" or day[7] != "-":
+            raise ValueError(f"first_day_to_keep must be YYYY-MM-DD, got {first_day_to_keep!r}")
+        stats: dict[str, int] = {}
+        with self._conn() as con:
+            cur = con.execute("DELETE FROM daily_snapshots WHERE date < ?", (day,))
+            stats["daily_snapshots_deleted"] = cur.rowcount
+
+            cur = con.execute(
+                """
+                DELETE FROM market_regimes
+                WHERE length(trim(timestamp)) >= 10
+                  AND substr(trim(timestamp), 1, 10) < ?
+                """,
+                (day,),
+            )
+            stats["market_regimes_deleted"] = cur.rowcount
+
+            cur = con.execute(
+                """
+                DELETE FROM execution_quality
+                WHERE length(trim(updated_at)) >= 10
+                  AND substr(trim(updated_at), 1, 10) < ?
+                """,
+                (day,),
+            )
+            stats["execution_quality_deleted"] = cur.rowcount
+
+            cur = con.execute(
+                """
+                DELETE FROM fills WHERE trade_id IN (
+                    SELECT trade_id FROM trades WHERE run_id IN (
+                        SELECT run_id FROM runs
+                        WHERE length(trim(started_at)) >= 10
+                          AND substr(trim(started_at), 1, 10) < ?
+                    )
+                )
+                """,
+                (day,),
+            )
+            stats["fills_deleted"] = cur.rowcount
+
+            cur = con.execute(
+                """
+                DELETE FROM orders WHERE trade_id IN (
+                    SELECT trade_id FROM trades WHERE run_id IN (
+                        SELECT run_id FROM runs
+                        WHERE length(trim(started_at)) >= 10
+                          AND substr(trim(started_at), 1, 10) < ?
+                    )
+                )
+                """,
+                (day,),
+            )
+            stats["orders_deleted"] = cur.rowcount
+
+            cur = con.execute(
+                """
+                DELETE FROM ib_executions WHERE trade_id IN (
+                    SELECT trade_id FROM trades WHERE run_id IN (
+                        SELECT run_id FROM runs
+                        WHERE length(trim(started_at)) >= 10
+                          AND substr(trim(started_at), 1, 10) < ?
+                    )
+                )
+                """,
+                (day,),
+            )
+            stats["ib_executions_deleted_for_old_trades"] = cur.rowcount
+
+            cur = con.execute(
+                """
+                DELETE FROM trades WHERE run_id IN (
+                    SELECT run_id FROM runs
+                    WHERE length(trim(started_at)) >= 10
+                      AND substr(trim(started_at), 1, 10) < ?
+                )
+                """,
+                (day,),
+            )
+            stats["trades_deleted"] = cur.rowcount
+
+            cur = con.execute(
+                """
+                DELETE FROM signals WHERE run_id IN (
+                    SELECT run_id FROM runs
+                    WHERE length(trim(started_at)) >= 10
+                      AND substr(trim(started_at), 1, 10) < ?
+                )
+                """,
+                (day,),
+            )
+            stats["signals_deleted"] = cur.rowcount
+
+            cur = con.execute(
+                """
+                DELETE FROM runs
+                WHERE length(trim(started_at)) >= 10
+                  AND substr(trim(started_at), 1, 10) < ?
+                """,
+                (day,),
+            )
+            stats["runs_deleted"] = cur.rowcount
+
+            cur = con.execute(
+                """
+                DELETE FROM ib_executions
+                WHERE length(trim(time)) >= 10
+                  AND substr(trim(time), 1, 10) < ?
+                """,
+                (day,),
+            )
+            stats["ib_executions_deleted_by_fill_time"] = cur.rowcount
+
+        return stats
 
     def get_available_dates(self) -> list[str]:
         """Return distinct calendar dates (YYYY-MM-DD) from daily_snapshots and trades, newest first."""

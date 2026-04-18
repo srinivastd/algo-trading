@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 from .base import StrategyBase
 import logging
 from pytz import timezone
@@ -531,107 +531,125 @@ class GroqRecommendationsStrategy(StrategyBase):
             break
 
         return out
-        
-    async def generate_exit_signals(self, df: pd.DataFrame, position_type: str) -> int:
+
+    def _long_exit_bar_detail(self, df: pd.DataFrame) -> Optional[str]:
         """
-        Optional live-only exits (momentum, zone reversals, ADX). ``backtest()`` does not call this;
-        watch mode runs it only when ``main.py`` is started with ``--strategy-exit-signals``.
+        If LONG exit rules fire on the last bar of ``df``, return a stable tag (else None).
+        Priority matches evaluation order of the original boolean helper.
         """
         if len(df) < 3:
-            return 0
-        
-        df = self.calculate_indicators(df)
-        current_price = df['close'].iloc[-1]
-        prev_price = df['close'].iloc[-2]
+            return None
+        current_price = float(df["close"].iloc[-1])
+        prev_price = float(df["close"].iloc[-2])
         current_time = df.index[-1]
-        
-        # Get current momentum indicators
-        current_adx = df['adx'].iloc[-1] if 'adx' in df.columns else 50
-        prev_price = float(prev_price)
-        current_price = float(current_price)
-        price_change = (
-            (current_price - prev_price) / prev_price if prev_price != 0 else 0.0
-        )
-        
-        supply_zones, demand_zones = self.identify_zones(df)
-        
-        if position_type == 'long':
-            # Exit long position conditions:
-            # 1. Price breaks below recent demand zone
-            # 2. Strong bearish momentum (price drop > 2% in recent bar)
-            # 3. ADX showing strong trend but price moving against position
-            # 4. Price breaks below recent support
-            for zone_time, zone_high, zone_low in demand_zones:
-                if ((current_time - zone_time) < timedelta(hours=24) and 
-                    current_price < zone_low and
-                    price_change < -0.015):  # 1.5% price decrease - potential reversal point
-                    price_change_pct = price_change * 100
-                    time_diff_hours = (current_time - zone_time).total_seconds() / 3600
-                    logger.info(f"🚪 EXIT LONG SIGNAL: Price broke below demand zone at ${current_price:.2f}")
-                    logger.info(f"   Zone Low: ${zone_low:.2f}")
-                    logger.info(f"   Price Change: {price_change_pct:.2f}%")
-                    logger.info(f"   Zone Age: {time_diff_hours:.1f} hours")
-                    logger.info(f"   Zone Range: ${zone_low:.2f} - ${zone_high:.2f}")
-                    return 1  # Exit long
-            
-            # Exit on strong bearish momentum or adverse trend
-            if price_change < -0.02 or (current_adx > 30 and df['minus_di'].iloc[-1] > df['plus_di'].iloc[-1]):  # 2% drop or bearish trend
-                price_change_pct = price_change * 100
-                logger.info(f"🚪 EXIT LONG SIGNAL: Strong bearish momentum or trend at ${current_price:.2f}")
-                logger.info(f"   Price Change: {price_change_pct:.2f}%")
-                logger.info(f"   Current Price: ${current_price:.2f}")
-                logger.info(f"   Previous Price: ${prev_price:.2f}")
-                logger.info(f"   ADX: {current_adx:.2f}")
-                return 1  # Exit long
-            
-            # Exit if price breaks below recent support
-            if len(df) >= 10:
-                recent_low = df['low'].iloc[-10:].min()
-                if current_price < recent_low * 0.995:  # 0.5% below recent support
-                    logger.info(f"🚪 EXIT LONG SIGNAL: Price broke below support at ${current_price:.2f}")
-                    logger.info(f"   Recent Support: ${recent_low:.2f}")
-                    logger.info(f"   Break Level: ${recent_low * 0.995:.2f}")
-                    return 1  # Exit long
-        
-        elif position_type == 'short':
-            # Exit short position conditions:
-            # 1. Price breaks below recent demand zone
-            # 2. Strong bullish momentum (price gain > 2% in recent bar)
-            # 3. ADX showing strong trend but price moving against position
-            # 4. Price breaks above recent resistance
-            for zone_time, zone_high, zone_low in demand_zones:
-                if ((current_time - zone_time) < timedelta(hours=24) and 
-                    current_price < zone_low and
-                    price_change < -0.015):  # 1.5% price decrease - potential reversal point
-                    price_change_pct = price_change * 100
-                    time_diff_hours = (current_time - zone_time).total_seconds() / 3600
-                    logger.info(f"🚪 EXIT SHORT SIGNAL: Price reached demand zone at ${current_price:.2f}")
-                    logger.info(f"   Zone Low: ${zone_low:.2f}")
-                    logger.info(f"   Price Change: {price_change_pct:.2f}%")
-                    logger.info(f"   Zone Age: {time_diff_hours:.1f} hours")
-                    logger.info(f"   Zone Range: ${zone_low:.2f} - ${zone_high:.2f}")
-                    return -1  # Exit short
-            
-            # Exit on strong bullish momentum or adverse trend
-            if price_change > 0.02 or (current_adx > 30 and df['plus_di'].iloc[-1] > df['minus_di'].iloc[-1]):  # 2% gain or bullish trend
-                price_change_pct = price_change * 100
-                logger.info(f"🚪 EXIT SHORT SIGNAL: Strong bullish momentum or trend at ${current_price:.2f}")
-                logger.info(f"   Price Change: {price_change_pct:.2f}%")
-                logger.info(f"   Current Price: ${current_price:.2f}")
-                logger.info(f"   Previous Price: ${prev_price:.2f}")
-                logger.info(f"   ADX: {current_adx:.2f}")
-                return -1  # Exit short
-            
-            # Exit if price breaks above recent resistance
-            if len(df) >= 10:
-                recent_high = df['high'].iloc[-10:].max()
-                if current_price > recent_high * 1.005:  # 0.5% above recent resistance
-                    logger.info(f"🚪 EXIT SHORT SIGNAL: Price broke above resistance at ${current_price:.2f}")
-                    logger.info(f"   Recent Resistance: ${recent_high:.2f}")
-                    logger.info(f"   Break Level: ${recent_high * 1.005:.2f}")
-                    return -1  # Exit short
-        
-        return 0  # Hold position
+        price_change = (current_price - prev_price) / prev_price if prev_price != 0 else 0.0
+        current_adx = float(df["adx"].iloc[-1]) if "adx" in df.columns else 50.0
+        _supply_zones, demand_zones = self.identify_zones(df)
+        for zone_time, zone_high, zone_low in demand_zones:
+            if (
+                (current_time - zone_time) < timedelta(hours=24)
+                and current_price < zone_low
+                and price_change < -0.015
+            ):
+                return "below_demand_zone"
+        if price_change < -0.02 or (
+            current_adx > 30 and df["minus_di"].iloc[-1] > df["plus_di"].iloc[-1]
+        ):
+            return "bearish_momentum_or_di"
+        if len(df) >= 10:
+            recent_low = df["low"].iloc[-10:].min()
+            if current_price < float(recent_low) * 0.995:
+                return "broke_swing_low"
+        return None
+
+    def _long_exit_bar_triggered(self, df: pd.DataFrame) -> bool:
+        """True if single-bar LONG exit rules would fire at ``df``'s last row (``df`` must include indicators)."""
+        return self._long_exit_bar_detail(df) is not None
+
+    def _short_exit_bar_detail(self, df: pd.DataFrame) -> Optional[str]:
+        """If SHORT exit rules fire on the last bar of ``df``, return a stable tag (else None)."""
+        if len(df) < 3:
+            return None
+        current_price = float(df["close"].iloc[-1])
+        prev_price = float(df["close"].iloc[-2])
+        current_time = df.index[-1]
+        price_change = (current_price - prev_price) / prev_price if prev_price != 0 else 0.0
+        current_adx = float(df["adx"].iloc[-1]) if "adx" in df.columns else 50.0
+        _supply_zones, demand_zones = self.identify_zones(df)
+        for zone_time, zone_high, zone_low in demand_zones:
+            if (
+                (current_time - zone_time) < timedelta(hours=24)
+                and current_price < zone_low
+                and price_change < -0.015
+            ):
+                return "demand_micro_structure"
+        if price_change > 0.02 or (
+            current_adx > 30 and df["plus_di"].iloc[-1] > df["minus_di"].iloc[-1]
+        ):
+            return "bullish_momentum_or_di"
+        if len(df) >= 10:
+            recent_high = df["high"].iloc[-10:].max()
+            if current_price > float(recent_high) * 1.005:
+                return "broke_swing_high"
+        return None
+
+    def _short_exit_bar_triggered(self, df: pd.DataFrame) -> bool:
+        """True if single-bar SHORT exit rules would fire at ``df``'s last row (``df`` must include indicators)."""
+        return self._short_exit_bar_detail(df) is not None
+
+    async def generate_exit_signals(
+        self, df: pd.DataFrame, position_type: str
+    ) -> Union[int, Tuple[int, str]]:
+        """
+        Live-only exits (momentum, zone reversals, ADX). ``backtest()`` does not call this.
+
+        Watch mode invokes this when ``main.py`` is run with strategy exit signals enabled
+        (default: ``--strategy-exit-signals``; disable with ``--no-strategy-exit-signals``).
+
+        Exit requires the **same** rule set to evaluate true on **two consecutive** completed bars
+        (reduces one-bar noise exits on RT data).
+
+        Returns ``(signal, reason)`` with ``reason`` like ``strategy_exit:below_demand_zone`` or
+        ``strategy_exit:2bar_mix:a+b`` when the confirming bars fired different rule tags.
+        """
+        if len(df) < 4:
+            return 0
+        d_last = self.calculate_indicators(df)
+        d_prev = self.calculate_indicators(df.iloc[:-1])
+        if len(d_prev) < 3:
+            return 0
+
+        if position_type == "long":
+            r_last = self._long_exit_bar_detail(d_last)
+            r_prev = self._long_exit_bar_detail(d_prev)
+            if r_last and r_prev:
+                px = float(d_last["close"].iloc[-1])
+                tag = r_last if r_last == r_prev else f"2bar_mix:{r_last}+{r_prev}"
+                logger.info(
+                    "🚪 EXIT LONG SIGNAL (2 consecutive bars): %s at $%.2f",
+                    tag,
+                    px,
+                )
+                return (1, f"strategy_exit:{tag}")
+
+            return (0, "")
+
+        if position_type == "short":
+            r_last = self._short_exit_bar_detail(d_last)
+            r_prev = self._short_exit_bar_detail(d_prev)
+            if r_last and r_prev:
+                px = float(d_last["close"].iloc[-1])
+                tag = r_last if r_last == r_prev else f"2bar_mix:{r_last}+{r_prev}"
+                logger.info(
+                    "🚪 EXIT SHORT SIGNAL (2 consecutive bars): %s at $%.2f",
+                    tag,
+                    px,
+                )
+                return (-1, f"strategy_exit:{tag}")
+
+            return (0, "")
+
+        return (0, "")
     
     async def execute_trade(self, symbol: str, signal: int, entry_price: float, shares: int, stop_loss: float, target: float) -> Dict:
         if not self.ib_client:

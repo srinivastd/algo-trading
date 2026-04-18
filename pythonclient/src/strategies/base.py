@@ -3,7 +3,7 @@ Base Strategy Class
 Defines the interface for all trading strategies.
 """
 import pandas as pd
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Union
 from abc import ABC, abstractmethod
 
 class StrategyBase(ABC):
@@ -48,19 +48,17 @@ class StrategyBase(ABC):
             return int(signals['signal'].iloc[-1])
         return 0
         
-    async def generate_exit_signals(self, df: pd.DataFrame, position_type: str) -> int:
-        """Generate exit signals for existing positions
-        
-        Args:
-            df: DataFrame with current market data and indicators
-            position_type: 'long' or 'short' to indicate current position type
-            
+    async def generate_exit_signals(
+        self, df: pd.DataFrame, position_type: str
+    ) -> Union[int, Tuple[int, str]]:
+        """Generate exit signals for existing positions.
+
         Returns:
-            int: Exit signal value (1 to exit long/enter short, -1 to exit short/enter long, 0 for hold)
+            ``(signal, reason)`` where signal is 1 / -1 / 0 and reason is a short tag for the journal
+            (empty string when holding). Implementations may still return a bare int ``0`` for hold-only
+            backward compatibility; ``main.watch_mode`` normalizes both shapes.
         """
-        # Default implementation - should be overridden by specific strategies
-        # For now, return 0 (hold) as a safe default
-        return 0
+        return (0, "")
         
     @abstractmethod
     async def backtest(self, df: pd.DataFrame, initial_capital: float = 100000, symbol: str = 'MSFT') -> Dict:

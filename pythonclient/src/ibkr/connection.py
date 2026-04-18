@@ -656,6 +656,32 @@ class IBKRConnection:
         except Exception as e:
             logger.debug("cancel_account_pnl_subscription: %s", e)
 
+    async def _sell_only_closes_or_reduces_long(self, symbol: str, quantity: int) -> bool:
+        """
+        True when SELL size is fully covered by an existing **long** stock position (close/trim only).
+        False for opening a short, adding to a short, or when flat (SELL would open short) — those
+        should still go through the rough BP share cap like BUY.
+        """
+        qty = max(0, int(quantity))
+        if qty <= 0:
+            return True
+        sym_u = symbol.upper()
+        try:
+            ib = self.get_ib()
+            positions = await ib.reqPositionsAsync()
+            for p in positions:
+                if p.contract.symbol.upper() != sym_u:
+                    continue
+                if getattr(p.contract, "secType", "") not in ("STK", ""):
+                    continue
+                pos = float(p.position)
+                if pos > 1e-6:
+                    return qty <= pos + 1e-3
+                return False
+        except Exception as e:
+            logger.debug("_sell_only_closes_or_reduces_long failed: %s", e)
+        return False
+
     async def pre_trade_check(self, symbol: str, action: str = "BUY", quantity: int = 100) -> Dict[str, Any]:
         """
         Comprehensive pre-trade gate that makes **paper behave like live**.
@@ -663,7 +689,9 @@ class IBKRConnection:
         - Uses ``get_account_margin_gate_snapshot()`` (DayTradesRemaining, SettledCash, BuyingPower...).
         - **PDT**: blocks if DayTradesRemaining==0.
         - **Settlement**: checks SettledCash for CASH accounts.
-        - **Buying power**: uses get_account_sizing_headroom().
+        - **Buying power** (rough share cap): applied to BUY and to SELL that **opens or adds**
+          a short (``reqPositions``: no long, or short already). **Skipped** only for SELL that
+          **only closes or trims** an existing long — that path does not need “purchase BP”.
         - **--lax-paper** (paper only) bypasses all gates for diagnostics.
 
         Returns dict with "allowed", "reason", full gates, etc.
@@ -731,25 +759,32 @@ class IBKRConnection:
                 )
                 return result
 
-        # Buying power / available funds check
-        headroom = await self.get_account_sizing_headroom()
-        bp = headroom.get("buying_power") or headroom.get("available_funds")
-        if bp is not None and bp > 0:
-            # Rough per-share estimate
-            est_price = 50.0  # placeholder; real price would be better
-            max_shares = int(bp * 0.85 / est_price)  # conservative
-            result["suggested_max_shares"] = max_shares
-            if quantity > max_shares * 2:  # very loose buffer
-                result.update({
-                    "allowed": False,
-                    "reason": f"INSUFFICIENT_BUYING_POWER (bp=${bp:,.0f}, max_shares~{max_shares})",
-                })
-                logger.warning(
-                    "PRE_TRADE_REJECTED symbol=%s action=%s qty=%s reason=INSUFFICIENT_BUYING_POWER "
-                    "buying_power=%.0f max_shares_est=%d",
-                    symbol.upper(), action.upper(), quantity, bp, max_shares
-                )
-                return result
+        # Buying power — rough share cap vs BP. Skip for SELL that only closes/trims a long
+        # (same bug as before: comparing exit qty to affordable *buy* size). Run for BUY,
+        # for SELL that opens/adds short, and for oversized SELL (long→short flip).
+        bp: Optional[float] = None
+        au = action.upper()
+        apply_bp_share_cap = True
+        if au == "SELL" and await self._sell_only_closes_or_reduces_long(symbol, quantity):
+            apply_bp_share_cap = False
+        if apply_bp_share_cap:
+            headroom = await self.get_account_sizing_headroom()
+            bp = headroom.get("buying_power") or headroom.get("available_funds")
+            if bp is not None and bp > 0:
+                est_price = 50.0  # placeholder; real price would be better
+                max_shares = int(bp * 0.85 / est_price)  # conservative
+                result["suggested_max_shares"] = max_shares
+                if quantity > max_shares * 2:  # very loose buffer
+                    result.update({
+                        "allowed": False,
+                        "reason": f"INSUFFICIENT_BUYING_POWER (bp=${bp:,.0f}, max_shares~{max_shares})",
+                    })
+                    logger.warning(
+                        "PRE_TRADE_REJECTED symbol=%s action=%s qty=%s reason=INSUFFICIENT_BUYING_POWER "
+                        "buying_power=%.0f max_shares_est=%d",
+                        symbol.upper(), action.upper(), quantity, bp, max_shares
+                    )
+                    return result
 
         logger.debug(
             "PRE_TRADE_ALLOWED symbol=%s action=%s dtr=%s bp=%.0f settled=%.0f acct=%s",

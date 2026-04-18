@@ -161,7 +161,7 @@ def _classify_trade(row: dict[str, Any]) -> tuple[str, int, str]:
     if reason in {"target"}:
         score += 12
         notes.append("target exit")
-    elif reason in {"strategy_signal", "signal"}:
+    elif reason in {"strategy_signal", "signal"} or reason.startswith("strategy_exit:"):
         score += 4
         notes.append("signal exit")
     elif reason in {"stop_loss", "stop"}:

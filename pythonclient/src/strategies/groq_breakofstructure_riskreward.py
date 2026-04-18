@@ -208,70 +208,56 @@ class GroqBreakOfStructureStrategy(StrategyBase):
                 
         return 0
         
-    async def generate_exit_signals(self, df: pd.DataFrame, position_type: str) -> int:
+    async def generate_exit_signals(self, df: pd.DataFrame, position_type: str):
         """Generate exit signals for existing positions based on break of structure reversals."""
         if len(df) < 3:
-            return 0
-            
+            return (0, "")
+
         df = self.calculate_indicators(df)
         current_price = df['close'].iloc[-1]
         prev_price = df['close'].iloc[-2]
         current_time = df.index[-1]
-        
+
         price_change = (current_price - prev_price) / prev_price
         supply_zones, demand_zones = self.identify_zones(df)
-        
+
         if position_type == 'long':
-            # Exit long position conditions for break of structure strategy:
-            # 1. Price breaks back below demand zone that was just broken
-            # 2. Strong bearish momentum (>1.5% drop)
-            # 3. Volume confirmation of reversal
-            
             for zone_time, zone_high, zone_low in demand_zones:
-                if ((current_time - zone_time) < timedelta(hours=12) and 
+                if ((current_time - zone_time) < timedelta(hours=12) and
                     current_price > zone_low and prev_price > zone_low and
-                    current_price < zone_high):  # Price pulled back into zone
+                    current_price < zone_high):
                     logger.debug(f"Exit long signal: Price pulled back into demand zone at {current_price:.2f}")
-                    return 1  # Exit long
-                    
-            # Exit on strong bearish momentum
-            if price_change < -0.015:  # 1.5% drop
+                    return (1, "strategy_exit:bos_pullback_demand")
+
+            if price_change < -0.015:
                 logger.debug(f"Exit long signal: Strong bearish momentum {price_change:.3f}")
-                return 1  # Exit long
-                
-            # Exit if ADX shows weakening trend
+                return (1, "strategy_exit:bos_bear_momentum")
+
             if 'adx' in df.columns and len(df) >= 5:
                 recent_adx = df['adx'].iloc[-3:].mean()
-                if recent_adx < 20:  # Weak trend
+                if recent_adx < 20:
                     logger.debug(f"Exit long signal: Weakening trend ADX {recent_adx:.2f}")
-                    return 1  # Exit long
-                    
+                    return (1, "strategy_exit:bos_weak_adx")
+
         elif position_type == 'short':
-            # Exit short position conditions:
-            # 1. Price breaks back above supply zone that was just broken
-            # 2. Strong bullish momentum (>1.5% gain)
-            # 3. Volume confirmation of reversal
-            
             for zone_time, zone_high, zone_low in supply_zones:
-                if ((current_time - zone_time) < timedelta(hours=12) and 
+                if ((current_time - zone_time) < timedelta(hours=12) and
                     current_price < zone_high and prev_price < zone_high and
-                    current_price > zone_low):  # Price pulled back into zone
+                    current_price > zone_low):
                     logger.debug(f"Exit short signal: Price pulled back into supply zone at {current_price:.2f}")
-                    return -1  # Exit short
-                    
-            # Exit on strong bullish momentum
-            if price_change > 0.015:  # 1.5% gain
+                    return (-1, "strategy_exit:bos_pullback_supply")
+
+            if price_change > 0.015:
                 logger.debug(f"Exit short signal: Strong bullish momentum {price_change:.3f}")
-                return -1  # Exit short
-                
-            # Exit if ADX shows weakening trend
+                return (-1, "strategy_exit:bos_bull_momentum")
+
             if 'adx' in df.columns and len(df) >= 5:
                 recent_adx = df['adx'].iloc[-3:].mean()
-                if recent_adx < 20:  # Weak trend
+                if recent_adx < 20:
                     logger.debug(f"Exit short signal: Weakening trend ADX {recent_adx:.2f}")
-                    return -1  # Exit short
-        
-        return 0  # Hold position
+                    return (-1, "strategy_exit:bos_weak_adx")
+
+        return (0, "")
         
     async def execute_trade(self, symbol: str, signal: int, entry_price: float, shares: int, stop_loss: float, target: float) -> Dict:
         """Execute a trade through IBKR"""

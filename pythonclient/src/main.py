@@ -7,6 +7,7 @@ import logging
 import argparse
 import sys
 from pathlib import Path
+from typing import Any, Tuple, Union
 from datetime import datetime, timedelta, time
 from uuid import uuid4
 import pytz
@@ -188,6 +189,114 @@ def _log_ib_account_pnl(pnl_ib: dict) -> None:
     )
 
 
+def _fill_execution_obj(f) -> Any:
+    """``reqExecutions`` / ``Fill`` objects expose nested ``execution``."""
+    return getattr(f, "execution", f)
+
+
+def _fill_order_id_from_obj(f) -> int:
+    ex = _fill_execution_obj(f)
+    try:
+        return int(getattr(ex, "orderId", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _aggregate_exit_fills_pnl(
+    matching_fills: list,
+    *,
+    is_long: bool,
+    avg_cost: float,
+) -> tuple[float, float, float, float, Any] | None:
+    """
+    From IB executions for one ``order_id``: (vwap_price, total_qty, realized_pnl, sum_commission, latest_time).
+    Long: realized = qty * (exit_vwap - avg_cost). Short: qty * (avg_cost - exit_vwap).
+    """
+    total_sh = 0.0
+    weighted_px = 0.0
+    total_comm = 0.0
+    latest_t = None
+    for f in matching_fills:
+        ex = _fill_execution_obj(f)
+        try:
+            sh = float(getattr(ex, "shares", 0) or 0)
+            px = float(getattr(ex, "price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if sh <= 0:
+            continue
+        total_sh += sh
+        weighted_px += sh * px
+        cr = getattr(f, "commissionReport", None)
+        if cr is not None:
+            try:
+                total_comm += float(getattr(cr, "commission", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        tt = getattr(ex, "time", None)
+        if tt is not None:
+            if latest_t is None:
+                latest_t = tt
+            else:
+                try:
+                    if tt > latest_t:
+                        latest_t = tt
+                except TypeError:
+                    pass
+    if total_sh <= 0:
+        return None
+    vwap = weighted_px / total_sh
+    if is_long:
+        realized = total_sh * (vwap - avg_cost)
+    else:
+        realized = total_sh * (avg_cost - vwap)
+    # ``total_comm`` is signed (IB reports commissions negative).
+    realized_net = realized + total_comm
+    return (vwap, total_sh, realized_net, total_comm, latest_t)
+
+
+def _aggregate_entry_fills_vwap(
+    matching_fills: list,
+) -> tuple[float, float, Any] | None:
+    """(vwap_price, total_qty, latest_time) for all partials on the parent entry order."""
+    total_sh = 0.0
+    weighted_px = 0.0
+    latest_t = None
+    for f in matching_fills:
+        ex = _fill_execution_obj(f)
+        try:
+            sh = float(getattr(ex, "shares", 0) or 0)
+            px = float(getattr(ex, "price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if sh <= 0:
+            continue
+        total_sh += sh
+        weighted_px += sh * px
+        tt = getattr(ex, "time", None)
+        if tt is not None:
+            if latest_t is None:
+                latest_t = tt
+            else:
+                try:
+                    if tt > latest_t:
+                        latest_t = tt
+                except TypeError:
+                    pass
+    if total_sh <= 0:
+        return None
+    return (weighted_px / total_sh, total_sh, latest_t)
+
+
+def _normalize_strategy_exit_signal(result: Union[int, Tuple[int, str]]) -> Tuple[int, str]:
+    """Strategies return either a bare int (legacy) or ``(signal, reason_tag)``."""
+    if isinstance(result, tuple):
+        sig = int(result[0])
+        reason = str(result[1]).strip() if len(result) > 1 else ""
+        return sig, reason
+    return int(result), "strategy_signal"
+
+
 async def watch_mode(
     symbols,
     strategy,
@@ -201,9 +310,22 @@ async def watch_mode(
     paper_margin_gates_interval_sec: int = 0,
     allow_shorts: bool = False,
     daily_loss_stop_pct: float = 0.02,
+    strategy_exit_signals: bool = True,
+    strategy_exit_min_unrealized_pct: float = 0.0,
 ):
     """Real-time watching mode for multiple stocks"""
     logger.info(f"Starting real-time watch for {symbols} with check interval {check_interval} seconds")
+    if not strategy_exit_signals:
+        logger.info(
+            "Strategy-driven programmatic exits are OFF (--no-strategy-exit-signals); "
+            "IB bracket stop/target orders still apply."
+        )
+    elif strategy_exit_min_unrealized_pct > 0:
+        logger.info(
+            "Strategy exits: suppressing signals while unrealized P&L %% is between 0 and %.2f%% "
+            "(losers still exit; use bracket target for larger wins).",
+            strategy_exit_min_unrealized_pct,
+        )
 
     allow_outside_rth = getattr(connection, "_allow_equity_orders_when_market_closed", False)
     if allow_outside_rth:
@@ -369,6 +491,39 @@ async def watch_mode(
 
         margin_gates_task = asyncio.create_task(_margin_gates_loop())
 
+    ib = connection.get_ib()
+    journal_exec_events_registered = False
+
+    def _journal_on_exec_details(trade, fill):
+        if journal:
+            try:
+                journal.ingest_ib_execution_fill(fill)
+            except Exception as exd_err:
+                logger.debug("journal execDetails ingest failed: %s", exd_err)
+
+    def _journal_on_commission_report(trade, fill, commissionReport):
+        if journal:
+            try:
+                if commissionReport is None:
+                    return
+                c = getattr(commissionReport, "commission", None)
+                if c is None:
+                    return
+                journal.apply_ib_commission_report(fill, float(c))
+            except Exception as cr_err:
+                logger.debug("journal commissionReport failed: %s", cr_err)
+
+    if journal:
+        ib.execDetailsEvent += _journal_on_exec_details
+        ib.commissionReportEvent += _journal_on_commission_report
+        journal_exec_events_registered = True
+        try:
+            backfill = await ib.reqExecutionsAsync()
+            n = journal.backfill_executions_from_ib_fills(backfill)
+            logger.info("Journal IB execution backfill: %d execution(s) from reqExecutions", n)
+        except Exception as bf_err:
+            logger.warning("Journal IB execution backfill failed: %s", bf_err)
+
     # Daily kill-switch: halt NEW entries when down > X% vs start-of-day net liquidation.
     # Exits are still allowed so we can flatten risk.
     et_tz = pytz.timezone("US/Eastern")
@@ -468,11 +623,37 @@ async def watch_mode(
                         if len(data_dict[pos_symbol]) >= 2:
                             df = strategy.calculate_indicators(data_dict[pos_symbol].copy())
 
-                            # Generate exit signal for this position
-                            if position_size > 0:  # Long position
-                                exit_signal = await strategy.generate_exit_signals(df, 'long')
-                            else:  # Short position
-                                exit_signal = await strategy.generate_exit_signals(df, 'short')
+                            # Generate exit signal for this position (optional; default on)
+                            exit_reason_tag = ""
+                            if strategy_exit_signals:
+                                if position_size > 0:
+                                    raw_exit = await strategy.generate_exit_signals(df, "long")
+                                else:
+                                    raw_exit = await strategy.generate_exit_signals(df, "short")
+                                exit_signal, exit_reason_tag = _normalize_strategy_exit_signal(raw_exit)
+                            else:
+                                exit_signal = 0
+
+                            if (
+                                strategy_exit_signals
+                                and exit_signal != 0
+                                and strategy_exit_min_unrealized_pct > 0
+                                and avg_cost > 0
+                            ):
+                                mark = float(df["close"].iloc[-1])
+                                if position_size > 0:
+                                    ur_pct = (mark - avg_cost) / avg_cost * 100.0
+                                else:
+                                    ur_pct = (avg_cost - mark) / avg_cost * 100.0
+                                if 0.0 <= ur_pct < float(strategy_exit_min_unrealized_pct):
+                                    logger.info(
+                                        "STRATEGY_EXIT_SUPPRESSED %s unrealized=%.3f%% (min_win=%.2f%%) reason_would_be=%s",
+                                        pos_symbol,
+                                        ur_pct,
+                                        strategy_exit_min_unrealized_pct,
+                                        exit_reason_tag or "strategy_signal",
+                                    )
+                                    exit_signal = 0
 
                             # Log position monitoring
                             position_data = {
@@ -493,7 +674,13 @@ async def watch_mode(
 
                             # Execute exit trade if signal indicates
                             if exit_signal != 0:
-                                logger.info(f"Exit signal {exit_signal} generated for position {pos_symbol}")
+                                er = exit_reason_tag or "strategy_signal"
+                                logger.info(
+                                    "Exit signal %s generated for position %s (%s)",
+                                    exit_signal,
+                                    pos_symbol,
+                                    er,
+                                )
                                 exit_action = 'SELL' if position_size > 0 else 'BUY'
                                 exit_quantity = abs(int(position_size))
                                 trade_id = active_trades.get(pos_symbol, {}).get('trade_id', 'UNKNOWN_TRADE')
@@ -510,7 +697,7 @@ async def watch_mode(
                                         'current_price': float(df['close'].iloc[-1]),
                                         'position_size': position_size,
                                         'avg_cost': avg_cost,
-                                        'exit_reason': 'strategy_signal'
+                                        'exit_reason': er,
                                     }
                                 }
                                 market_data_logger.info(json.dumps(exit_data))
@@ -534,34 +721,88 @@ async def watch_mode(
                                 market_data_logger.info(json.dumps(exit_result_data))
 
                                 if exit_result['status'] == 'success':
-                                    pnl = position_size * (float(df['close'].iloc[-1]) - avg_cost)
+                                    is_long = position_size > 0
+                                    bar_px = float(df["close"].iloc[-1])
+                                    oid_exit = exit_result.get("order_id")
+                                    if journal and trade_id != "UNKNOWN_TRADE" and oid_exit is not None:
+                                        try:
+                                            journal.upsert_order(
+                                                order_id=int(oid_exit),
+                                                trade_id=trade_id,
+                                                symbol=pos_symbol,
+                                                order_type="LMT",
+                                                action=exit_action,
+                                                qty=float(exit_quantity),
+                                                limit_price=bar_px,
+                                                status="submitted",
+                                                parent_order_id=None,
+                                            )
+                                        except Exception as ups_err:
+                                            logger.debug("journal upsert_order exit failed: %s", ups_err)
+                                    await asyncio.sleep(3.0)
+                                    exec_filter = ExecutionFilter(symbol=pos_symbol, time="1 D")
+                                    try:
+                                        executions = await connection.get_ib().reqExecutionsAsync(exec_filter)
+                                    except Exception as req_ex_err:
+                                        logger.debug("reqExecutionsAsync exit path: %s", req_ex_err)
+                                        executions = []
+                                    oid_int = int(oid_exit) if oid_exit is not None else 0
+                                    matching_exit = [
+                                        x for x in (executions or []) if _fill_order_id_from_obj(x) == oid_int
+                                    ]
+                                    for f in matching_exit:
+                                        if journal and trade_id != "UNKNOWN_TRADE":
+                                            try:
+                                                journal.ingest_ib_execution_fill(f)
+                                            except Exception as ing_err:
+                                                logger.debug("journal ingest exit fill: %s", ing_err)
+                                    agg = _aggregate_exit_fills_pnl(
+                                        matching_exit,
+                                        is_long=is_long,
+                                        avg_cost=avg_cost,
+                                    )
+                                    if agg is not None:
+                                        vwap_px, _qty_x, pnl, _comm_sum, latest_t = agg
+                                        fill_px = float(vwap_px)
+                                        if latest_t is not None and hasattr(latest_t, "astimezone"):
+                                            fill_time_exit = latest_t.astimezone(pytz.timezone("US/Eastern"))
+                                        else:
+                                            fill_time_exit = current_time
+                                    else:
+                                        if is_long:
+                                            pnl = float(exit_quantity) * (bar_px - avg_cost)
+                                        else:
+                                            pnl = float(exit_quantity) * (avg_cost - bar_px)
+                                        fill_px = bar_px
+                                        fill_time_exit = current_time
                                     logger.info(
                                         f"TRADE {trade_id}: Closed position {pos_symbol}: "
-                                        f"{exit_action} {exit_quantity} shares at ${df['close'].iloc[-1]:.2f}, PnL: ${pnl:.2f}"
+                                        f"{exit_action} {exit_quantity} sh @ ${fill_px:.2f}, PnL: ${pnl:.2f}"
                                     )
                                     at = active_trades.get(pos_symbol, {})
                                     if journal and trade_id != "UNKNOWN_TRADE":
                                         try:
                                             journal.close_trade(
                                                 trade_id=trade_id,
-                                                exit_fill_price=float(df['close'].iloc[-1]),
-                                                exit_fill_time=current_time,
-                                                exit_reason="strategy_signal",
+                                                exit_fill_price=float(fill_px),
+                                                exit_fill_time=fill_time_exit,
+                                                exit_reason=er,
                                                 realized_pnl=float(pnl),
                                                 status="closed",
                                             )
-                                            journal.record_fill(
-                                                trade_id=trade_id,
-                                                order_id=None,
-                                                exec_id=None,
-                                                symbol=pos_symbol,
-                                                side=exit_action,
-                                                qty=exit_quantity,
-                                                price=float(df['close'].iloc[-1]),
-                                                commission=None,
-                                                time=current_time,
-                                                is_entry=False,
-                                            )
+                                            if not matching_exit:
+                                                journal.record_fill(
+                                                    trade_id=trade_id,
+                                                    order_id=int(oid_exit) if oid_exit is not None else None,
+                                                    exec_id=None,
+                                                    symbol=pos_symbol,
+                                                    side=exit_action,
+                                                    qty=float(exit_quantity),
+                                                    price=float(fill_px),
+                                                    commission=None,
+                                                    time=fill_time_exit,
+                                                    is_entry=False,
+                                                )
                                         except Exception as journal_err:
                                             logger.warning(f"Trade journal close logging failed for {trade_id}: {journal_err}")
 
@@ -574,13 +815,13 @@ async def watch_mode(
                                                 side="LONG" if at.get("is_long", position_size > 0) else "SHORT",
                                                 signal_value=int(at.get("signal_value", -1 if position_size > 0 else 1)),
                                                 entry_price=_safe_float(at.get("entry_price")),
-                                                exit_price=float(df['close'].iloc[-1]),
+                                                exit_price=float(fill_px),
                                                 realized_pnl=float(pnl),
                                                 shares=_safe_float(at.get("shares", exit_quantity)),
                                                 entry_time=at.get("entry_time"),
                                                 exit_time=current_time,
                                                 entry_regime=at.get("entry_regime"),
-                                                exit_reason="strategy_signal",
+                                                exit_reason=er,
                                                 indicators=at.get("indicator_snapshot", {}),
                                             )
                                         except Exception as memory_err:
@@ -788,14 +1029,68 @@ async def watch_mode(
                                 logger.warning(f"Trade journal result logging failed for {trade_id}: {journal_err}")
 
                         if trade_result['status'] == 'success':
+                            pid = trade_result.get("order_id")
+                            if journal and pid is not None:
+                                try:
+                                    journal.upsert_order(
+                                        order_id=int(pid),
+                                        trade_id=trade_id,
+                                        symbol=symbol_upper,
+                                        order_type="LMT",
+                                        action="BUY" if signal == 1 else "SELL",
+                                        qty=float(shares),
+                                        limit_price=float(entry_price),
+                                        status="submitted",
+                                        parent_order_id=None,
+                                    )
+                                    so = trade_result.get("stop_order_id")
+                                    if so is not None:
+                                        journal.upsert_order(
+                                            order_id=int(so),
+                                            trade_id=trade_id,
+                                            symbol=symbol_upper,
+                                            order_type="STP",
+                                            action="SELL" if signal == 1 else "BUY",
+                                            qty=float(shares),
+                                            limit_price=None,
+                                            status="submitted",
+                                            parent_order_id=int(pid),
+                                        )
+                                    to = trade_result.get("target_order_id")
+                                    if to is not None:
+                                        journal.upsert_order(
+                                            order_id=int(to),
+                                            trade_id=trade_id,
+                                            symbol=symbol_upper,
+                                            order_type="LMT",
+                                            action="SELL" if signal == 1 else "BUY",
+                                            qty=float(shares),
+                                            limit_price=float(target),
+                                            status="submitted",
+                                            parent_order_id=int(pid),
+                                        )
+                                except Exception as ups_err:
+                                    logger.debug("journal upsert_order entry legs failed: %s", ups_err)
                             await asyncio.sleep(5)
                             exec_filter = ExecutionFilter(symbol=symbol, time="1 D")
                             executions = await connection.get_ib().reqExecutionsAsync(exec_filter)
-                            matching_execs = [exec for exec in executions if exec.orderId == trade_result['order_id']]
-                            if matching_execs:
-                                fill_time = matching_execs[0].time.astimezone(pytz.timezone('US/Eastern'))
-                                fill_price = float(matching_execs[0].price)
-                                fill_qty = float(matching_execs[0].shares)
+                            oid_parent = int(trade_result["order_id"]) if trade_result.get("order_id") is not None else 0
+                            matching_execs = [
+                                ex for ex in (executions or []) if _fill_order_id_from_obj(ex) == oid_parent
+                            ]
+                            for f in matching_execs:
+                                if journal:
+                                    try:
+                                        journal.ingest_ib_execution_fill(f)
+                                    except Exception as ing_err:
+                                        logger.debug("journal ingest entry fill: %s", ing_err)
+                            vwap_row = _aggregate_entry_fills_vwap(matching_execs)
+                            if vwap_row is not None:
+                                fill_price, fill_qty, latest_t = vwap_row
+                                if latest_t is not None and hasattr(latest_t, "astimezone"):
+                                    fill_time = latest_t.astimezone(pytz.timezone("US/Eastern"))
+                                else:
+                                    fill_time = current_time
                             else:
                                 fill_time = current_time
                                 fill_price = entry_price
@@ -826,18 +1121,19 @@ async def watch_mode(
                                         slippage_bps=slippage_bps,
                                         status="open",
                                     )
-                                    journal.record_fill(
-                                        trade_id=trade_id,
-                                        order_id=trade_result.get('order_id'),
-                                        exec_id=None,
-                                        symbol=symbol,
-                                        side='BUY' if signal == 1 else 'SELL',
-                                        qty=fill_qty,
-                                        price=fill_price,
-                                        commission=None,
-                                        time=fill_time,
-                                        is_entry=True,
-                                    )
+                                    if not matching_execs:
+                                        journal.record_fill(
+                                            trade_id=trade_id,
+                                            order_id=trade_result.get("order_id"),
+                                            exec_id=None,
+                                            symbol=symbol,
+                                            side="BUY" if signal == 1 else "SELL",
+                                            qty=fill_qty,
+                                            price=fill_price,
+                                            commission=None,
+                                            time=fill_time,
+                                            is_entry=True,
+                                        )
                                 except Exception as journal_err:
                                     logger.warning(f"Trade journal fill logging failed for {trade_id}: {journal_err}")
 
@@ -871,6 +1167,12 @@ async def watch_mode(
             try:
                 await margin_gates_task
             except asyncio.CancelledError:
+                pass
+        if journal_exec_events_registered:
+            try:
+                ib.execDetailsEvent -= _journal_on_exec_details
+                ib.commissionReportEvent -= _journal_on_commission_report
+            except Exception:
                 pass
         try:
             connection.get_ib().barUpdateEvent -= on_bar_update
@@ -963,6 +1265,21 @@ def parse_args():
     parser.add_argument("--live", action="store_true", help="Use live trading")
     parser.add_argument("--watch", action="store_true", help="Watch mode only")
     parser.add_argument("--check-interval", type=int, default=60, help="Check interval in seconds")
+    parser.add_argument(
+        "--strategy-exit-signals",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Watch mode: call strategy programmatic exits (e.g. Groq generate_exit_signals). Default on. "
+        "Use --no-strategy-exit-signals to disable (stop/target brackets unchanged).",
+    )
+    parser.add_argument(
+        "--strategy-exit-min-unrealized-pct",
+        type=float,
+        default=0.0,
+        metavar="PCT",
+        help="Watch mode: if >0, do not take programmatic strategy exits while unrealized P&L %% is in [0, PCT) "
+        "(still exit losers; lets winners reach bracket target or a larger signal). 0=off. Example: 2 or 3.",
+    )
     parser.add_argument("--backtest-only", action="store_true", help="Run backtest only")
     parser.add_argument("--risk-per-trade", type=float, default=1000.0, help="Risk per trade in dollars")
     parser.add_argument("--max-duration", type=float, default=12.0, help="Maximum trade duration in hours")
@@ -1130,8 +1447,16 @@ async def main():
                     run_id = journal.start_run(
                         strategy=args.strategy,
                         symbols=[s.upper() for s in args.symbols],
-                        params={**strategy_params, **groq_extra, "check_interval": args.check_interval},
-                    )
+                        params={
+                            **strategy_params,
+                            **groq_extra,
+                                    "check_interval": args.check_interval,
+                                    "strategy_exit_signals": bool(args.strategy_exit_signals),
+                                    "strategy_exit_min_unrealized_pct": float(
+                                        args.strategy_exit_min_unrealized_pct
+                                    ),
+                                },
+                            )
                 except Exception as run_err:
                     logger.warning(f"Could not start trade journal run: {run_err}")
                     run_id = None
@@ -1151,6 +1476,10 @@ async def main():
                     ),
                     allow_shorts=bool(args.enable_shorts),
                     daily_loss_stop_pct=float(args.daily_loss_stop_pct),
+                    strategy_exit_signals=bool(args.strategy_exit_signals),
+                    strategy_exit_min_unrealized_pct=float(
+                        args.strategy_exit_min_unrealized_pct
+                    ),
                 )
             finally:
                 if journal and run_id:
@@ -1275,7 +1604,15 @@ async def main():
                             run_id = journal.start_run(
                                 strategy=args.strategy,
                                 symbols=[s.upper() for s in args.symbols],
-                                params={**strategy_params, **groq_extra, "check_interval": args.check_interval},
+                                params={
+                                    **strategy_params,
+                                    **groq_extra,
+                                    "check_interval": args.check_interval,
+                                    "strategy_exit_signals": bool(args.strategy_exit_signals),
+                                    "strategy_exit_min_unrealized_pct": float(
+                                        args.strategy_exit_min_unrealized_pct
+                                    ),
+                                },
                             )
                         except Exception as run_err:
                             logger.warning(f"Could not start trade journal run: {run_err}")
@@ -1293,6 +1630,10 @@ async def main():
                             snapshot_interval_sec=args.journal_snapshot_interval,
                             allow_shorts=bool(args.enable_shorts),
                             daily_loss_stop_pct=float(args.daily_loss_stop_pct),
+                            strategy_exit_signals=bool(args.strategy_exit_signals),
+                            strategy_exit_min_unrealized_pct=float(
+                                args.strategy_exit_min_unrealized_pct
+                            ),
                         )
                     finally:
                         if journal and run_id:
