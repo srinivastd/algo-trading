@@ -1,0 +1,35 @@
+---
+description: Agent workflow — plan before code, then review and atomic commits for safe rollback
+alwaysApply: true
+---
+
+# Workflow (plan → implement → review → commit)
+
+Use this loop for non-trivial work (trading logic, IBKR, journal/schema, CLI behavior).
+
+## 1. Plan (before editing)
+
+- State the **goal** and **constraints** (backward compatibility, paper vs live, rollback).
+- List **files/APIs** you expect to touch and the **data contract** (returns, DB columns, log fields).
+- Note **edge cases** (long/short, partial fills, suppressions).
+- Decide **how to verify** (e.g. `py_compile`, one watch path, SQLite spot-check).
+
+Do not expand scope beyond the plan unless the user agrees.
+
+## 2. Implement
+
+- Match existing style and patterns in the repo; minimal diff for the task.
+- Prefer one **logical change** per commit (see below).
+
+## 3. Review
+
+- Run linters/compiler on touched files where applicable.
+- Re-read the diff for accidental scope creep, missing wiring (CLI → `watch_mode` → journal), and wrong defaults.
+
+## 4. Commit
+
+- **Atomic commits**: one cohesive change per commit so `git revert <sha>` cleanly rolls back one feature.
+- Message: Conventional-style short subject (e.g. `feat(watch): …`, `fix(ibkr): …`).
+- Do not bundle unrelated fixes, docs, and rules in the same commit as risky trading/IBKR changes unless the user asks.
+
+If the user requests a **rules-only** or **docs-only** change, commit it separately from executable code.
