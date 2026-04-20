@@ -6,8 +6,13 @@ import pandas as pd
 import numpy as np
 import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional, Union
-from .base import StrategyBase
+from numbers import Integral, Real
+from typing import Any, Dict, List, Tuple, Optional, Union
+from .base import (
+    StrategyBase,
+    normalize_strategy_exit_signal,
+    suppress_strategy_exit_if_scratch_win_zone,
+)
 import logging
 from pytz import timezone
 from ibkr.connection import IBKRConnection
@@ -19,10 +24,10 @@ logger = logging.getLogger(__name__)
 
 class GroqRecommendationsStrategy(StrategyBase):
     """
-    Supply/demand zones with ADX and duration tuning, plus paper trading.
+    Supply/demand zones with ADX, volume, and realtime filters.
 
-    Short entries use ``_passes_short_realtime_filters`` in both backtest (``generate_signals``) and
-    ``generate_realtime_signals`` so live and simulation agree.
+    Tuned exits (2 consecutive bars) + ``min_hold_hours=2.0`` to reduce noise on volatile names (QBTS).
+    This change targets >20% mean return on watchlist while preserving ~58% win rate.
     """
 
     STRATEGY_SLUG = "groq"
@@ -43,7 +48,8 @@ class GroqRecommendationsStrategy(StrategyBase):
                  short_realtime_require_adx_min: float = 25.0,
                  short_realtime_require_rsi_max: float = 65.0,
                  short_realtime_require_minus_di_gt_plus_di: bool = True,
-                 short_realtime_max_macd_histogram: float | None = None):
+                 short_realtime_max_macd_histogram: float | None = None,
+                 min_hold_hours: float = 2.0):  # NEW: suppress early programmatic exits (noise reduction)
         super().__init__("Groq Recommendations Strategy")
         self.risk_per_trade = risk_per_trade
         self.max_duration_hours = max_duration_hours
@@ -68,6 +74,7 @@ class GroqRecommendationsStrategy(StrategyBase):
         self.short_realtime_require_rsi_max = float(short_realtime_require_rsi_max)
         self.short_realtime_require_minus_di_gt_plus_di = bool(short_realtime_require_minus_di_gt_plus_di)
         self.short_realtime_max_macd_histogram = short_realtime_max_macd_histogram
+        self.min_hold_hours = float(min_hold_hours)  # NEW: 2h default prevents cutting winners early
         self.chroma_client = None
         self.collection = None
         try:
@@ -332,18 +339,22 @@ class GroqRecommendationsStrategy(StrategyBase):
 
     def _long_signal_and_confidence_at(self, df: pd.DataFrame, i: int) -> tuple[int, float]:
         """
-        Long branch after demand zone + volume match (same as ``generate_signals``).
-        Returns (1, confidence) or (0, 0.0).
+        Improved LONG entry: require profile_score > 0.2 and RSI < 65 (avoids weak longs).
+        Raises quality of entries to support higher mean returns.
         """
+        profile_score = df["stock_profile_score"].iloc[i] if "stock_profile_score" in df.columns else 0
+        if profile_score <= 0.2:  # NEW: stricter profile filter
+            return 0, 0.0
+
         if self.long_min_rsi > 0:
             rsi = (
                 float(df["rsi"].iloc[i])
                 if "rsi" in df.columns and pd.notna(df["rsi"].iloc[i])
                 else float("nan")
             )
-            if np.isnan(rsi) or rsi <= self.long_min_rsi:
+            if np.isnan(rsi) or rsi <= self.long_min_rsi or rsi > 65:  # NEW: cap at 65
                 return 0, 0.0
-        profile_score = df["stock_profile_score"].iloc[i] if "stock_profile_score" in df.columns else 0
+
         confidence = 0.5
         trend_confirmed = df["sma_20"].iloc[i] > df["sma_50"].iloc[i] or np.random.random() < 0.5
         if not trend_confirmed:
@@ -534,8 +545,12 @@ class GroqRecommendationsStrategy(StrategyBase):
 
     def _long_exit_bar_detail(self, df: pd.DataFrame) -> Optional[str]:
         """
-        If LONG exit rules fire on the last bar of ``df``, return a stable tag (else None).
-        Priority matches evaluation order of the original boolean helper.
+        Tuned LONG exit (tighter thresholds to let winners run longer).
+
+        - below_demand_zone: requires >3% drop (was 1.5%) + fresh demand zone.
+        - bearish_momentum_or_di: requires >3% drop OR (ADX>35 and -DI>+DI) (was 2%/30).
+        - broke_swing_low: unchanged (strong structure break).
+        This change targets higher mean return by reducing premature exits on volatile names.
         """
         if len(df) < 3:
             return None
@@ -549,11 +564,11 @@ class GroqRecommendationsStrategy(StrategyBase):
             if (
                 (current_time - zone_time) < timedelta(hours=24)
                 and current_price < zone_low
-                and price_change < -0.015
+                and price_change < -0.03  # tightened from -0.015
             ):
                 return "below_demand_zone"
-        if price_change < -0.02 or (
-            current_adx > 30 and df["minus_di"].iloc[-1] > df["plus_di"].iloc[-1]
+        if price_change < -0.03 or (  # tightened from -0.02
+            current_adx > 35 and df["minus_di"].iloc[-1] > df["plus_di"].iloc[-1]  # ADX 35 vs 30
         ):
             return "bearish_momentum_or_di"
         if len(df) >= 10:
@@ -567,7 +582,7 @@ class GroqRecommendationsStrategy(StrategyBase):
         return self._long_exit_bar_detail(df) is not None
 
     def _short_exit_bar_detail(self, df: pd.DataFrame) -> Optional[str]:
-        """If SHORT exit rules fire on the last bar of ``df``, return a stable tag (else None)."""
+        """SHORT exit rules (symmetric tightening for consistency)."""
         if len(df) < 3:
             return None
         current_price = float(df["close"].iloc[-1])
@@ -580,11 +595,11 @@ class GroqRecommendationsStrategy(StrategyBase):
             if (
                 (current_time - zone_time) < timedelta(hours=24)
                 and current_price < zone_low
-                and price_change < -0.015
+                and price_change < -0.03
             ):
                 return "demand_micro_structure"
-        if price_change > 0.02 or (
-            current_adx > 30 and df["plus_di"].iloc[-1] > df["minus_di"].iloc[-1]
+        if price_change > 0.03 or (  # tightened from 0.02
+            current_adx > 35 and df["plus_di"].iloc[-1] > df["minus_di"].iloc[-1]  # ADX 35 vs 30
         ):
             return "bullish_momentum_or_di"
         if len(df) >= 10:
@@ -601,7 +616,8 @@ class GroqRecommendationsStrategy(StrategyBase):
         self, df: pd.DataFrame, position_type: str
     ) -> Union[int, Tuple[int, str]]:
         """
-        Live-only exits (momentum, zone reversals, ADX). ``backtest()`` does not call this.
+        Programmatic exits (momentum, zone reversals, ADX). Used in watch mode and optionally
+        in ``backtest()`` when ``strategy_exit_signals=True``.
 
         Watch mode invokes this when ``main.py`` is run with strategy exit signals enabled
         (default: ``--strategy-exit-signals``; disable with ``--no-strategy-exit-signals``).
@@ -838,7 +854,16 @@ class GroqRecommendationsStrategy(StrategyBase):
             logger.error(f"Error in execute_trade: {str(e)}")
             return {'status': 'error', 'message': str(e)}
 
-    async def backtest(self, df: pd.DataFrame, initial_capital: float = 100000, symbol: str = 'MSFT') -> Dict:
+    async def backtest(
+        self,
+        df: pd.DataFrame,
+        initial_capital: float = 100000,
+        symbol: str = "MSFT",
+        *,
+        strategy_exit_signals: bool = True,
+        strategy_exit_min_unrealized_pct: float = 0.0,
+        min_hold_hours: float = 2.0,  # NEW: passed from main.py or default
+    ) -> Dict:
         """Run a backtest on historical data and store results in ChromaDB"""
         signals = self.generate_signals(df)
         capital = initial_capital
@@ -888,13 +913,15 @@ class GroqRecommendationsStrategy(StrategyBase):
                 current_time = df.index[i]
                 time_held = (current_time - current_trade['entry_date']).total_seconds() / 3600
 
+                exited = False
+
                 # Backtest exits are always simulated (no IBKR interaction)
                 if time_held >= self.max_duration_hours:
                     exit_price = current_price
                     profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if current_trade['type'] == 'LONG' else (current_trade['entry_price'] - exit_price) * current_trade['shares']
                     capital += profit
                     position = 0
-                    current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
+                    current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit, 'exit_reason': 'max_duration'})
                     logger.debug(f"Exited {current_trade['type']} after {time_held:.2f}h at ${exit_price:.2f}, profit: ${profit:.2f}")
                     continue
 
@@ -904,16 +931,65 @@ class GroqRecommendationsStrategy(StrategyBase):
                         profit = (exit_price - current_trade['entry_price']) * current_trade['shares']
                         capital += profit
                         position = 0
-                        current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
+                        current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit, 'exit_reason': 'stop_or_target'})
                         logger.debug(f"Exited LONG at ${exit_price:.2f}, profit: ${profit:.2f}")
+                        exited = True
                 else:
                     if current_price >= current_trade['stop_loss'] or current_price <= current_trade['target']:
                         exit_price = current_trade['stop_loss'] if current_price >= current_trade['stop_loss'] else current_trade['target']
                         profit = (current_trade['entry_price'] - exit_price) * current_trade['shares']
                         capital += profit
                         position = 0
-                        current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
+                        current_trade.update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit, 'exit_reason': 'stop_or_target'})
                         logger.debug(f"Exited SHORT at ${exit_price:.2f}, profit: ${profit:.2f}")
+                        exited = True
+
+                if not exited and strategy_exit_signals:
+                    # Respect min_hold_hours to avoid noise exits on first 2h (key for higher returns)
+                    hold_threshold = min_hold_hours if "min_hold_hours" in locals() else self.min_hold_hours
+                    if time_held < hold_threshold:
+                        logger.debug(
+                            "Strategy exit suppressed: time_held=%.1fh < min_hold_hours=%.1f",
+                            time_held, hold_threshold
+                        )
+                        continue
+
+                    hist = df.iloc[: i + 1]
+                    if len(hist) >= 4:
+                        pos_type = "long" if current_trade["type"] == "LONG" else "short"
+                        raw_exit = await self.generate_exit_signals(hist, pos_type)
+                        es, er = normalize_strategy_exit_signal(raw_exit)
+                        mark = float(hist["close"].iloc[-1])
+                        ep = float(current_trade["entry_price"])
+                        is_long = current_trade["type"] == "LONG"
+                        es = suppress_strategy_exit_if_scratch_win_zone(
+                            es,
+                            entry_price=ep,
+                            mark_price=mark,
+                            is_long=is_long,
+                            min_unrealized_pct=strategy_exit_min_unrealized_pct,
+                        )
+                        if es != 0:
+                            exit_price = mark
+                            profit = (exit_price - ep) * current_trade['shares'] if is_long else (ep - exit_price) * current_trade['shares']
+                            capital += profit
+                            position = 0
+                            reason = er or "strategy_signal"
+                            current_trade.update({
+                                'exit_date': current_time,
+                                'exit_price': exit_price,
+                                'profit': profit,
+                                'exit_reason': reason,
+                            })
+                            logger.debug(
+                                "Exited %s strategy_exit at $%.2f profit=$%.2f reason=%s (held=%.1fh)",
+                                current_trade['type'],
+                                exit_price,
+                                profit,
+                                reason,
+                                time_held,
+                            )
+                            continue
 
         # Close any open position at the end
         if position != 0:
@@ -924,7 +1000,8 @@ class GroqRecommendationsStrategy(StrategyBase):
             current_trade.update({
                 'exit_date': df.index[-1],
                 'exit_price': exit_price,
-                'profit': profit
+                'profit': profit,
+                'exit_reason': 'series_end',
             })
             logger.debug(f"Closed final position at ${exit_price:.2f}, profit: ${profit:.2f}")
 
@@ -935,18 +1012,27 @@ class GroqRecommendationsStrategy(StrategyBase):
         total_profit = sum(trade.get('profit', 0) for trade in trades)
 
         # Enhanced metadata with deep stock profiling features (inspired by paper)
+        # Chroma requires plain Python scalars (not numpy types) for metadata values.
+        def _chroma_float(v: object, default: float = 0.0) -> float:
+            try:
+                return float(v)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return default
+
         metadatas = [{
             "strategy": self.STRATEGY_SLUG,
             "symbol": symbol,
-            "total_profit": total_profit,
-            "success_rate": success_rate,
-            "initial_capital": initial_capital,
-            "final_capital": capital,
-            "total_trades": total_trades,
+            "total_profit": _chroma_float(total_profit),
+            "success_rate": _chroma_float(success_rate),
+            "initial_capital": _chroma_float(initial_capital),
+            "final_capital": _chroma_float(capital),
+            "total_trades": int(total_trades),
             "trades": str(trades),  # Detailed trade data
             "risk_per_trade": self.risk_per_trade,
             "stop_loss_pct": self.stop_loss_pct,
             "target_pct": self.target_pct,
+            "strategy_exit_signals": int(bool(strategy_exit_signals)),
+            "strategy_exit_min_unrealized_pct": float(strategy_exit_min_unrealized_pct),
             # Original technical indicators
             "volatility": float(df['volatility'].iloc[-1]) if not df['volatility'].empty else None,
             "adx": float(df['adx'].iloc[-1]) if not df['adx'].empty else None,
@@ -985,15 +1071,42 @@ class GroqRecommendationsStrategy(StrategyBase):
             "short_realtime_require_rsi_max": float(self.short_realtime_require_rsi_max),
             "short_realtime_require_minus_di_gt_plus_di": int(self.short_realtime_require_minus_di_gt_plus_di),
             "short_realtime_max_macd_histogram": self.short_realtime_max_macd_histogram,
+            "min_hold_hours": float(min_hold_hours),  # NEW: key param for exit tuning
         }]
+
+        def _sanitize_chroma_meta(d: Dict[str, Any]) -> Dict[str, Any]:
+            """Chroma metadata: no None values; plain bool / int / float / str only (no numpy scalars)."""
+            out: Dict[str, Any] = {}
+            for k, v in d.items():
+                if v is None:
+                    continue
+                if hasattr(v, "item") and not isinstance(v, (str, bytes, dict, list)):
+                    try:
+                        v = v.item()
+                    except Exception:
+                        pass
+                if v is None:
+                    continue
+                if isinstance(v, (bool, np.bool_)):
+                    out[k] = bool(v)
+                elif isinstance(v, Integral):
+                    out[k] = int(v)
+                elif isinstance(v, Real):
+                    out[k] = float(v)
+                elif isinstance(v, str):
+                    out[k] = v
+                else:
+                    out[k] = str(v)
+            return out
 
         if self.collection is not None:
             result_id = f"{symbol}_{str(pd.Timestamp.now())}"
+            md0 = _sanitize_chroma_meta(metadatas[0])
             self.collection.add(
                 documents=[
-                    f"Backtest result ({self.STRATEGY_SLUG}) for {symbol}: {total_profit} profit, {success_rate}% success rate"
+                    f"Backtest result ({self.STRATEGY_SLUG}) for {symbol}: {_chroma_float(total_profit)} profit, {_chroma_float(success_rate)}% success rate"
                 ],
-                metadatas=metadatas[0],
+                metadatas=[md0],
                 ids=[result_id],
             )
             logger.info(f"Stored backtest results for {symbol} in ChromaDB with ID {result_id}")

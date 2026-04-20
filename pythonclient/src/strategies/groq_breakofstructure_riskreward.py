@@ -2,7 +2,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
-from .base import StrategyBase
+from .base import (
+    StrategyBase,
+    normalize_strategy_exit_signal,
+    suppress_strategy_exit_if_scratch_win_zone,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -104,7 +108,16 @@ class GroqBreakOfStructureStrategy(StrategyBase):
         logger.info(f"Generated {len(signals[signals['signal'] != 0])} signals")
         return signals
         
-    def backtest(self, df: pd.DataFrame, initial_capital: float = 100000) -> Dict:
+    async def backtest(
+        self,
+        df: pd.DataFrame,
+        initial_capital: float = 100000,
+        symbol: str = "MSFT",
+        *,
+        strategy_exit_signals: bool = True,
+        strategy_exit_min_unrealized_pct: float = 0.0,
+        min_hold_hours: float = 2.0,  # for compatibility with updated GroqRecommendationsStrategy
+    ) -> Dict:
         signals = self.generate_signals(df)
         capital = initial_capital
         position = 0
@@ -144,12 +157,13 @@ class GroqBreakOfStructureStrategy(StrategyBase):
                 current_time = df.index[i]
                 
                 time_held = (current_time - current_trade['entry_date']).total_seconds() / 3600
+                exited = False
                 if time_held >= self.max_duration_hours:
                     exit_price = current_price
                     profit = (exit_price - current_trade['entry_price']) * current_trade['shares'] if current_trade['type'] == 'LONG' else (current_trade['entry_price'] - exit_price) * current_trade['shares']
                     capital += profit
                     position = 0
-                    trades[-1].update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
+                    trades[-1].update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit, 'exit_reason': 'max_duration'})
                     logger.debug(f"Exited {current_trade['type']} after {self.max_duration_hours}h at {exit_price:.2f}, profit: ${profit:.2f}")
                     continue
                 
@@ -159,16 +173,55 @@ class GroqBreakOfStructureStrategy(StrategyBase):
                         profit = (exit_price - current_trade['entry_price']) * current_trade['shares']
                         capital += profit
                         position = 0
-                        trades[-1].update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
+                        trades[-1].update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit, 'exit_reason': 'stop_or_target'})
                         logger.debug(f"Exited LONG at {exit_price:.2f}, profit: ${profit:.2f}")
+                        exited = True
                 else:
                     if current_price >= current_trade['stop_loss'] or current_price <= current_trade['target']:
                         exit_price = current_trade['stop_loss'] if current_price >= current_trade['stop_loss'] else current_trade['target']
                         profit = (current_trade['entry_price'] - exit_price) * current_trade['shares']
                         capital += profit
                         position = 0
-                        trades[-1].update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit})
+                        trades[-1].update({'exit_date': current_time, 'exit_price': exit_price, 'profit': profit, 'exit_reason': 'stop_or_target'})
                         logger.debug(f"Exited SHORT at {exit_price:.2f}, profit: ${profit:.2f}")
+                        exited = True
+
+                if not exited and strategy_exit_signals:
+                    hist = df.iloc[: i + 1]
+                    if len(hist) >= 3:
+                        pos_type = "long" if current_trade["type"] == "LONG" else "short"
+                        raw_exit = await self.generate_exit_signals(hist, pos_type)
+                        es, er = normalize_strategy_exit_signal(raw_exit)
+                        mark = float(hist["close"].iloc[-1])
+                        ep = float(current_trade["entry_price"])
+                        is_long = current_trade["type"] == "LONG"
+                        es = suppress_strategy_exit_if_scratch_win_zone(
+                            es,
+                            entry_price=ep,
+                            mark_price=mark,
+                            is_long=is_long,
+                            min_unrealized_pct=strategy_exit_min_unrealized_pct,
+                        )
+                        if es != 0:
+                            exit_price = mark
+                            profit = (exit_price - ep) * current_trade['shares'] if is_long else (ep - exit_price) * current_trade['shares']
+                            capital += profit
+                            position = 0
+                            reason = er or "strategy_signal"
+                            trades[-1].update({
+                                'exit_date': current_time,
+                                'exit_price': exit_price,
+                                'profit': profit,
+                                'exit_reason': reason,
+                            })
+                            logger.debug(
+                                "Exited %s strategy_exit at %.2f profit=$%.2f reason=%s",
+                                current_trade['type'],
+                                exit_price,
+                                profit,
+                                reason,
+                            )
+                            continue
         
         return {
             'initial_capital': initial_capital,

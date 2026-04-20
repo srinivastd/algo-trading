@@ -7,7 +7,7 @@ import logging
 import argparse
 import sys
 from pathlib import Path
-from typing import Any, Tuple, Union
+from typing import Any
 from datetime import datetime, timedelta, time
 from uuid import uuid4
 import pytz
@@ -21,6 +21,10 @@ from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy
 from strategies.crossSectionalMomentumStrategy import CrossSectionalMomentumStrategy
 from strategies.vwap_mean_reversion_strategy import VWAPTrendTradingStrategy
 from strategies.mean_reversion_strategy import MeanReversionStrategy
+from strategies.base import (
+    normalize_strategy_exit_signal,
+    suppress_strategy_exit_if_scratch_win_zone,
+)
 from ib_insync import Stock, util
 import json
 import os
@@ -286,15 +290,6 @@ def _aggregate_entry_fills_vwap(
     if total_sh <= 0:
         return None
     return (weighted_px / total_sh, total_sh, latest_t)
-
-
-def _normalize_strategy_exit_signal(result: Union[int, Tuple[int, str]]) -> Tuple[int, str]:
-    """Strategies return either a bare int (legacy) or ``(signal, reason_tag)``."""
-    if isinstance(result, tuple):
-        sig = int(result[0])
-        reason = str(result[1]).strip() if len(result) > 1 else ""
-        return sig, reason
-    return int(result), "strategy_signal"
 
 
 async def watch_mode(
@@ -630,22 +625,24 @@ async def watch_mode(
                                     raw_exit = await strategy.generate_exit_signals(df, "long")
                                 else:
                                     raw_exit = await strategy.generate_exit_signals(df, "short")
-                                exit_signal, exit_reason_tag = _normalize_strategy_exit_signal(raw_exit)
+                                exit_signal, exit_reason_tag = normalize_strategy_exit_signal(raw_exit)
                             else:
                                 exit_signal = 0
 
-                            if (
-                                strategy_exit_signals
-                                and exit_signal != 0
-                                and strategy_exit_min_unrealized_pct > 0
-                                and avg_cost > 0
-                            ):
+                            if strategy_exit_signals and exit_signal != 0:
                                 mark = float(df["close"].iloc[-1])
-                                if position_size > 0:
-                                    ur_pct = (mark - avg_cost) / avg_cost * 100.0
-                                else:
-                                    ur_pct = (avg_cost - mark) / avg_cost * 100.0
-                                if 0.0 <= ur_pct < float(strategy_exit_min_unrealized_pct):
+                                suppressed = suppress_strategy_exit_if_scratch_win_zone(
+                                    exit_signal,
+                                    entry_price=float(avg_cost),
+                                    mark_price=mark,
+                                    is_long=position_size > 0,
+                                    min_unrealized_pct=float(strategy_exit_min_unrealized_pct),
+                                )
+                                if suppressed == 0 and exit_signal != 0:
+                                    if position_size > 0:
+                                        ur_pct = (mark - avg_cost) / avg_cost * 100.0
+                                    else:
+                                        ur_pct = (avg_cost - mark) / avg_cost * 100.0
                                     logger.info(
                                         "STRATEGY_EXIT_SUPPRESSED %s unrealized=%.3f%% (min_win=%.2f%%) reason_would_be=%s",
                                         pos_symbol,
@@ -653,7 +650,7 @@ async def watch_mode(
                                         strategy_exit_min_unrealized_pct,
                                         exit_reason_tag or "strategy_signal",
                                     )
-                                    exit_signal = 0
+                                exit_signal = suppressed
 
                             # Log position monitoring
                             position_data = {
@@ -1548,7 +1545,14 @@ async def main():
                     logger.warning(f"Risk per trade (${args.risk_per_trade}) exceeds maximum allowed ($2000.0). Setting to $2000.0")
                     args.risk_per_trade = 2000.0
                 
-                backtest_results = await strategy.backtest(df, initial_capital=args.initial_capital, symbol=symbol)
+                backtest_results = await strategy.backtest(
+                    df,
+                    initial_capital=args.initial_capital,
+                    symbol=symbol,
+                    strategy_exit_signals=bool(args.strategy_exit_signals),
+                    strategy_exit_min_unrealized_pct=float(args.strategy_exit_min_unrealized_pct),
+                    min_hold_hours=2.0,  # tuned for higher returns (reduces early noise exits)
+                )
                 all_results[symbol] = backtest_results
                 
                 logger.info(f"\nResults for {symbol}:")
