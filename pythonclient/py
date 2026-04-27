@@ -3,5 +3,8 @@
 #   ./py src/main.py --paper                     # paper trading (now has strict PDT/settlement gates)
 #   ./py src/main.py --paper --lax-paper         # disable gates for diagnostics only
 #   ./py src/journal_dashboard.py                # trade journal / IB P&L UI (default :8765)
+#
+# Logging is now daily-rotated (logs/stock_analysis_YYYYMMDD.log, etc.)
+# Old logs are kept for 30 days. No more multi-million line files.
 cd "$(dirname "$0")" || exit 1
 exec ./.bt_run_venv/bin/python3 "$@"
