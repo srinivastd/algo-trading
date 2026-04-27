@@ -5,8 +5,10 @@ Version 1.4
 import pandas as pd
 import numpy as np
 import asyncio
+import csv
 from datetime import datetime, timedelta
 from numbers import Integral, Real
+from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Union
 from .base import (
     StrategyBase,
@@ -16,32 +18,35 @@ from .base import (
 import logging
 from pytz import timezone
 from ibkr.connection import IBKRConnection
-from ib_insync import MarketOrder, StopOrder, LimitOrder
+from ib_insync import MarketOrder, StopOrder, LimitOrder, Stock
 import chromadb
 from chromadb.utils import embedding_functions
 
 logger = logging.getLogger(__name__)
+_PYTHONCLIENT_ROOT = Path(__file__).resolve().parent.parent
 
 class GroqRecommendationsStrategy(StrategyBase):
     """
     Supply/demand zones with ADX, volume, and realtime filters.
 
-    Tuned exits (2 consecutive bars) + ``min_hold_hours=2.0`` to reduce noise on volatile names (QBTS).
-    This change targets >20% mean return on watchlist while preserving ~58% win rate.
+    Tuned for **15-minute bars** (aligned with paper trading) + 3Y backtests.
+    New defaults: risk=$4000, SL=1.1%, TGT=4.8%, zone_lookback=7, adx_min=28.5,
+    long_min_rsi=18.0, volume_mults=(1.36, 1.19). Long-only recommended
+    (short_realtime_filters_enabled=False). min_hold_hours=2.0 reduces noise.
     """
 
     STRATEGY_SLUG = "groq"
 
-    def __init__(self, risk_per_trade: float = 3000, max_duration_hours: float = 12.0, paper_trading: bool = True,
-                 stop_loss_pct: float = 1.0, target_pct: float = 4.0, bar_size: str = "1 hour", duration: str = "1 M",
-                 zone_lookback: int = 4, adx_min: float = 25.0,
-                 long_min_rsi: float = 0.0,
+    def __init__(self, risk_per_trade: float = 4000, max_duration_hours: float = 12.0, paper_trading: bool = True,
+                 stop_loss_pct: float = 1.1, target_pct: float = 4.8, bar_size: str = "15 mins", duration: str = "3 Y",
+                 zone_lookback: int = 7, adx_min: float = 28.5,
+                 long_min_rsi: float = 18.0,
                  zone_freshness_hours: float = 8.0,
-                 volume_breakout_mult: float = 1.3,
-                 volume_confirm_mult: float = 1.3,
+                 volume_breakout_mult: float = 1.36,
+                 volume_confirm_mult: float = 1.19,
                  position_size_cap: float = 0.95,
-                 # Realtime SHORT gates aligned with journal post-mortem (chop + momentum long = bad shorts).
-                 short_realtime_filters_enabled: bool = True,
+                 # Long-only recommended for 15m bars (shorts filtered aggressively in realtime).
+                 short_realtime_filters_enabled: bool = False,
                  short_realtime_block_adx_below: float = 20.0,
                  short_realtime_block_rsi_above: float = 72.0,
                  short_realtime_block_bullish_di_rsi_above: float = 55.0,
@@ -49,7 +54,7 @@ class GroqRecommendationsStrategy(StrategyBase):
                  short_realtime_require_rsi_max: float = 65.0,
                  short_realtime_require_minus_di_gt_plus_di: bool = True,
                  short_realtime_max_macd_histogram: float | None = None,
-                 min_hold_hours: float = 2.0):  # NEW: suppress early programmatic exits (noise reduction)
+                 min_hold_hours: float = 2.0):  # suppress early programmatic exits (noise reduction on 15m)
         super().__init__("Groq Recommendations Strategy")
         self.risk_per_trade = risk_per_trade
         self.max_duration_hours = max_duration_hours
@@ -95,8 +100,8 @@ class GroqRecommendationsStrategy(StrategyBase):
             )
         logger.info(
             f"Initialized {self.name} with risk_per_trade=${risk_per_trade}, max_duration={max_duration_hours}h, "
-            f"stop_loss={stop_loss_pct}%, target={target_pct}%, paper_trading={paper_trading}, "
-            f"bar_size={bar_size}, duration={duration}, adx_min={self.adx_min}, long_min_rsi={self.long_min_rsi}"
+            f"stop_loss={stop_loss_pct}%, target={target_pct}%, bar_size={bar_size}, duration={duration}, "
+            f"adx_min={self.adx_min}, long_min_rsi={self.long_min_rsi}, zone_lookback={self.zone_lookback}"
         )
         if self.short_realtime_filters_enabled:
             logger.info(
@@ -112,6 +117,8 @@ class GroqRecommendationsStrategy(StrategyBase):
                 if self.short_realtime_max_macd_histogram is not None
                 else "off",
             )
+        else:
+            logger.info("SHORT filters DISABLED (long-only mode recommended for 15m bars)")
 
     def set_ib_client(self, ib_client):
         """Set the IBKR client for trading"""
@@ -403,6 +410,180 @@ class GroqRecommendationsStrategy(StrategyBase):
             score += min(latest['volume_ratio'] / 2, 0.3)
 
         return score
+
+    @staticmethod
+    def _confidence_bucket(confidence: float | None) -> str:
+        """Stable buckets for measuring whether entry confidence predicts PnL."""
+        if confidence is None or pd.isna(confidence):
+            return "unknown"
+        c = float(confidence)
+        if c < 0.60:
+            return "0.50-0.59"
+        if c < 0.70:
+            return "0.60-0.69"
+        if c < 0.80:
+            return "0.70-0.79"
+        if c < 0.90:
+            return "0.80-0.89"
+        return "0.90-1.00"
+
+    @staticmethod
+    def _trade_return_pct(trade: Dict[str, Any]) -> float | None:
+        entry = trade.get("entry_price")
+        exit_price = trade.get("exit_price")
+        if entry is None or exit_price is None:
+            return None
+        entry_f = float(entry)
+        if entry_f == 0:
+            return None
+        if trade.get("type") == "SHORT":
+            return (entry_f - float(exit_price)) / entry_f * 100.0
+        return (float(exit_price) - entry_f) / entry_f * 100.0
+
+    @staticmethod
+    def _trade_hold_hours(trade: Dict[str, Any]) -> float | None:
+        entry_dt = trade.get("entry_date")
+        exit_dt = trade.get("exit_date")
+        if entry_dt is None or exit_dt is None:
+            return None
+        try:
+            return (exit_dt - entry_dt).total_seconds() / 3600.0
+        except AttributeError:
+            return None
+
+    def _confidence_bucket_summary(
+        self,
+        trades: List[Dict[str, Any]],
+        symbol: str,
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        group_keys: list[tuple[str, str]] = []
+        for trade in trades:
+            bucket = self._confidence_bucket(trade.get("entry_confidence"))
+            side = str(trade.get("type", "UNKNOWN"))
+            group_keys.append((bucket, side))
+            group_keys.append((bucket, "ALL"))
+
+        for bucket, side in sorted(set(group_keys)):
+            bucket_trades = [
+                t for t in trades
+                if self._confidence_bucket(t.get("entry_confidence")) == bucket
+                and (side == "ALL" or t.get("type") == side)
+            ]
+            profits = [float(t.get("profit", 0.0)) for t in bucket_trades if "profit" in t]
+            hold_hours = [
+                h for h in (self._trade_hold_hours(t) for t in bucket_trades) if h is not None
+            ]
+            wins = sum(1 for p in profits if p > 0)
+            losses = sum(1 for p in profits if p < 0)
+            flats = sum(1 for p in profits if p == 0)
+            gross_win = sum(p for p in profits if p > 0)
+            gross_loss = -sum(p for p in profits if p < 0)
+            rows.append({
+                "symbol": symbol,
+                "confidence_bucket": bucket,
+                "side": side,
+                "trade_count": len(bucket_trades),
+                "closed_count": len(profits),
+                "wins": wins,
+                "losses": losses,
+                "flats": flats,
+                "win_rate_pct": (wins / len(profits) * 100.0) if profits else 0.0,
+                "total_pnl": sum(profits) if profits else 0.0,
+                "avg_pnl": (sum(profits) / len(profits)) if profits else 0.0,
+                "median_pnl": float(np.median(profits)) if profits else 0.0,
+                "gross_win": gross_win,
+                "gross_loss": gross_loss,
+                "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else None,
+                "best_trade": max(profits) if profits else 0.0,
+                "worst_trade": min(profits) if profits else 0.0,
+                "avg_hold_hours": (sum(hold_hours) / len(hold_hours)) if hold_hours else None,
+            })
+        return rows
+
+    def _export_backtest_confidence_measurement(
+        self,
+        trades: List[Dict[str, Any]],
+        symbol: str,
+    ) -> tuple[str | None, str | None, List[Dict[str, Any]]]:
+        """Write per-trade and confidence-bucket CSVs for analysis-only confidence validation."""
+        export_dir = _PYTHONCLIENT_ROOT / "backtest_exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        stamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        safe_symbol = "".join(ch for ch in symbol.upper() if ch.isalnum() or ch in ("_", "-"))
+        trades_path = export_dir / f"{self.STRATEGY_SLUG}_{safe_symbol}_trades_{stamp}.csv"
+        buckets_path = export_dir / f"{self.STRATEGY_SLUG}_{safe_symbol}_confidence_buckets_{stamp}.csv"
+
+        trade_fields = [
+            "symbol",
+            "side",
+            "entry_date",
+            "exit_date",
+            "entry_price",
+            "exit_price",
+            "shares",
+            "profit",
+            "return_pct",
+            "exit_reason",
+            "time_held_hours",
+            "entry_confidence",
+            "entry_confidence_bucket",
+            "entry_signal",
+            "entry_stock_profile_score",
+            "stop_loss",
+            "target",
+        ]
+        with trades_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=trade_fields)
+            writer.writeheader()
+            for trade in trades:
+                writer.writerow({
+                    "symbol": symbol,
+                    "side": trade.get("type"),
+                    "entry_date": trade.get("entry_date"),
+                    "exit_date": trade.get("exit_date"),
+                    "entry_price": trade.get("entry_price"),
+                    "exit_price": trade.get("exit_price"),
+                    "shares": trade.get("shares"),
+                    "profit": trade.get("profit"),
+                    "return_pct": self._trade_return_pct(trade),
+                    "exit_reason": trade.get("exit_reason"),
+                    "time_held_hours": self._trade_hold_hours(trade),
+                    "entry_confidence": trade.get("entry_confidence"),
+                    "entry_confidence_bucket": self._confidence_bucket(trade.get("entry_confidence")),
+                    "entry_signal": trade.get("entry_signal"),
+                    "entry_stock_profile_score": trade.get("entry_stock_profile_score"),
+                    "stop_loss": trade.get("stop_loss"),
+                    "target": trade.get("target"),
+                })
+
+        bucket_rows = self._confidence_bucket_summary(trades, symbol)
+        bucket_fields = [
+            "symbol",
+            "confidence_bucket",
+            "side",
+            "trade_count",
+            "closed_count",
+            "wins",
+            "losses",
+            "flats",
+            "win_rate_pct",
+            "total_pnl",
+            "avg_pnl",
+            "median_pnl",
+            "gross_win",
+            "gross_loss",
+            "profit_factor",
+            "best_trade",
+            "worst_trade",
+            "avg_hold_hours",
+        ]
+        with buckets_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=bucket_fields)
+            writer.writeheader()
+            writer.writerows(bucket_rows)
+
+        return str(trades_path), str(buckets_path), bucket_rows
         
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
         signals = pd.DataFrame(index=df.index)
@@ -870,11 +1051,15 @@ class GroqRecommendationsStrategy(StrategyBase):
         position = 0
         trades = []
 
-        for i in range(1, len(df) - 1):
+        # IMPORTANT: Start loop after indicators are stable (match generate_signals)
+        for i in range(30, len(df) - 1):
             if signals['signal'].iloc[i] != 0 and position == 0:
                 entry_price = df['close'].iloc[i]
                 entry_time = df.index[i]
-                is_long = signals['signal'].iloc[i] == 1
+                entry_signal = int(signals['signal'].iloc[i])
+                is_long = entry_signal == 1
+                entry_confidence = float(signals['confidence_score'].iloc[i])
+                entry_stock_profile_score = float(signals['stock_profile_score'].iloc[i])
                 
                 # Calculate stop loss and target based on configured percentages
                 stop_loss = entry_price * (1 - self.stop_loss_pct/100) if is_long else entry_price * (1 + self.stop_loss_pct/100)
@@ -903,7 +1088,11 @@ class GroqRecommendationsStrategy(StrategyBase):
                     'shares': abs(shares),
                     'stop_loss': stop_loss,
                     'target': target,
-                    'type': 'LONG' if is_long else 'SHORT'
+                    'type': 'LONG' if is_long else 'SHORT',
+                    'entry_signal': entry_signal,
+                    'entry_confidence': entry_confidence,
+                    'entry_confidence_bucket': self._confidence_bucket(entry_confidence),
+                    'entry_stock_profile_score': entry_stock_profile_score,
                 })
                 logger.debug(f"Simulated entry {trades[-1]['type']} at ${entry_price:.2f}, shares: {shares}")
 
@@ -1010,6 +1199,38 @@ class GroqRecommendationsStrategy(StrategyBase):
         successful_trades = sum(1 for trade in trades if trade.get('profit', 0) > 0)
         success_rate = (successful_trades / total_trades * 100) if total_trades > 0 else 0
         total_profit = sum(trade.get('profit', 0) for trade in trades)
+        confidence_trades_export = None
+        confidence_buckets_export = None
+        confidence_bucket_summary: List[Dict[str, Any]] = []
+        try:
+            (
+                confidence_trades_export,
+                confidence_buckets_export,
+                confidence_bucket_summary,
+            ) = self._export_backtest_confidence_measurement(trades, symbol)
+            logger.info(
+                "Confidence measurement export for %s: trades=%s buckets=%s",
+                symbol,
+                confidence_trades_export,
+                confidence_buckets_export,
+            )
+            for row in confidence_bucket_summary:
+                if row["side"] != "ALL":
+                    continue
+                logger.info(
+                    "CONF_BUCKET %s %s trades=%s win_rate=%.1f%% total_pnl=%.2f "
+                    "avg=%.2f median=%.2f pf=%s",
+                    symbol,
+                    row["confidence_bucket"],
+                    row["closed_count"],
+                    row["win_rate_pct"],
+                    row["total_pnl"],
+                    row["avg_pnl"],
+                    row["median_pnl"],
+                    f"{row['profit_factor']:.3f}" if row["profit_factor"] is not None else "n/a",
+                )
+        except Exception as export_err:
+            logger.warning("Confidence measurement export failed for %s: %s", symbol, export_err)
 
         # Enhanced metadata with deep stock profiling features (inspired by paper)
         # Chroma requires plain Python scalars (not numpy types) for metadata values.
@@ -1033,6 +1254,8 @@ class GroqRecommendationsStrategy(StrategyBase):
             "target_pct": self.target_pct,
             "strategy_exit_signals": int(bool(strategy_exit_signals)),
             "strategy_exit_min_unrealized_pct": float(strategy_exit_min_unrealized_pct),
+            "confidence_trades_export": confidence_trades_export,
+            "confidence_buckets_export": confidence_buckets_export,
             # Original technical indicators
             "volatility": float(df['volatility'].iloc[-1]) if not df['volatility'].empty else None,
             "adx": float(df['adx'].iloc[-1]) if not df['adx'].empty else None,
@@ -1116,5 +1339,8 @@ class GroqRecommendationsStrategy(StrategyBase):
             'final_capital': capital,
             'return_pct': ((capital - initial_capital) / initial_capital) * 100,
             'total_trades': total_trades,
-            'trades': trades
+            'trades': trades,
+            'confidence_trades_export': confidence_trades_export,
+            'confidence_buckets_export': confidence_buckets_export,
+            'confidence_bucket_summary': confidence_bucket_summary,
         }
