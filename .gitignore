@@ -72,7 +72,12 @@ pythonclient/historical_data/
 # Local runtime / artifacts (not for version control)
 chroma_db/
 market_data_logs/
+*.log
+*.pid
+watch_restart.log
 stock_analysis.log
+.DS_Store
+
 # Stray empty DB if sqlite3 is run from repo root; real journal is pythonclient/trade_journal.db
 /trade_journal.db
 pythonclient/trade_journal.db

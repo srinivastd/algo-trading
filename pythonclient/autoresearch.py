@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import subprocess
 import sys
 import time
@@ -25,11 +26,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Use centralized daily logging
+from src.logging_config import setup_daily_logging
+
+logger = setup_daily_logging(
+    log_name="autoresearch",
+    level=logging.INFO,
+    console=True,
+    backup_count=30,
+)
+
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
 BASELINE_PATH = ROOT / "baseline.json"
 NEXT_EXP_DIR = ROOT / "runs" / "next_experiments"
-LOG_PATH = ROOT / "runs" / "autoresearch_log.jsonl"
+LOG_PATH = ROOT / "logs" / "autoresearch_log.jsonl"
 
 
 def _load_json(path: Path) -> Dict[str, Any]:

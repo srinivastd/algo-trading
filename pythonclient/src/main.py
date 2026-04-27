@@ -15,12 +15,9 @@ import random
 import pandas as pd
 from ibkr.connection import IBKRConnection
 from ibkr.historical_data import HistoricalDataManager
-from strategies.breakout_pullback import BreakoutPullbackStrategy
-from strategies.supplydemand_surge import SupplyDemandSurgeStrategy
 from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy
-from strategies.crossSectionalMomentumStrategy import CrossSectionalMomentumStrategy
-from strategies.vwap_mean_reversion_strategy import VWAPTrendTradingStrategy
-from strategies.mean_reversion_strategy import MeanReversionStrategy
+from strategies.adx_rsi_macd_pullback_strategy import AdxRsiMacdTrendPullbackStrategy
+
 from strategies.base import (
     normalize_strategy_exit_signal,
     suppress_strategy_exit_if_scratch_win_zone,
@@ -34,66 +31,21 @@ from trade_memory import TradeMemory
 
 _PYTHONCLIENT_ROOT = Path(__file__).resolve().parent.parent
 
-# Set up logging to both file and console with color
-class ColoredFormatter(logging.Formatter):
-    """Custom formatter with colors"""
-    
-    grey = "\x1b[38;21m"
-    blue = "\x1b[38;5;39m"
-    yellow = "\x1b[38;5;226m"
-    red = "\x1b[38;5;196m"
-    bold_red = "\x1b[31;1m"
-    reset = "\x1b[0m"
+from pathlib import Path
+from src.logging_config import setup_daily_logging, setup_market_data_logger
 
-    def __init__(self, fmt):
-        super().__init__()
-        self.fmt = fmt
-        self.FORMATS = {
-            logging.DEBUG: self.grey + self.fmt + self.reset,
-            logging.INFO: self.blue + self.fmt + self.reset,
-            logging.WARNING: self.yellow + self.fmt + self.reset,
-            logging.ERROR: self.red + self.fmt + self.reset,
-            logging.CRITICAL: self.bold_red + self.fmt + self.reset
-        }
-
-    def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
-        formatter = logging.Formatter(log_fmt)
-        return formatter.format(record)
-
-# Create console handler with custom formatter
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(ColoredFormatter('%(asctime)s - %(levelname)s - %(message)s'))
-
-# Create file handler
-file_handler = logging.FileHandler('stock_analysis.log')
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-
-# Create a directory for market data logs
-os.makedirs('market_data_logs', exist_ok=True)
-
-# Add a new file handler for market data
-market_data_handler = logging.FileHandler('market_data_logs/market_data.json', mode='a')  # Append mode
-market_data_handler.setFormatter(logging.Formatter('%(message)s'))  # Raw JSON format
-market_data_logger = logging.getLogger('market_data')
-market_data_logger.setLevel(logging.INFO)
-market_data_logger.addHandler(market_data_handler)
-market_data_logger.propagate = False  # Don't propagate to root logger
-
-# Add a test log entry to verify logger is working
-market_data_logger.info(json.dumps({
-    'timestamp': datetime.now(pytz.timezone('US/Eastern')).isoformat(),
-    'type': 'system',
-    'message': 'Market data logger initialized'
-}))
-
-# Set up root logger
-logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG to see all messages
-    handlers=[console_handler, file_handler]
+# Setup daily rotating logging (one file per day, keeps last 30 days)
+# This is now idempotent (Bug 2 fix) so it can safely be called from multiple modules
+logger = setup_daily_logging(
+    log_name="stock_analysis",
+    level=logging.INFO,
+    console=True,
+    backup_count=30,
 )
 
-logger = logging.getLogger(__name__)
+# Market data logger with dedicated JSON handler (one JSON object per line, daily rotation)
+# This fixes Bug 3: previously had propagate=False with no handler
+market_data_logger = setup_market_data_logger()
 
 def _safe_float(v):
     try:
@@ -1222,8 +1174,8 @@ async def load_active_trades(connection):
 def parse_args():
     parser = argparse.ArgumentParser(description="Trading System")
     parser.add_argument("symbols", nargs="+", help="Trading symbols")
-    parser.add_argument("--duration", default="1 M", help="Duration for historical data")
-    parser.add_argument("--bar-size", default="15 mins", help="Bar size for historical data")
+    parser.add_argument("--duration", default="3 Y", help="Duration for historical data (aligned with tuned params)")
+    parser.add_argument("--bar-size", default="15 mins", help="Bar size for historical data (aligned with paper trading)")
     parser.add_argument("--strategy", default="groq", help="Trading strategy to use")
     parser.add_argument("--force-refresh", action="store_true", help="Force refresh historical data")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -1278,27 +1230,31 @@ def parse_args():
         "(still exit losers; lets winners reach bracket target or a larger signal). 0=off. Example: 2 or 3.",
     )
     parser.add_argument("--backtest-only", action="store_true", help="Run backtest only")
-    parser.add_argument("--risk-per-trade", type=float, default=1000.0, help="Risk per trade in dollars")
+    parser.add_argument("--risk-per-trade", type=float, default=4000.0, help="Risk per trade in dollars (default tuned for 15m)")
     parser.add_argument("--max-duration", type=float, default=12.0, help="Maximum trade duration in hours")
-    parser.add_argument("--stop-loss", type=float, default=1.0, help="Stop loss percentage")
-    parser.add_argument("--target", type=float, default=4.0, help="Target profit percentage")
-    parser.add_argument("--initial-capital", type=float, default=50000.0, help="Initial capital for backtest")
+    parser.add_argument("--stop-loss", type=float, default=1.1, help="Stop loss percentage (tuned for 15m bars)")
+    parser.add_argument("--target", type=float, default=4.8, help="Target profit percentage (tuned for 15m bars)")
+    parser.add_argument("--initial-capital", type=float, default=100000.0, help="Initial capital for backtest")
     parser.add_argument("--rebalance-period", type=int, default=60, help="Portfolio rebalance period in minutes")
     parser.add_argument("--vwap-threshold", type=float, default=0.5, help="VWAP threshold for entry")
     parser.add_argument("--phase2-rules", action="store_true", help="Use Phase 2 trading rules")
-    parser.add_argument("--zone-lookback", type=int, default=4, help="Bars to look back for supply/demand zones")
-    parser.add_argument("--adx-min", type=float, default=25.0, help="Minimum ADX for zone validity")
+    parser.add_argument("--zone-lookback", type=int, default=7, help="Bars to look back for supply/demand zones (tuned)")
+    parser.add_argument("--adx-min", type=float, default=28.5, help="Minimum ADX for zone validity (tuned for 15m)")
     parser.add_argument(
         "--long-min-rsi",
         type=float,
-        default=0.0,
+        default=18.0,
         metavar="R",
-        help="Groq strategy: for LONG entries only, require last-bar RSI > R (0 = off).",
+        help="Groq strategy: for LONG entries only, require last-bar RSI > R (tuned for 15m).",
     )
-    parser.add_argument("--zone-freshness-hours", type=float, default=12.0, help="Max hours a zone stays valid")
-    parser.add_argument("--volume-breakout-mult", type=float, default=1.1, help="Volume multiplier for breakout bar")
-    parser.add_argument("--volume-confirm-mult", type=float, default=1.05, help="Volume multiplier for confirmation bar")
+    parser.add_argument("--zone-freshness-hours", type=float, default=8.0, help="Max hours a zone stays valid")
+    parser.add_argument("--volume-breakout-mult", type=float, default=1.36, help="Volume multiplier for breakout bar (tuned)")
+    parser.add_argument("--volume-confirm-mult", type=float, default=1.19, help="Volume multiplier for confirmation bar (tuned)")
     parser.add_argument("--position-size-cap", type=float, default=0.95, help="Max fraction of capital per position")
+    # ADX RSI MACD specific parameters (passed through to strategy)
+    parser.add_argument("--adx-threshold", type=float, default=35.0, help="ADX threshold for trend strength (adx_rsi_macd)")
+    parser.add_argument("--rsi-entry-cross", type=float, default=45.0, help="RSI cross level for entry (adx_rsi_macd)")
+    parser.add_argument("--min-hold-hours", type=float, default=2.0, help="Minimum hold time before strategy exits")
     parser.add_argument("--no-journal", action="store_true", help="Disable SQLite trade journaling in watch mode")
     parser.add_argument("--journal-db", default=str(_PYTHONCLIENT_ROOT / "trade_journal.db"), help="Path to SQLite journal db")
     parser.add_argument("--journal-snapshot-interval", type=int, default=60, help="Seconds between account/position snapshots in journal")
@@ -1334,14 +1290,28 @@ async def main():
         "volume_breakout_mult": args.volume_breakout_mult,
         "volume_confirm_mult": args.volume_confirm_mult,
         "position_size_cap": args.position_size_cap,
+        "min_hold_hours": getattr(args, "min_hold_hours", 2.0),
+        "short_realtime_filters_enabled": False,  # long-only for 15m consistency
     }
     
     if args.strategy == "groq":
         strategy = GroqRecommendationsStrategy(**strategy_params, **groq_extra)
-        logger.info(f"Strategy initialized with: stop_loss_pct={strategy.stop_loss_pct}%, target_pct={strategy.target_pct}%, risk_per_trade=${strategy.risk_per_trade}")
-    elif args.strategy == "mean_reversion":
-        strategy = MeanReversionStrategy(**strategy_params)
-        logger.info(f"Mean Reversion Strategy initialized with: stop_loss_pct={strategy.stop_loss_pct}%, target_pct={strategy.target_pct}%, risk_per_trade=${strategy.risk_per_trade}")
+        logger.info(
+            f"Strategy initialized with: risk=${strategy.risk_per_trade}, SL={strategy.stop_loss_pct}%, "
+            f"TGT={strategy.target_pct}%, bar_size={strategy.bar_size}, duration={strategy.duration}, "
+            f"adx_min={strategy.adx_min}, long_min_rsi={getattr(strategy, 'long_min_rsi', 18.0)}, "
+            f"zone_lookback={getattr(strategy, 'zone_lookback', 7)} (15m tuned params)"
+        )
+    elif args.strategy == "adx_rsi_macd":
+        # Support higher risk and extended hours for the new strategy
+        adx_params = {
+            "adx_threshold": getattr(args, "adx_threshold", 35.0),
+            "rsi_entry_cross": getattr(args, "rsi_entry_cross", 45.0),
+            "min_hold_hours": getattr(args, "min_hold_hours", 2.0),
+        }
+        strategy = AdxRsiMacdTrendPullbackStrategy(**strategy_params, **adx_params)
+        logger.info(f"ADX_RSI_MACD Strategy initialized with: ADX>{strategy.adx_threshold}, RSI_cross>{strategy.rsi_entry_cross}, "
+                   f"risk=${strategy.risk_per_trade}, min_hold={strategy.min_hold_hours}h (extended hours OK)")
     else:
         raise ValueError(f"Unknown strategy: {args.strategy}")
     
@@ -1540,10 +1510,14 @@ async def main():
                     logger.info(f"Running in {mode} mode for {symbol}...")
                     strategy.set_ib_client(connection)  # Set IB client for paper trading
                     
-                # Validate risk per trade
-                if args.risk_per_trade > 2000.0:
-                    logger.warning(f"Risk per trade (${args.risk_per_trade}) exceeds maximum allowed ($2000.0). Setting to $2000.0")
-                    args.risk_per_trade = 2000.0
+                # Validate risk per trade (higher limit allowed for adx_rsi_macd strategy)
+                max_risk = 5000.0 if args.strategy == "adx_rsi_macd" else 2000.0
+                if args.risk_per_trade > max_risk:
+                    logger.warning(f"Risk per trade (${args.risk_per_trade}) exceeds maximum allowed (${max_risk}). Setting to ${max_risk}.")
+                    args.risk_per_trade = max_risk
+                # Pass updated risk to strategy instance
+                if hasattr(strategy, 'risk_per_trade'):
+                    strategy.risk_per_trade = args.risk_per_trade
                 
                 backtest_results = await strategy.backtest(
                     df,
@@ -1586,6 +1560,36 @@ async def main():
             total_trades = sum(r['total_trades'] for r in all_results.values())
             logger.info(f"Average Return: {total_return:.2f}%")
             logger.info(f"Total Trades: {total_trades}")
+            confidence_bucket_rows = [
+                row
+                for result in all_results.values()
+                for row in result.get("confidence_bucket_summary", [])
+            ]
+            if confidence_bucket_rows:
+                logger.info("\nConfidence bucket summary by stock:")
+                for row in confidence_bucket_rows:
+                    if row.get("side") != "ALL":
+                        continue
+                    pf = row.get("profit_factor")
+                    pf_s = f"{pf:.3f}" if pf is not None else "n/a"
+                    logger.info(
+                        "%s bucket=%s trades=%s win_rate=%.1f%% total_pnl=%.2f avg=%.2f pf=%s",
+                        row.get("symbol"),
+                        row.get("confidence_bucket"),
+                        row.get("closed_count"),
+                        row.get("win_rate_pct", 0.0),
+                        row.get("total_pnl", 0.0),
+                        row.get("avg_pnl", 0.0),
+                        pf_s,
+                    )
+                try:
+                    export_dir = _PYTHONCLIENT_ROOT / "backtest_exports"
+                    export_dir.mkdir(parents=True, exist_ok=True)
+                    bucket_export = export_dir / f"{args.strategy}_confidence_buckets_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    pd.DataFrame(confidence_bucket_rows).to_csv(bucket_export, index=False)
+                    logger.info("Combined confidence bucket export: %s", bucket_export)
+                except Exception as export_err:
+                    logger.warning("Combined confidence bucket export failed: %s", export_err)
             
             # Check if we should proceed with trading based on backtest results
             if (args.paper or args.live) and not args.backtest_only:
