@@ -1077,6 +1077,14 @@ class TradeJournal:
         params: list[str] = []
         opened_expr: str
         exited_expr: str
+        closed_expr: str
+        closed_long_expr: str
+        closed_short_expr: str
+        wins_expr: str
+        losses_expr: str
+        flat_expr: str
+        total_realized_expr: str
+        order_realized_expr: str
         if date_yyyy_mm_dd:
             date_filter = """
                   AND (
@@ -1109,10 +1117,167 @@ class TradeJournal:
                         END
                     ) AS exited_count,
             """
+            closed_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND exit_fill_time IS NOT NULL
+                                 AND length(trim(exit_fill_time)) >= 10
+                                 AND substr(trim(exit_fill_time), 1, 10) = ?
+                            THEN 1 ELSE 0
+                        END
+                    ) AS closed,
+            """
+            closed_long_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND UPPER(TRIM(side)) = 'LONG'
+                                 AND exit_fill_time IS NOT NULL
+                                 AND length(trim(exit_fill_time)) >= 10
+                                 AND substr(trim(exit_fill_time), 1, 10) = ?
+                            THEN 1 ELSE 0
+                        END
+                    ) AS closed_long,
+            """
+            closed_short_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND UPPER(TRIM(side)) = 'SHORT'
+                                 AND exit_fill_time IS NOT NULL
+                                 AND length(trim(exit_fill_time)) >= 10
+                                 AND substr(trim(exit_fill_time), 1, 10) = ?
+                            THEN 1 ELSE 0
+                        END
+                    ) AS closed_short,
+            """
+            wins_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND exit_fill_time IS NOT NULL
+                                 AND length(trim(exit_fill_time)) >= 10
+                                 AND substr(trim(exit_fill_time), 1, 10) = ?
+                                 AND realized_pnl IS NOT NULL
+                                 AND realized_pnl > 0
+                            THEN 1 ELSE 0
+                        END
+                    ) AS wins,
+            """
+            losses_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND exit_fill_time IS NOT NULL
+                                 AND length(trim(exit_fill_time)) >= 10
+                                 AND substr(trim(exit_fill_time), 1, 10) = ?
+                                 AND realized_pnl IS NOT NULL
+                                 AND realized_pnl < 0
+                            THEN 1 ELSE 0
+                        END
+                    ) AS losses,
+            """
+            flat_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND exit_fill_time IS NOT NULL
+                                 AND length(trim(exit_fill_time)) >= 10
+                                 AND substr(trim(exit_fill_time), 1, 10) = ?
+                                 AND (realized_pnl IS NULL OR realized_pnl = 0)
+                            THEN 1 ELSE 0
+                        END
+                    ) AS flat,
+            """
+            total_realized_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND exit_fill_time IS NOT NULL
+                                 AND length(trim(exit_fill_time)) >= 10
+                                 AND substr(trim(exit_fill_time), 1, 10) = ?
+                            THEN COALESCE(realized_pnl, 0)
+                            ELSE 0
+                        END
+                    ) AS total_realized_pnl
+            """
+            order_realized_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND exit_fill_time IS NOT NULL
+                                 AND length(trim(exit_fill_time)) >= 10
+                                 AND substr(trim(exit_fill_time), 1, 10) = ?
+                            THEN COALESCE(realized_pnl, 0)
+                            ELSE 0
+                        END
+                    ) DESC,
+            """
         else:
             opened_expr = "COUNT(*) AS opened_count,\n"
             exited_expr = """
                     SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) AS exited_count,
+            """
+            closed_expr = "SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) AS closed,\n"
+            closed_long_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND UPPER(TRIM(side)) = 'LONG'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS closed_long,
+            """
+            closed_short_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND UPPER(TRIM(side)) = 'SHORT'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS closed_short,
+            """
+            wins_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND realized_pnl IS NOT NULL
+                                 AND realized_pnl > 0
+                            THEN 1 ELSE 0
+                        END
+                    ) AS wins,
+            """
+            losses_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND realized_pnl IS NOT NULL
+                                 AND realized_pnl < 0
+                            THEN 1 ELSE 0
+                        END
+                    ) AS losses,
+            """
+            flat_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                                 AND (realized_pnl IS NULL OR realized_pnl = 0)
+                            THEN 1 ELSE 0
+                        END
+                    ) AS flat,
+            """
+            total_realized_expr = """
+                    SUM(
+                        CASE
+                            WHEN LOWER(TRIM(status)) = 'closed'
+                            THEN COALESCE(realized_pnl, 0)
+                            ELSE 0
+                        END
+                    ) AS total_realized_pnl
+            """
+            order_realized_expr = """
+                    SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN COALESCE(realized_pnl, 0) ELSE 0 END) DESC,
             """
 
         if date_yyyy_mm_dd:
@@ -1128,7 +1293,22 @@ class TradeJournal:
                         END
                     ) > 0
             """
-            params = [date_yyyy_mm_dd, date_yyyy_mm_dd, date_yyyy_mm_dd, date_yyyy_mm_dd]
+            # Placeholder order follows SQL text order: SELECT expressions first, then WHERE,
+            # then HAVING, then ORDER BY.
+            params = [
+                date_yyyy_mm_dd,  # opened
+                date_yyyy_mm_dd,  # exited
+                date_yyyy_mm_dd,  # closed
+                date_yyyy_mm_dd,  # closed_long
+                date_yyyy_mm_dd,  # closed_short
+                date_yyyy_mm_dd,  # wins
+                date_yyyy_mm_dd,  # losses
+                date_yyyy_mm_dd,  # flat
+                date_yyyy_mm_dd,  # total_realized_pnl
+                date_yyyy_mm_dd,  # WHERE date_filter
+                date_yyyy_mm_dd,  # HAVING opened
+                date_yyyy_mm_dd,  # ORDER BY realized
+            ]
         else:
             having_clause = """
                 HAVING SUM(CASE WHEN LOWER(TRIM(status)) = 'open' THEN 1 ELSE 0 END) > 0
@@ -1158,57 +1338,19 @@ class TradeJournal:
                     ) AS open_short,
                     {opened_expr}
                     {exited_expr}
-                    SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN 1 ELSE 0 END) AS closed,
-                    SUM(
-                        CASE
-                            WHEN LOWER(TRIM(status)) = 'closed'
-                                 AND UPPER(TRIM(side)) = 'LONG'
-                            THEN 1 ELSE 0
-                        END
-                    ) AS closed_long,
-                    SUM(
-                        CASE
-                            WHEN LOWER(TRIM(status)) = 'closed'
-                                 AND UPPER(TRIM(side)) = 'SHORT'
-                            THEN 1 ELSE 0
-                        END
-                    ) AS closed_short,
-                    SUM(
-                        CASE
-                            WHEN LOWER(TRIM(status)) = 'closed'
-                                 AND realized_pnl IS NOT NULL
-                                 AND realized_pnl > 0
-                            THEN 1 ELSE 0
-                        END
-                    ) AS wins,
-                    SUM(
-                        CASE
-                            WHEN LOWER(TRIM(status)) = 'closed'
-                                 AND realized_pnl IS NOT NULL
-                                 AND realized_pnl < 0
-                            THEN 1 ELSE 0
-                        END
-                    ) AS losses,
-                    SUM(
-                        CASE
-                            WHEN LOWER(TRIM(status)) = 'closed'
-                                 AND (realized_pnl IS NULL OR realized_pnl = 0)
-                            THEN 1 ELSE 0
-                        END
-                    ) AS flat,
-                    SUM(
-                        CASE
-                            WHEN LOWER(TRIM(status)) = 'closed'
-                            THEN COALESCE(realized_pnl, 0)
-                            ELSE 0
-                        END
-                    ) AS total_realized_pnl
+                    {closed_expr}
+                    {closed_long_expr}
+                    {closed_short_expr}
+                    {wins_expr}
+                    {losses_expr}
+                    {flat_expr}
+                    {total_realized_expr}
                 FROM trades
                 WHERE 1=1 {date_filter}
                 GROUP BY UPPER(TRIM(symbol))
                 {having_clause}
                 ORDER BY
-                    SUM(CASE WHEN LOWER(TRIM(status)) = 'closed' THEN COALESCE(realized_pnl, 0) ELSE 0 END) DESC,
+                    {order_realized_expr}
                     symbol ASC
                 """
             rows = con.execute(query, params).fetchall()
@@ -1382,7 +1524,9 @@ class TradeJournal:
             )
         return out
 
-    def purge_journal_before_calendar_date(self, first_day_to_keep: str) -> dict[str, int]:
+    def purge_journal_before_calendar_date(
+        self, first_day_to_keep: str, *, strict_trade_time: bool = False
+    ) -> dict[str, int]:
         """
         Remove misleading history **strictly before** ``first_day_to_keep`` (``YYYY-MM-DD``).
 
@@ -1392,6 +1536,10 @@ class TradeJournal:
         that day; and any remaining ``ib_executions`` with fill ``time`` before that day.
 
         Rows on or after ``first_day_to_keep`` are kept.
+
+        When ``strict_trade_time`` is True, an additional pass deletes trade lifecycles where
+        the trade's own timestamps are before the boundary even if their run date does not
+        satisfy the run-based deletion criteria.
         """
         day = first_day_to_keep.strip()[:10]
         if len(day) != 10 or day[4] != "-" or day[7] != "-":
@@ -1506,6 +1654,66 @@ class TradeJournal:
                 (day,),
             )
             stats["ib_executions_deleted_by_fill_time"] = cur.rowcount
+
+            if strict_trade_time:
+                cur = con.execute(
+                    """
+                    DELETE FROM fills
+                    WHERE trade_id IN (
+                        SELECT trade_id
+                        FROM trades
+                        WHERE length(trim(COALESCE(exit_fill_time, entry_fill_time, created_at))) >= 10
+                          AND substr(trim(COALESCE(exit_fill_time, entry_fill_time, created_at)), 1, 10) < ?
+                    )
+                    """,
+                    (day,),
+                )
+                stats["strict_fills_deleted_by_trade_time"] = cur.rowcount
+
+                cur = con.execute(
+                    """
+                    DELETE FROM orders
+                    WHERE trade_id IN (
+                        SELECT trade_id
+                        FROM trades
+                        WHERE length(trim(COALESCE(exit_fill_time, entry_fill_time, created_at))) >= 10
+                          AND substr(trim(COALESCE(exit_fill_time, entry_fill_time, created_at)), 1, 10) < ?
+                    )
+                    """,
+                    (day,),
+                )
+                stats["strict_orders_deleted_by_trade_time"] = cur.rowcount
+
+                cur = con.execute(
+                    """
+                    DELETE FROM ib_executions
+                    WHERE trade_id IN (
+                        SELECT trade_id
+                        FROM trades
+                        WHERE length(trim(COALESCE(exit_fill_time, entry_fill_time, created_at))) >= 10
+                          AND substr(trim(COALESCE(exit_fill_time, entry_fill_time, created_at)), 1, 10) < ?
+                    )
+                    """,
+                    (day,),
+                )
+                stats["strict_ib_exec_deleted_by_trade_time"] = cur.rowcount
+
+                cur = con.execute(
+                    """
+                    DELETE FROM trades
+                    WHERE length(trim(COALESCE(exit_fill_time, entry_fill_time, created_at))) >= 10
+                      AND substr(trim(COALESCE(exit_fill_time, entry_fill_time, created_at)), 1, 10) < ?
+                    """,
+                    (day,),
+                )
+                stats["strict_trades_deleted_by_trade_time"] = cur.rowcount
+
+                cur = con.execute("DELETE FROM fills WHERE trade_id NOT IN (SELECT trade_id FROM trades)")
+                stats["strict_fills_orphan_deleted"] = cur.rowcount
+                cur = con.execute("DELETE FROM orders WHERE trade_id NOT IN (SELECT trade_id FROM trades)")
+                stats["strict_orders_orphan_deleted"] = cur.rowcount
+                cur = con.execute("DELETE FROM ib_executions WHERE trade_id NOT IN (SELECT trade_id FROM trades)")
+                stats["strict_ib_exec_orphan_deleted"] = cur.rowcount
 
         return stats
 
