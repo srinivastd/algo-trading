@@ -725,37 +725,37 @@ class GroqRecommendationsStrategy(StrategyBase):
         return out
 
     def _long_exit_bar_detail(self, df: pd.DataFrame) -> Optional[str]:
-        """
-        Tuned LONG exit (tighter thresholds to let winners run longer).
-
-        - below_demand_zone: requires >3% drop (was 1.5%) + fresh demand zone.
-        - bearish_momentum_or_di: requires >3% drop OR (ADX>35 and -DI>+DI) (was 2%/30).
-        - broke_swing_low: unchanged (strong structure break).
-        This change targets higher mean return by reducing premature exits on volatile names.
-        """
-        if len(df) < 3:
+        """Reliable LONG exit - less sensitive on 15-min bars."""
+        if len(df) < 5:
             return None
+
         current_price = float(df["close"].iloc[-1])
         prev_price = float(df["close"].iloc[-2])
-        current_time = df.index[-1]
         price_change = (current_price - prev_price) / prev_price if prev_price != 0 else 0.0
-        current_adx = float(df["adx"].iloc[-1]) if "adx" in df.columns else 50.0
-        _supply_zones, demand_zones = self.identify_zones(df)
+
+        current_adx = float(df.get("adx", pd.Series(0)).iloc[-1])
+        minus_di = float(df.get("minus_di", pd.Series(0)).iloc[-1])
+        plus_di = float(df.get("plus_di", pd.Series(0)).iloc[-1])
+
+        # 1. Strong swing low break
+        recent_low = df["low"].iloc[-10:].min()
+        if current_price < float(recent_low) * 0.985:
+            return "broke_swing_low"
+
+        # 2. Fresh demand zone violation
+        _, demand_zones = self.identify_zones(df)
         for zone_time, zone_high, zone_low in demand_zones:
-            if (
-                (current_time - zone_time) < timedelta(hours=24)
-                and current_price < zone_low
-                and price_change < -0.03  # tightened from -0.015
-            ):
+            if (df.index[-1] - zone_time).total_seconds() / 3600 < 48 and current_price < zone_low * 0.98:
                 return "below_demand_zone"
-        if price_change < -0.03 or (  # tightened from -0.02
-            current_adx > 35 and df["minus_di"].iloc[-1] > df["plus_di"].iloc[-1]  # ADX 35 vs 30
-        ):
-            return "bearish_momentum_or_di"
-        if len(df) >= 10:
-            recent_low = df["low"].iloc[-10:].min()
-            if current_price < float(recent_low) * 0.995:
-                return "broke_swing_low"
+
+        # 3. DI crossover ONLY with confirmation
+        if (minus_di > plus_di and current_adx > 30 and price_change < -0.008):
+            return "bearish_di_crossover"
+
+        # 4. Overbought + MACD flip
+        if df["rsi"].iloc[-1] > 72 and df["macd_histogram"].iloc[-1] < 0:
+            return "overbought_macd_flip"
+
         return None
 
     def _long_exit_bar_triggered(self, df: pd.DataFrame) -> bool:
@@ -763,30 +763,37 @@ class GroqRecommendationsStrategy(StrategyBase):
         return self._long_exit_bar_detail(df) is not None
 
     def _short_exit_bar_detail(self, df: pd.DataFrame) -> Optional[str]:
-        """SHORT exit rules (symmetric tightening for consistency)."""
-        if len(df) < 3:
+        """Symmetric reliable SHORT exit."""
+        if len(df) < 5:
             return None
+
         current_price = float(df["close"].iloc[-1])
         prev_price = float(df["close"].iloc[-2])
-        current_time = df.index[-1]
         price_change = (current_price - prev_price) / prev_price if prev_price != 0 else 0.0
-        current_adx = float(df["adx"].iloc[-1]) if "adx" in df.columns else 50.0
-        _supply_zones, demand_zones = self.identify_zones(df)
-        for zone_time, zone_high, zone_low in demand_zones:
-            if (
-                (current_time - zone_time) < timedelta(hours=24)
-                and current_price < zone_low
-                and price_change < -0.03
-            ):
-                return "demand_micro_structure"
-        if price_change > 0.03 or (  # tightened from 0.02
-            current_adx > 35 and df["plus_di"].iloc[-1] > df["minus_di"].iloc[-1]  # ADX 35 vs 30
-        ):
-            return "bullish_momentum_or_di"
-        if len(df) >= 10:
-            recent_high = df["high"].iloc[-10:].max()
-            if current_price > float(recent_high) * 1.005:
-                return "broke_swing_high"
+
+        current_adx = float(df.get("adx", pd.Series(0)).iloc[-1])
+        minus_di = float(df.get("minus_di", pd.Series(0)).iloc[-1])
+        plus_di = float(df.get("plus_di", pd.Series(0)).iloc[-1])
+
+        # 1. Strong swing high break
+        recent_high = df["high"].iloc[-10:].max()
+        if current_price > float(recent_high) * 1.015:
+            return "broke_swing_high"
+
+        # 2. Fresh supply zone violation
+        supply_zones, _ = self.identify_zones(df)
+        for zone_time, zone_high, zone_low in supply_zones:
+            if (df.index[-1] - zone_time).total_seconds() / 3600 < 48 and current_price > zone_high * 1.02:
+                return "above_supply_zone"
+
+        # 3. DI crossover with confirmation
+        if (plus_di > minus_di and current_adx > 30 and price_change > 0.008):
+            return "bullish_di_crossover"
+
+        # 4. Oversold + MACD flip
+        if df["rsi"].iloc[-1] < 28 and df["macd_histogram"].iloc[-1] > 0:
+            return "oversold_macd_flip"
+
         return None
 
     def _short_exit_bar_triggered(self, df: pd.DataFrame) -> bool:
@@ -809,7 +816,7 @@ class GroqRecommendationsStrategy(StrategyBase):
         Returns ``(signal, reason)`` with ``reason`` like ``strategy_exit:below_demand_zone`` or
         ``strategy_exit:2bar_mix:a+b`` when the confirming bars fired different rule tags.
         """
-        if len(df) < 4:
+        if len(df) < 6:
             return 0
         d_last = self.calculate_indicators(df)
         d_prev = self.calculate_indicators(df.iloc[:-1])
