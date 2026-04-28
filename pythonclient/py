@@ -1,6 +1,7 @@
 #!/usr/bin/env sh
 # Use project deps (pytz, ib_insync, …). From pythonclient/:
 #   ./py -m pip install -r requirements.txt       # install/upgrade deps (no global `pip` needed)
+#   PYTHONPATH=src ./py -m uvicorn zone_validation_app.main:app --port 8766  # zone chart UI (not brew uvicorn)
 #   ./py src/main.py --paper                     # paper trading (now has strict PDT/settlement gates)
 #   ./py src/main.py --paper --lax-paper         # disable gates for diagnostics only
 #   ./py src/journal_dashboard.py                # trade journal / IB P&L UI (default :8765)

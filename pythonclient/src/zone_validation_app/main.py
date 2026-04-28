@@ -1,10 +1,16 @@
 """
 Minimal FastAPI server for zone + journal charts.
 
-Run (from ``pythonclient`` with deps installed):
-  PYTHONPATH=src uvicorn zone_validation_app.main:app --reload --host 127.0.0.1 --port 8765
+Run from ``pythonclient`` (uses project venv via ``./py``, same as other tools):
 
-Open http://127.0.0.1:8765/
+  ./scripts/run_zone_validation_server.sh
+
+Or:
+
+  PYTHONPATH=src ./py -m uvicorn zone_validation_app.main:app --reload --host 127.0.0.1 --port 8766
+
+Use a free port (e.g. 8766) if ``journal_dashboard`` is on 8765. Do not use Homebrew's
+``uvicorn`` — it runs a different Python without ``pandas`` / project deps.
 """
 
 from __future__ import annotations
