@@ -410,6 +410,21 @@ async def watch_mode(
                         realized_pnl_today=pnl_ib.get("realized_pnl"),
                         ib_daily_pnl=pnl_ib.get("daily_pnl"),
                     )
+                    try:
+                        day = now.strftime("%Y-%m-%d")
+                        day_agg = journal.get_journal_exit_day_aggregate(day)
+                        ib_realized = _safe_float(pnl_ib.get("realized_pnl"))
+                        if ib_realized is not None:
+                            delta = ib_realized - float(day_agg.get("sum_realized_pnl") or 0.0)
+                            logger.info(
+                                "PnL reconcile %s: IB realized=%.2f, journal closed Σ=%.2f, delta=%.2f",
+                                day,
+                                ib_realized,
+                                float(day_agg.get("sum_realized_pnl") or 0.0),
+                                delta,
+                            )
+                    except Exception as reconcile_err:
+                        logger.debug("PnL reconciliation log skipped: %s", reconcile_err)
                     _log_ib_account_pnl(pnl_ib)
                 except asyncio.CancelledError:
                     raise
@@ -672,6 +687,20 @@ async def watch_mode(
                                 if exit_result['status'] == 'success':
                                     is_long = position_size > 0
                                     bar_px = float(df["close"].iloc[-1])
+                                    at = active_trades.get(pos_symbol, {})
+                                    entry_basis = _safe_float(at.get("entry_fill_price"))
+                                    if entry_basis is None or entry_basis <= 0:
+                                        entry_basis = _safe_float(at.get("entry_price"))
+                                    pnl_cost_basis = float(avg_cost)
+                                    if (pnl_cost_basis <= 0) and (entry_basis is not None and entry_basis > 0):
+                                        pnl_cost_basis = float(entry_basis)
+                                        logger.warning(
+                                            "PnL cost-basis fallback for %s trade=%s: avgCost=%.4f -> entry_basis=%.4f",
+                                            pos_symbol,
+                                            trade_id,
+                                            float(avg_cost),
+                                            float(pnl_cost_basis),
+                                        )
                                     oid_exit = exit_result.get("order_id")
                                     if journal and trade_id != "UNKNOWN_TRADE" and oid_exit is not None:
                                         try:
@@ -708,7 +737,7 @@ async def watch_mode(
                                     agg = _aggregate_exit_fills_pnl(
                                         matching_exit,
                                         is_long=is_long,
-                                        avg_cost=avg_cost,
+                                        avg_cost=pnl_cost_basis,
                                     )
                                     if agg is not None:
                                         vwap_px, _qty_x, pnl, _comm_sum, latest_t = agg
@@ -719,16 +748,15 @@ async def watch_mode(
                                             fill_time_exit = current_time
                                     else:
                                         if is_long:
-                                            pnl = float(exit_quantity) * (bar_px - avg_cost)
+                                            pnl = float(exit_quantity) * (bar_px - pnl_cost_basis)
                                         else:
-                                            pnl = float(exit_quantity) * (avg_cost - bar_px)
+                                            pnl = float(exit_quantity) * (pnl_cost_basis - bar_px)
                                         fill_px = bar_px
                                         fill_time_exit = current_time
                                     logger.info(
                                         f"TRADE {trade_id}: Closed position {pos_symbol}: "
                                         f"{exit_action} {exit_quantity} sh @ ${fill_px:.2f}, PnL: ${pnl:.2f}"
                                     )
-                                    at = active_trades.get(pos_symbol, {})
                                     if journal and trade_id != "UNKNOWN_TRADE":
                                         try:
                                             journal.close_trade(
