@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
 # Use project deps (pytz, ib_insync, …). From pythonclient/:
+#   ./py -m pip install -r requirements.txt       # install/upgrade deps (no global `pip` needed)
 #   ./py src/main.py --paper                     # paper trading (now has strict PDT/settlement gates)
 #   ./py src/main.py --paper --lax-paper         # disable gates for diagnostics only
 #   ./py src/journal_dashboard.py                # trade journal / IB P&L UI (default :8765)
