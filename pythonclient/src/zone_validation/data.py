@@ -4,10 +4,14 @@ Load cached IB-style OHLCV CSVs (same layout as ibkr/historical_data cache).
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import pytz
+
+_ET = pytz.timezone("America/New_York")
 
 
 def bar_size_to_cache_suffix(bar_size: str) -> str:
@@ -55,3 +59,26 @@ def load_ohlcv_csv(path: Path) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def session_day_bars_error_hint(df: pd.DataFrame, day_yyyy_mm_dd: str) -> str | None:
+    """
+    If the index has at least one bar on the given ET calendar day, return ``None``.
+
+    Otherwise return a user-facing message with the data's index range (for picking a valid day).
+    """
+    if df.empty:
+        return "OHLCV is empty after load."
+    day = day_yyyy_mm_dd.strip()[:10]
+    d0 = datetime.strptime(day, "%Y-%m-%d")
+    day_start = pd.Timestamp(_ET.localize(d0))
+    day_end = day_start + pd.Timedelta(days=1)
+    win = (df.index >= day_start) & (df.index < day_end)
+    if bool(win.any()):
+        return None
+    tmin, tmax = df.index.min(), df.index.max()
+    return (
+        f"No bars for session {day} (ET) in this cache. "
+        f"File index range: {tmin} … {tmax}. "
+        f"Choose a day inside that range, or refresh/download CSV that includes your session."
+    )

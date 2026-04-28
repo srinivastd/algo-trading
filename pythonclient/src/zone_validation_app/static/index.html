@@ -25,7 +25,10 @@
   <h1>Zone validation (OHLCV + zones + journal)</h1>
   <form id="f">
     <label>Symbol <input name="symbol" value="NVDA" required maxlength="16" /></label>
-    <label>Day (ET) <input name="day" type="date" required /></label>
+    <label>Day (ET)
+      <input name="day" type="date" required />
+      <span style="font-size:0.7rem;color:#888;font-weight:normal">Defaults to today on load; must fall inside your cache CSV bar range.</span>
+    </label>
     <label>Bar size <input name="bar_size" value="15 mins" /></label>
     <label>CSV file <input name="csv_file" placeholder="optional, under historical_data/" /></label>
     <label>Run ID <input name="run_id" placeholder="optional: journal run → default params" style="min-width:16rem" /></label>

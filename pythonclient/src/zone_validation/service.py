@@ -13,7 +13,8 @@ from typing import Any, Mapping
 from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy
 from trade_journal import TradeJournal
 
-from . import build_zone_trade_figure, load_ohlcv_csv, pick_cache_csv
+from . import build_zone_trade_figure
+from .data import load_ohlcv_csv, pick_cache_csv, session_day_bars_error_hint
 
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -109,15 +110,24 @@ def render_zone_trade_chart(
         trades = journal.get_trades_touching_calendar_day(day)
         trades = [t for t in trades if (t.get("symbol") or "").strip().upper() == sym]
 
+    no_day = session_day_bars_error_hint(df_ind, day)
+    if no_day:
+        raise ZoneChartError(no_day)
+
     title = f"{sym} {day} | zones + journal | {csv_path.name}"
-    fig = build_zone_trade_figure(
-        df_ind,
-        day,
-        supply,
-        demand,
-        trades,
-        title=title,
-    )
+    try:
+        fig = build_zone_trade_figure(
+            df_ind,
+            day,
+            supply,
+            demand,
+            trades,
+            title=title,
+        )
+    except ValueError as e:
+        if "No bars in" in str(e):
+            raise ZoneChartError(str(e)) from e
+        raise
 
     meta: dict[str, Any] = {
         "symbol": sym,
