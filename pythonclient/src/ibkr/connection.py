@@ -656,6 +656,43 @@ class IBKRConnection:
         except Exception as e:
             logger.debug("cancel_account_pnl_subscription: %s", e)
 
+    async def get_current_positions(self) -> List[Dict[str, Any]]:
+        """
+        Return current open positions from IBKR portfolio (matches logs and TWS).
+
+        Positive position = LONG, negative = SHORT. Used by dashboard live panel and
+        position sync to journal. Returns only non-zero positions.
+        """
+        if not self.is_connected():
+            logger.debug("get_current_positions: not connected")
+            return []
+
+        try:
+            ib = self.get_ib()
+            positions = await ib.reqPositionsAsync()
+            result: List[Dict[str, Any]] = []
+            for p in positions:
+                pos = float(getattr(p, "position", 0.0))
+                if abs(pos) < 0.001:
+                    continue
+                contract = getattr(p, "contract", None)
+                symbol = getattr(contract, "symbol", "UNKNOWN").upper() if contract else "UNKNOWN"
+                result.append({
+                    "symbol": symbol,
+                    "secType": getattr(contract, "secType", "STK") if contract else "STK",
+                    "position": pos,  # positive=long, negative=short
+                    "avgCost": float(getattr(p, "avgCost", 0.0)),
+                    "unrealizedPNL": float(getattr(p, "unrealizedPNL", 0.0)) if hasattr(p, "unrealizedPNL") else None,
+                    "marketValue": float(getattr(p, "marketValue", 0.0)) if hasattr(p, "marketValue") else None,
+                    "marketPrice": getattr(p, "marketPrice", None),
+                })
+            if result:
+                logger.info(f"Retrieved {len(result)} current IBKR positions: {[p['symbol'] for p in result]}")
+            return result
+        except Exception as e:
+            logger.warning(f"get_current_positions failed: {e}")
+            return []
+
     async def _sell_only_closes_or_reduces_long(self, symbol: str, quantity: int) -> bool:
         """
         True when SELL size is fully covered by an existing **long** stock position (close/trim only).
