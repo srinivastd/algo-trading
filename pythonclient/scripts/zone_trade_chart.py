@@ -6,6 +6,8 @@ Run from repo (example):
   cd pythonclient && PYTHONPATH=src python scripts/zone_trade_chart.py \\
     --symbol NVDA --day 2026-04-28 --html /tmp/nvda_zones.html
 
+HTTP UI: see ``zone_validation_app/main.py`` and ``scripts/run_zone_validation_server.sh``.
+
 Uses the newest matching IB cache CSV under historical_data/ (see ibkr/historical_data.py naming).
 """
 from __future__ import annotations
@@ -19,9 +21,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy  # noqa: E402
-from trade_journal import TradeJournal  # noqa: E402
-from zone_validation import load_ohlcv_csv, pick_cache_csv, build_zone_trade_figure  # noqa: E402
+from zone_validation.service import ZoneChartError, render_zone_trade_chart  # noqa: E402
 
 
 def _pythonclient_root() -> Path:
@@ -64,21 +64,6 @@ def main() -> int:
     args = p.parse_args()
 
     sym = args.symbol.strip().upper()
-    csv_path = pick_cache_csv(args.data_dir, sym, args.bar_size, prefer_path=args.csv)
-    if csv_path is None:
-        print(
-            f"No cache CSV for {sym} ({args.bar_size}). "
-            f"Place a file like {sym}-YYYY-MM-DD-YYYY-MM-DD-{args.bar_size.replace(' ', '')}.csv "
-            f"under {args.data_dir} or pass --csv.",
-            file=sys.stderr,
-        )
-        return 1
-
-    raw = load_ohlcv_csv(csv_path)
-    if raw.empty:
-        print(f"Empty CSV: {csv_path}", file=sys.stderr)
-        return 1
-
     strat_kw: dict = {}
     if args.strategy_params and args.strategy_params.is_file():
         strat_kw = json.loads(args.strategy_params.read_text(encoding="utf-8"))
@@ -86,28 +71,23 @@ def main() -> int:
             print("--strategy-params must be a JSON object", file=sys.stderr)
             return 1
 
-    strategy = GroqRecommendationsStrategy(**strat_kw)
-    df_ind = strategy.calculate_indicators(raw.copy())
-    supply, demand = strategy.identify_zones(df_ind)
+    csv_path = args.csv.resolve() if args.csv else None
 
-    trades: list = []
-    if not args.no_journal and args.journal_db.is_file():
-        journal = TradeJournal(args.journal_db)
-        trades = journal.get_trades_touching_calendar_day(args.day.strip()[:10])
-        trades = [t for t in trades if (t.get("symbol") or "").strip().upper() == sym]
-    elif not args.no_journal:
-        print(f"Journal DB not found ({args.journal_db}); use --no-journal or fix path.", file=sys.stderr)
+    try:
+        fig, _ = render_zone_trade_chart(
+            symbol=sym,
+            day_yyyy_mm_dd=args.day.strip()[:10],
+            pythonclient_root=root,
+            data_dir=args.data_dir,
+            csv_path=csv_path,
+            bar_size=args.bar_size,
+            journal_db=args.journal_db,
+            no_journal=args.no_journal,
+            strategy_params=strat_kw or None,
+        )
+    except ZoneChartError as e:
+        print(str(e), file=sys.stderr)
         return 1
-
-    title = f"{sym} {args.day} | zones + journal | {csv_path.name}"
-    fig = build_zone_trade_figure(
-        df_ind,
-        args.day.strip()[:10],
-        supply,
-        demand,
-        trades,
-        title=title,
-    )
 
     if args.html:
         args.html.parent.mkdir(parents=True, exist_ok=True)

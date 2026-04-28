@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Zone validation</title>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <style>
+    :root { font-family: system-ui, sans-serif; background: #111; color: #e8e8e8; }
+    body { margin: 0; padding: 1rem; max-width: 1200px; margin-inline: auto; }
+    h1 { font-size: 1.25rem; font-weight: 600; }
+    form { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-end; margin-bottom: 1rem; }
+    label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.8rem; color: #aaa; }
+    input, button { padding: 0.4rem 0.6rem; border-radius: 6px; border: 1px solid #444; background: #1e1e1e; color: #eee; }
+    button { cursor: pointer; background: #2d5a87; border-color: #3a7ab8; font-weight: 600; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: #333; border-color: #555; }
+    #chart { width: 100%; height: 720px; background: #0d0d0d; border-radius: 8px; }
+    #err { color: #f66; white-space: pre-wrap; font-size: 0.9rem; margin-bottom: 0.5rem; }
+    #meta { font-size: 0.85rem; color: #9ab; margin-bottom: 0.5rem; }
+    textarea { min-width: 220px; min-height: 60px; font-family: ui-monospace, monospace; font-size: 0.75rem; }
+  </style>
+</head>
+<body>
+  <h1>Zone validation (OHLCV + zones + journal)</h1>
+  <form id="f">
+    <label>Symbol <input name="symbol" value="NVDA" required maxlength="16" /></label>
+    <label>Day (ET) <input name="day" type="date" required /></label>
+    <label>Bar size <input name="bar_size" value="15 mins" /></label>
+    <label>CSV file <input name="csv_file" placeholder="optional, under historical_data/" /></label>
+    <label style="flex-direction:row; align-items:center; gap:0.5rem;">
+      <input name="no_journal" type="checkbox" /> No journal
+    </label>
+    <label>Strategy params (JSON) <textarea name="strategy_params_json" placeholder='{}'></textarea></label>
+    <button type="submit" id="go">Load chart</button>
+    <button type="button" class="secondary" id="today">Today</button>
+  </form>
+  <div id="err"></div>
+  <div id="meta"></div>
+  <div id="chart"></div>
+  <script>
+    const chartEl = document.getElementById("chart");
+    const errEl = document.getElementById("err");
+    const metaEl = document.getElementById("meta");
+    const form = document.getElementById("f");
+    const goBtn = document.getElementById("go");
+
+    const pad = (n) => String(n).padStart(2, "0");
+    function localTodayISO() {
+      const d = new Date();
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+    }
+    document.querySelector('input[name="day"]').value = localTodayISO();
+    document.getElementById("today").addEventListener("click", () => {
+      document.querySelector('input[name="day"]').value = localTodayISO();
+    });
+
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      errEl.textContent = "";
+      metaEl.textContent = "";
+      goBtn.disabled = true;
+      const fd = new FormData(form);
+      const params = new URLSearchParams();
+      params.set("symbol", fd.get("symbol").trim());
+      params.set("day", fd.get("day"));
+      params.set("bar_size", fd.get("bar_size") || "15 mins");
+      const cf = (fd.get("csv_file") || "").trim();
+      if (cf) params.set("csv_file", cf);
+      if (fd.get("no_journal")) params.set("no_journal", "true");
+      const sp = (fd.get("strategy_params_json") || "").trim();
+      if (sp) params.set("strategy_params_json", sp);
+
+      try {
+        const res = await fetch("/api/chart?" + params.toString());
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const d = body.detail;
+          errEl.textContent = typeof d === "string" ? d : JSON.stringify(d, null, 2);
+          return;
+        }
+        const { figure, meta } = body;
+        metaEl.textContent = JSON.stringify(meta, null, 2);
+        await Plotly.newPlot(chartEl, figure.data, figure.layout, { responsive: true });
+      } catch (e) {
+        errEl.textContent = String(e);
+      } finally {
+        goBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
