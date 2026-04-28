@@ -329,6 +329,37 @@ def _html_shell(
             f"<td class='num {tp_cls}'>{_fmt_money(tot_pnl)}</td></tr>"
         )
 
+    # Live IBKR Positions panel (from snapshot.positions or latest snapshot) - matches logs
+    positions_html = ""
+    positions = (snap or {}).get("positions", [])
+    if positions:
+        pos_rows = ""
+        for p in positions:
+            sym = html.escape(p.get("symbol", ""))
+            qty = p.get("qty") or p.get("position", 0)
+            is_short = qty < 0
+            side = "SHORT" if is_short else "LONG"
+            side_cls = "loss" if is_short else "win"
+            pos_rows += (
+                f"<tr><td><strong>{sym}</strong></td>"
+                f"<td class='num {side_cls}'>{side}</td>"
+                f"<td class='num'>{abs(int(qty))}</td>"
+                f"<td class='num'>{_fmt_money(p.get('avgCost'))}</td>"
+                f"<td class='num'>{_fmt_money(p.get('unrealizedPNL'))}</td></tr>"
+            )
+        positions_html = f'''
+  <h2>Live IBKR Positions (from latest snapshot)</h2>
+  <p class="meta">Pulled from IBKR `reqPositionsAsync()` in snapshot_loop. Positive qty = LONG, negative = SHORT. Matches logs (e.g. AMZN/TSLA shorts). Journal "open" rows may include stale/historical from previous runs.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Cost</th><th>Unrealized PnL</th></tr></thead>
+      <tbody>{pos_rows}</tbody>
+    </table>
+  </div>
+'''
+    else:
+        positions_html = '<p class="meta">No positions in latest snapshot yet (run watch mode longer).</p>'
+
     _api_example_day = "2026-04-17"
     api_trades_quick = (
         f'<p class="meta"><strong>Per-trade JSON</strong> (same host/port as this page): '
@@ -390,6 +421,7 @@ def _html_shell(
     <div class="card"><div class="label">{d_lbl}</div><div class="value">{d}</div></div>
   </div>
   {pnl_note}
+  {positions_html}
   {ib_vs_journal}
   {day_exit_block}
   <h2>Activity by symbol{date_title}</h2>
@@ -449,13 +481,21 @@ def main() -> None:
         metavar="YYYY-MM-DD",
         help="Destructive: delete journal data strictly before this calendar day (runs, trades, snapshots, …), then exit.",
     )
+    ap.add_argument(
+        "--purge-strict",
+        action="store_true",
+        help="When used with --purge-before-date, also purge trades by their own timestamps (entry/exit/created_at) and clean orphan rows.",
+    )
     args = ap.parse_args()
     db_path = args.db.resolve()
     if args.purge_before_date:
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", args.purge_before_date):
             raise SystemExit("--purge-before-date must be YYYY-MM-DD")
         journal = TradeJournal(db_path)
-        stats = journal.purge_journal_before_calendar_date(args.purge_before_date)
+        stats = journal.purge_journal_before_calendar_date(
+            args.purge_before_date,
+            strict_trade_time=bool(args.purge_strict),
+        )
         print(json.dumps(stats, indent=2))
         print(f"Purge complete (kept {args.purge_before_date} onward). DB: {db_path}")
         return
@@ -556,25 +596,26 @@ def main() -> None:
                 self._send_json(snap if snap else {})
                 return
             if path in ("/", "/index.html"):
-                if selected_date:
-                    cards_snap = journal.get_daily_snapshot_last_for_date(selected_date)
-                    recent = journal.get_recent_daily_snapshots_for_date(selected_date, 100)
+                dates = journal.get_available_dates()
+                effective_date = selected_date or (dates[0] if dates else None)
+                if effective_date:
+                    cards_snap = journal.get_daily_snapshot_last_for_date(effective_date)
+                    recent = journal.get_recent_daily_snapshots_for_date(effective_date, 100)
                 else:
                     cards_snap = journal.get_latest_daily_snapshot()
                     recent = journal.get_recent_daily_snapshots(100)
-                activity = journal.get_activity_by_symbol(selected_date)
-                dates = journal.get_available_dates()
+                activity = journal.get_activity_by_symbol(effective_date)
                 day_exit = (
-                    journal.get_journal_exit_day_aggregate(selected_date)
-                    if selected_date
+                    journal.get_journal_exit_day_aggregate(effective_date)
+                    if effective_date
                     else None
                 )
                 trades_rows = (
-                    journal.get_trades_touching_calendar_day(selected_date)
-                    if selected_date
+                    journal.get_trades_touching_calendar_day(effective_date)
+                    if effective_date
                     else []
                 )
-                trades_detail_html = _build_trades_day_html(trades_rows, selected_date)
+                trades_detail_html = _build_trades_day_html(trades_rows, effective_date)
                 self._send_html(
                     _html_shell(
                         cards_snap,
@@ -582,7 +623,7 @@ def main() -> None:
                         activity,
                         dates,
                         str(db_path),
-                        selected_date,
+                        effective_date,
                         day_exit,
                         trades_detail_html=trades_detail_html,
                     )
