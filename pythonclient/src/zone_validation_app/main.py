@@ -21,9 +21,11 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from trade_journal import TradeJournal
 
 from zone_validation.service import (
     ZoneChartError,
+    groq_strategy_kwargs_from_run_params,
     parse_strategy_params_json,
     render_zone_trade_chart,
     resolve_csv_under_data_dir,
@@ -50,12 +52,36 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/run-params")
+def api_run_params(
+    run_id: str = Query(..., min_length=1, description="Journal run_id (runs.params_json)"),
+) -> JSONResponse:
+    """Return Groq strategy kwargs derived from ``trade_journal.runs`` (for textarea prefill)."""
+    root = _pythonclient_root()
+    jpath = root / "trade_journal.db"
+    if not jpath.is_file():
+        raise HTTPException(status_code=400, detail=f"Journal DB not found: {jpath}")
+    journal = TradeJournal(jpath)
+    raw = journal.get_run_params(run_id.strip())
+    if raw is None:
+        raise HTTPException(status_code=404, detail=f"Unknown run_id: {run_id!r}")
+    groq = groq_strategy_kwargs_from_run_params(raw)
+    return JSONResponse(
+        content={"run_id": run_id.strip(), "groq_params": groq},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/api/chart")
 def api_chart(
     symbol: str = Query(..., min_length=1, max_length=16),
     day: str = Query(..., description="Session calendar day YYYY-MM-DD (ET bar index)"),
     bar_size: str = Query("15 mins"),
     no_journal: bool = Query(False),
+    run_id: str | None = Query(
+        None,
+        description="Journal run: load default Groq kwargs from runs.params_json (JSON overrides on top)",
+    ),
     csv_file: str | None = Query(
         None,
         description="Optional cache filename only (must live under historical_data/)",
@@ -86,6 +112,7 @@ def api_chart(
             bar_size=bar_size,
             journal_db=root / "trade_journal.db",
             no_journal=no_journal,
+            run_id=run_id,
             strategy_params=strat,
         )
     except ZoneChartError as e:

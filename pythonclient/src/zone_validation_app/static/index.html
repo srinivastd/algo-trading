@@ -28,11 +28,13 @@
     <label>Day (ET) <input name="day" type="date" required /></label>
     <label>Bar size <input name="bar_size" value="15 mins" /></label>
     <label>CSV file <input name="csv_file" placeholder="optional, under historical_data/" /></label>
+    <label>Run ID <input name="run_id" placeholder="optional: journal run → default params" style="min-width:16rem" /></label>
     <label style="flex-direction:row; align-items:center; gap:0.5rem;">
       <input name="no_journal" type="checkbox" /> No journal
     </label>
-    <label>Strategy params (JSON) <textarea name="strategy_params_json" placeholder='{}'></textarea></label>
+    <label>Strategy params (JSON) <textarea name="strategy_params_json" placeholder='{} optional; overrides run_id'></textarea></label>
     <button type="submit" id="go">Load chart</button>
+    <button type="button" class="secondary" id="loadRunParams">Load params from run</button>
     <button type="button" class="secondary" id="today">Today</button>
   </form>
   <div id="err"></div>
@@ -55,6 +57,28 @@
       document.querySelector('input[name="day"]').value = localTodayISO();
     });
 
+    document.getElementById("loadRunParams").addEventListener("click", async () => {
+      errEl.textContent = "";
+      const runInput = document.querySelector('input[name="run_id"]');
+      const rid = runInput ? String(runInput.value).trim() : "";
+      if (!rid) {
+        errEl.textContent = "Enter a run_id first.";
+        return;
+      }
+      try {
+        const res = await fetch("/api/run-params?" + new URLSearchParams({ run_id: String(rid).trim() }));
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const d = body.detail;
+          errEl.textContent = typeof d === "string" ? d : JSON.stringify(d, null, 2);
+          return;
+        }
+        document.querySelector('textarea[name="strategy_params_json"]').value = JSON.stringify(body.groq_params, null, 2);
+      } catch (e) {
+        errEl.textContent = String(e);
+      }
+    });
+
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       errEl.textContent = "";
@@ -68,6 +92,8 @@
       const cf = (fd.get("csv_file") || "").trim();
       if (cf) params.set("csv_file", cf);
       if (fd.get("no_journal")) params.set("no_journal", "true");
+      const rid = (fd.get("run_id") || "").trim();
+      if (rid) params.set("run_id", rid);
       const sp = (fd.get("strategy_params_json") || "").trim();
       if (sp) params.set("strategy_params_json", sp);
 

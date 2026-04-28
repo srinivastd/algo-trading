@@ -284,6 +284,27 @@ class TradeJournal:
             )
         return run_id
 
+    def get_run_params(self, run_id: str) -> dict[str, Any] | None:
+        """
+        Return parsed ``params_json`` for a journal run, or ``None`` if the run_id is missing
+        or invalid JSON.
+        """
+        rid = (run_id or "").strip()
+        if not rid:
+            return None
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT params_json FROM runs WHERE run_id = ?",
+                (rid,),
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            obj = json.loads(row[0])
+        except json.JSONDecodeError:
+            return None
+        return obj if isinstance(obj, dict) else None
+
     def end_run(self, run_id: str) -> None:
         with self._conn() as con:
             con.execute(

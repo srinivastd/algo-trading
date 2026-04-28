@@ -4,10 +4,11 @@ Shared entry point for CLI and HTTP: load bars, run identify_zones, build Plotly
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy
 from trade_journal import TradeJournal
@@ -19,6 +20,20 @@ _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 class ZoneChartError(ValueError):
     """User-facing error (bad args, missing cache, empty data)."""
+
+
+def _groq_init_param_names() -> set[str]:
+    sig = inspect.signature(GroqRecommendationsStrategy.__init__)
+    return {p for p in sig.parameters if p != "self"}
+
+
+def groq_strategy_kwargs_from_run_params(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Keep only ``GroqRecommendationsStrategy`` constructor keys; drop journal-only fields
+    (e.g. check_interval, strategy_exit_signals).
+    """
+    names = _groq_init_param_names()
+    return {k: v for k, v in raw.items() if k in names}
 
 
 def _pythonclient_root() -> Path:
@@ -35,6 +50,7 @@ def render_zone_trade_chart(
     bar_size: str = "15 mins",
     journal_db: Path | None = None,
     no_journal: bool = False,
+    run_id: str | None = None,
     strategy_params: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """
@@ -67,7 +83,18 @@ def render_zone_trade_chart(
     if raw.empty:
         raise ZoneChartError(f"Empty CSV: {csv_path}")
 
-    strat_kw = dict(strategy_params or {})
+    strat_kw: dict[str, Any] = {}
+    if run_id and str(run_id).strip():
+        if not jpath.is_file():
+            raise ZoneChartError(
+                f"Journal DB not found at {jpath}. Cannot load run_id {run_id!r}."
+            )
+        journal = TradeJournal(jpath)
+        run_raw = journal.get_run_params(str(run_id).strip())
+        if not run_raw:
+            raise ZoneChartError(f"Unknown run_id: {str(run_id).strip()!r} (not in runs table).")
+        strat_kw = groq_strategy_kwargs_from_run_params(run_raw)
+    strat_kw = {**strat_kw, **dict(strategy_params or {})}
     strategy = GroqRecommendationsStrategy(**strat_kw)
     df_ind = strategy.calculate_indicators(raw.copy())
     supply, demand = strategy.identify_zones(df_ind)
@@ -92,7 +119,7 @@ def render_zone_trade_chart(
         title=title,
     )
 
-    meta = {
+    meta: dict[str, Any] = {
         "symbol": sym,
         "day": day,
         "csv": str(csv_path),
@@ -101,6 +128,9 @@ def render_zone_trade_chart(
         "demand_zones": len(demand),
         "journal_trades_plotted": len(trades),
     }
+    if run_id and str(run_id).strip():
+        meta["run_id"] = str(run_id).strip()
+        meta["params_from_run"] = True
     return fig, meta
 
 

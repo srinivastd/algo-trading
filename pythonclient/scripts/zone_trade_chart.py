@@ -54,10 +54,15 @@ def main() -> int:
     )
     p.add_argument("--no-journal", action="store_true", help="Skip DB; zones and OHLCV only")
     p.add_argument(
+        "--run-id",
+        default=None,
+        help="Journal run_id: load default Groq kwargs from trade_journal.runs.params_json",
+    )
+    p.add_argument(
         "--strategy-params",
         type=Path,
         default=None,
-        help="Optional JSON object of GroqRecommendationsStrategy kwargs (matches a run/experiment)",
+        help="Optional JSON file of GroqRecommendationsStrategy kwargs (merged on top of --run-id)",
     )
     p.add_argument("--html", type=Path, default=None, help="Write interactive HTML (Plotly)")
     p.add_argument("--show", action="store_true", help="Open default browser (requires display)")
@@ -72,6 +77,7 @@ def main() -> int:
             return 1
 
     csv_path = args.csv.resolve() if args.csv else None
+    run_id = (args.run_id or "").strip() or None
 
     try:
         fig, _ = render_zone_trade_chart(
@@ -83,6 +89,7 @@ def main() -> int:
             bar_size=args.bar_size,
             journal_db=args.journal_db,
             no_journal=args.no_journal,
+            run_id=run_id,
             strategy_params=strat_kw or None,
         )
     except ZoneChartError as e:
