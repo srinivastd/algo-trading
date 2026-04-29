@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from trade_journal import TradeJournal
 
+from zone_validation.data import list_matching_cache_csvs
 from zone_validation.service import (
     ZoneChartError,
     groq_strategy_kwargs_from_run_params,
@@ -50,6 +51,34 @@ app.mount(
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/cache-files")
+def api_cache_files(
+    symbol: str = Query(..., min_length=1, max_length=16),
+    bar_size: str = Query("15 mins"),
+) -> dict[str, object]:
+    """List ``historical_data`` CSVs for symbol + bar size (newest first)."""
+    root = _pythonclient_root()
+    data_dir = root / "historical_data"
+    files = list_matching_cache_csvs(data_dir, symbol.strip().upper(), bar_size)
+    return {
+        "symbol": symbol.strip().upper(),
+        "bar_size": bar_size,
+        "data_dir": str(data_dir),
+        "files": files,
+    }
+
+
+@app.get("/api/runs")
+def api_runs(limit: int = Query(30, ge=1, le=200)) -> dict[str, object]:
+    """Recent ``trade_journal.runs`` rows (newest first) for run_id autofill."""
+    root = _pythonclient_root()
+    jpath = root / "trade_journal.db"
+    if not jpath.is_file():
+        return {"runs": [], "journal_db": str(jpath), "note": "journal database not found"}
+    journal = TradeJournal(jpath)
+    return {"runs": journal.list_recent_runs(limit=limit), "journal_db": str(jpath)}
 
 
 @app.get("/api/run-params")

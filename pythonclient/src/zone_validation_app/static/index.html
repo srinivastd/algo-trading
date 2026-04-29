@@ -19,10 +19,22 @@
     #err { color: #f66; white-space: pre-wrap; font-size: 0.9rem; margin-bottom: 0.5rem; }
     #meta { font-size: 0.85rem; color: #9ab; margin-bottom: 0.5rem; }
     textarea { min-width: 220px; min-height: 60px; font-family: ui-monospace, monospace; font-size: 0.75rem; }
+    details { margin-bottom: 0.75rem; color: #bbb; font-size: 0.85rem; }
+    details ul { margin: 0.4rem 0 0 1.2rem; }
+    code { background: #222; padding: 0 0.2rem; border-radius: 3px; }
   </style>
 </head>
 <body>
   <h1>Zone validation (OHLCV + zones + journal)</h1>
+  <details>
+    <summary>What goes in CSV / Run ID / Strategy params?</summary>
+    <ul>
+      <li><strong>CSV file</strong> — Optional filename only, under <code>historical_data/</code> (e.g. <code>NVDA-2023-01-01-2026-04-28-15mins.csv</code>). Empty = use newest file for symbol + bar size (see list after <strong>Refresh lists</strong>).</li>
+      <li><strong>Run ID</strong> — Optional <code>trade_journal.runs.run_id</code> from a watch/paper session. Loads stored <code>params_json</code> into the strategy (same knobs as that run). “Load params from run” copies them into the JSON box. Not the data file: bars still come from the CSV.</li>
+      <li><strong>Strategy params (JSON)</strong> — Optional overrides for <code>GroqRecommendationsStrategy</code> (e.g. <code>adx_min</code>, <code>zone_lookback</code>). Applied on top of Run ID. Logs and Chroma are <em>not</em> read for params—only the journal run row or this JSON.</li>
+      <li><strong>Day (ET)</strong> — Defaults to browser “today” on load. Must be a calendar day that has at least one bar in the <em>selected</em> CSV (see <code>cache_index_start</code> / <code>cache_index_end</code> in meta after a successful chart).</li>
+    </ul>
+  </details>
   <form id="f">
     <label>Symbol <input name="symbol" value="NVDA" required maxlength="16" /></label>
     <label>Day (ET)
@@ -30,16 +42,23 @@
       <span style="font-size:0.7rem;color:#888;font-weight:normal">Defaults to today on load; must fall inside your cache CSV bar range.</span>
     </label>
     <label>Bar size <input name="bar_size" value="15 mins" /></label>
-    <label>CSV file <input name="csv_file" placeholder="optional, under historical_data/" /></label>
-    <label>Run ID <input name="run_id" placeholder="optional: journal run → default params" style="min-width:16rem" /></label>
+    <label>CSV file
+      <input name="csv_file" list="csv-list" placeholder="optional — pick from list or leave empty" autocomplete="off" />
+    </label>
+    <label>Run ID
+      <input name="run_id" list="run-list" placeholder="optional — journal run for default params" style="min-width:16rem" autocomplete="off" />
+    </label>
     <label style="flex-direction:row; align-items:center; gap:0.5rem;">
       <input name="no_journal" type="checkbox" /> No journal
     </label>
     <label>Strategy params (JSON) <textarea name="strategy_params_json" placeholder='{} optional; overrides run_id'></textarea></label>
     <button type="submit" id="go">Load chart</button>
     <button type="button" class="secondary" id="loadRunParams">Load params from run</button>
+    <button type="button" class="secondary" id="refreshLists">Refresh lists</button>
     <button type="button" class="secondary" id="today">Today</button>
   </form>
+  <datalist id="csv-list"></datalist>
+  <datalist id="run-list"></datalist>
   <div id="err"></div>
   <div id="meta"></div>
   <div id="chart"></div>
@@ -59,6 +78,43 @@
     document.getElementById("today").addEventListener("click", () => {
       document.querySelector('input[name="day"]').value = localTodayISO();
     });
+
+    async function refreshLists() {
+      errEl.textContent = "";
+      const sym = (document.querySelector('input[name="symbol"]') || {}).value || "NVDA";
+      const bar = (document.querySelector('input[name="bar_size"]') || {}).value || "15 mins";
+      const csvDl = document.getElementById("csv-list");
+      const runDl = document.getElementById("run-list");
+      csvDl.innerHTML = "";
+      runDl.innerHTML = "";
+      try {
+        const [fr, rr] = await Promise.all([
+          fetch("/api/cache-files?" + new URLSearchParams({ symbol: sym.trim(), bar_size: bar })),
+          fetch("/api/runs?limit=40"),
+        ]);
+        const cj = await fr.json().catch(() => ({}));
+        const rj = await rr.json().catch(() => ({}));
+        if (fr.ok && cj.files) {
+          cj.files.forEach((f) => {
+            const o = document.createElement("option");
+            o.value = f.name;
+            csvDl.appendChild(o);
+          });
+        }
+        if (rr.ok && rj.runs) {
+          rj.runs.forEach((r) => {
+            const o = document.createElement("option");
+            o.value = r.run_id;
+            o.label = (r.symbols || []).join(",") + " " + (r.started_at || "");
+            runDl.appendChild(o);
+          });
+        }
+      } catch (e) {
+        errEl.textContent = "List refresh failed: " + String(e);
+      }
+    }
+    document.getElementById("refreshLists").addEventListener("click", refreshLists);
+    refreshLists();
 
     document.getElementById("loadRunParams").addEventListener("click", async () => {
       errEl.textContent = "";

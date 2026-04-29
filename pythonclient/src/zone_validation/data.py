@@ -4,9 +4,9 @@ Load cached IB-style OHLCV CSVs (same layout as ibkr/historical_data cache).
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 import pytz
@@ -45,6 +45,59 @@ def pick_cache_csv(
     return matches[0] if matches else None
 
 
+def list_matching_cache_csvs(
+    data_dir: Path,
+    symbol: str,
+    bar_size: str = "15 mins",
+) -> list[dict[str, Any]]:
+    """
+    Newest first: files named ``{SYMBOL}-*-{barSize}.csv`` under ``data_dir``.
+    """
+    if not data_dir.is_dir():
+        return []
+    suf = bar_size_to_cache_suffix(bar_size)
+    pat = f"{symbol.strip().upper()}-*-{suf}.csv"
+    out: list[dict[str, Any]] = []
+    for p in sorted(
+        data_dir.glob(pat),
+        key=lambda x: x.stat().st_mtime,
+        reverse=True,
+    ):
+        st = p.stat()
+        out.append(
+            {
+                "name": p.name,
+                "mtime_utc": datetime.fromtimestamp(st.st_mtime, tz=dt_timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+            }
+        )
+    return out
+
+
+def et_day_bounds_for_index(
+    index: pd.DatetimeIndex, day_yyyy_mm_dd: str
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    ET calendar day window aligned to the *index* timezone (zoneinfo / pytz-consistent for comparisons).
+
+    Using the same ``Timestamp`` type as the bars avoids a bug where pytz ``localize`` bounds do not
+    match a ``DatetimeIndex`` produced by ``tz_convert("America/New_York")`` (all ``>=``/``<`` can fail).
+    """
+    day = day_yyyy_mm_dd.strip()[:10]
+    if index.empty:
+        return pd.Timestamp(day, tz="America/New_York"), pd.Timestamp(day, tz="America/New_York") + pd.Timedelta(
+            days=1
+        )
+    tz = index.tz
+    if tz is not None:
+        day_start = pd.Timestamp(day, tz=tz)
+    else:
+        day_start = pd.Timestamp(day, tz="America/New_York")
+    day_end = day_start + pd.Timedelta(days=1)
+    return day_start, day_end
+
+
 def load_ohlcv_csv(path: Path) -> pd.DataFrame:
     """
     Read cache CSV with index column ``date``; normalize to US/Eastern (same as HistoricalDataManager._get_latest_cached_data).
@@ -70,9 +123,7 @@ def session_day_bars_error_hint(df: pd.DataFrame, day_yyyy_mm_dd: str) -> str | 
     if df.empty:
         return "OHLCV is empty after load."
     day = day_yyyy_mm_dd.strip()[:10]
-    d0 = datetime.strptime(day, "%Y-%m-%d")
-    day_start = pd.Timestamp(_ET.localize(d0))
-    day_end = day_start + pd.Timedelta(days=1)
+    day_start, day_end = et_day_bounds_for_index(df.index, day)
     win = (df.index >= day_start) & (df.index < day_end)
     if bool(win.any()):
         return None

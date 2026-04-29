@@ -305,6 +305,39 @@ class TradeJournal:
             return None
         return obj if isinstance(obj, dict) else None
 
+    def list_recent_runs(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Recent journal runs (for zone UI / tooling). Newest first."""
+        lim = max(1, min(int(limit), 200))
+        with self._conn() as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                """
+                SELECT run_id, strategy, symbols_json, started_at
+                FROM runs
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (lim,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            sym_raw = r["symbols_json"] or "[]"
+            try:
+                syms = json.loads(sym_raw) if isinstance(sym_raw, str) else sym_raw
+            except json.JSONDecodeError:
+                syms = []
+            if not isinstance(syms, list):
+                syms = []
+            out.append(
+                {
+                    "run_id": r["run_id"],
+                    "strategy": r["strategy"],
+                    "started_at": r["started_at"],
+                    "symbols": [str(s).upper() for s in syms],
+                }
+            )
+        return out
+
     def end_run(self, run_id: str) -> None:
         with self._conn() as con:
             con.execute(

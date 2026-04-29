@@ -19,8 +19,8 @@ from .data import load_ohlcv_csv, pick_cache_csv, session_day_bars_error_hint
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-class ZoneChartError(ValueError):
-    """User-facing error (bad args, missing cache, empty data)."""
+class ZoneChartError(Exception):
+    """User-facing error (bad args, missing cache, empty data). Do not subclass ValueError (API mapping)."""
 
 
 def _groq_init_param_names() -> set[str]:
@@ -96,6 +96,7 @@ def render_zone_trade_chart(
             raise ZoneChartError(f"Unknown run_id: {str(run_id).strip()!r} (not in runs table).")
         strat_kw = groq_strategy_kwargs_from_run_params(run_raw)
     strat_kw = {**strat_kw, **dict(strategy_params or {})}
+    strat_kw["skip_chromadb"] = True
     strategy = GroqRecommendationsStrategy(**strat_kw)
     df_ind = strategy.calculate_indicators(raw.copy())
     supply, demand = strategy.identify_zones(df_ind)
@@ -125,15 +126,15 @@ def render_zone_trade_chart(
             title=title,
         )
     except ValueError as e:
-        if "No bars in" in str(e):
-            raise ZoneChartError(str(e)) from e
-        raise
+        raise ZoneChartError(str(e)) from e
 
     meta: dict[str, Any] = {
         "symbol": sym,
         "day": day,
         "csv": str(csv_path),
         "bar_rows_total": int(len(df_ind)),
+        "cache_index_start": str(df_ind.index.min()),
+        "cache_index_end": str(df_ind.index.max()),
         "supply_zones": len(supply),
         "demand_zones": len(demand),
         "journal_trades_plotted": len(trades),

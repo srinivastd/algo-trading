@@ -54,7 +54,9 @@ class GroqRecommendationsStrategy(StrategyBase):
                  short_realtime_require_rsi_max: float = 65.0,
                  short_realtime_require_minus_di_gt_plus_di: bool = True,
                  short_realtime_max_macd_histogram: float | None = None,
-                 min_hold_hours: float = 2.0):  # suppress early programmatic exits (noise reduction on 15m)
+                 min_hold_hours: float = 2.0,  # suppress early programmatic exits (noise reduction on 15m)
+                 skip_chromadb: bool = False,  # zone UI: skip Chroma + sentence-transformer load
+    ):
         super().__init__("Groq Recommendations Strategy")
         self.risk_per_trade = risk_per_trade
         self.max_duration_hours = max_duration_hours
@@ -82,22 +84,25 @@ class GroqRecommendationsStrategy(StrategyBase):
         self.min_hold_hours = float(min_hold_hours)  # NEW: 2h default prevents cutting winners early
         self.chroma_client = None
         self.collection = None
-        try:
-            self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
-            self.collection = self.chroma_client.get_or_create_collection(
-                name="backtest_results",
-                embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
-                    model_name="all-MiniLM-L6-v2"
-                ),
-            )
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except BaseException as chroma_err:
-            # Chroma's Rust layer can raise pyo3 PanicException (not a subclass of Exception).
-            logger.warning(
-                "ChromaDB unavailable (backtest results will not be persisted): %s",
-                chroma_err,
-            )
+        if skip_chromadb:
+            logger.info("ChromaDB skipped (skip_chromadb=True) — no backtest embedding persistence for this instance.")
+        else:
+            try:
+                self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+                self.collection = self.chroma_client.get_or_create_collection(
+                    name="backtest_results",
+                    embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
+                        model_name="all-MiniLM-L6-v2"
+                    ),
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as chroma_err:
+                # Chroma's Rust layer can raise pyo3 PanicException (not a subclass of Exception).
+                logger.warning(
+                    "ChromaDB unavailable (backtest results will not be persisted): %s",
+                    chroma_err,
+                )
         logger.info(
             f"Initialized {self.name} with risk_per_trade=${risk_per_trade}, max_duration={max_duration_hours}h, "
             f"stop_loss={stop_loss_pct}%, target={target_pct}%, bar_size={bar_size}, duration={duration}, "

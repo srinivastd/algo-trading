@@ -10,6 +10,8 @@ from typing import Any, Sequence, Tuple
 import pandas as pd
 import pytz
 
+from .data import et_day_bounds_for_index
+
 try:
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -32,13 +34,6 @@ def _parse_fill_ts(raw: str | None) -> pd.Timestamp | None:
     return t.tz_convert(ET)
 
 
-def _session_window(session_day: str) -> tuple[pd.Timestamp, pd.Timestamp]:
-    d0 = datetime.strptime(session_day.strip()[:10], "%Y-%m-%d")
-    start = ET.localize(d0)
-    end = start + timedelta(days=1)
-    return pd.Timestamp(start), pd.Timestamp(end)
-
-
 def build_zone_trade_figure(
     ohlcv: pd.DataFrame,
     session_day: str,
@@ -55,7 +50,7 @@ def build_zone_trade_figure(
     Zones are drawn from pivot time through end of session day (horizontal bands).
     """
     trades = trades or []
-    day_start, day_end = _session_window(session_day)
+    day_start, day_end = et_day_bounds_for_index(ohlcv.index, session_day)
 
     win = (ohlcv.index >= day_start) & (ohlcv.index < day_end)
     plot_df = ohlcv.loc[win].copy()
