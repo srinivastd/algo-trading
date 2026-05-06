@@ -47,6 +47,11 @@ logger = setup_daily_logging(
 # This fixes Bug 3: previously had propagate=False with no handler
 market_data_logger = setup_market_data_logger()
 
+
+class WatchModeInsufficientBuyingPower(RuntimeError):
+    """Watch mode stopped: an entry was rejected with INSUFFICIENT_BUYING_POWER."""
+
+
 def _safe_float(v):
     try:
         return float(v)
@@ -861,6 +866,16 @@ async def watch_mode(
                     }
                     market_data_logger.info(json.dumps(signal_data))
                     indicators = signal_data.get("market_context", {}).get("indicators", {})
+                    decision_zone = None
+                    if signal != 0 and hasattr(strategy, "get_last_realtime_decision_zone"):
+                        try:
+                            decision_zone = strategy.get_last_realtime_decision_zone()
+                        except Exception as dz_err:
+                            logger.debug("Decision-zone snapshot unavailable for %s: %s", symbol_upper, dz_err)
+                    if decision_zone:
+                        indicators = dict(indicators)
+                        indicators["decision_zone"] = decision_zone
+                        signal_data["market_context"]["indicators"] = indicators
                     regime, adx, vol_ratio, trend_direction = _infer_regime(indicators)
 
                     if journal and run_id:
@@ -1004,6 +1019,36 @@ async def watch_mode(
                                     )
                             except Exception as journal_err:
                                 logger.warning(f"Trade journal result logging failed for {trade_id}: {journal_err}")
+
+                        if (
+                            trade_result.get("status") != "success"
+                            and not getattr(connection, "_lax_paper", False)
+                        ):
+                            ib_od = trade_result.get("ib_place_order") or {}
+                            msg = str(trade_result.get("message") or "")
+                            code = str(ib_od.get("code") or "")
+                            is_ibp = (
+                                code == "INSUFFICIENT_BUYING_POWER"
+                                or "INSUFFICIENT_BUYING_POWER" in msg
+                            )
+                            if is_ibp:
+                                detail = (msg or code or "INSUFFICIENT_BUYING_POWER").strip()
+                                logger.critical(
+                                    "HALTING_WATCH_MODE: entry rejected with INSUFFICIENT_BUYING_POWER — %s",
+                                    detail,
+                                )
+                                market_data_logger.info(json.dumps({
+                                    "timestamp": datetime.now(
+                                        pytz.timezone("US/Eastern")
+                                    ).isoformat(),
+                                    "type": "system",
+                                    "message": (
+                                        "Watch mode halted: INSUFFICIENT_BUYING_POWER"
+                                    ),
+                                }))
+                                raise WatchModeInsufficientBuyingPower(
+                                    f"INSUFFICIENT_BUYING_POWER: {detail}"
+                                )
 
                         if trade_result['status'] == 'success':
                             pid = trade_result.get("order_id")
@@ -1678,6 +1723,8 @@ async def main():
                             except Exception as end_err:
                                 logger.warning(f"Could not finalize trade journal run {run_id}: {end_err}")
             
+    except WatchModeInsufficientBuyingPower:
+        raise
     except Exception as e:
         logger.error(f"Error in main: {str(e)}", exc_info=True)
     finally:
@@ -1687,4 +1734,8 @@ async def main():
 
 if __name__ == "__main__":
     util.startLoop()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except WatchModeInsufficientBuyingPower as e:
+        logger.critical("%s", e)
+        sys.exit(1)
