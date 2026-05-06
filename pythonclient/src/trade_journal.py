@@ -1578,6 +1578,136 @@ class TradeJournal:
             )
         return out
 
+    def get_trade_full(self, trade_id: str) -> dict[str, Any] | None:
+        """
+        Return one trade with **un-compacted** ``entry_snapshot`` / ``exit_snapshot`` (full
+        ``indicator_snapshot_json`` split) plus fills, for review / API (e.g. journal dashboard hover).
+        """
+        tid = (trade_id or "").strip()
+        if not tid:
+            return None
+        with self._conn() as con:
+            con.row_factory = sqlite3.Row
+            r = con.execute(
+                """
+                SELECT
+                    t.trade_id,
+                    t.run_id,
+                    t.symbol,
+                    t.side,
+                    t.status,
+                    t.signal_value,
+                    t.intended_entry_price,
+                    t.intended_shares,
+                    t.stop_loss,
+                    t.target,
+                    t.entry_fill_price,
+                    t.entry_fill_time,
+                    t.exit_fill_price,
+                    t.exit_fill_time,
+                    t.exit_reason,
+                    t.realized_pnl,
+                    t.commission,
+                    t.order_id,
+                    t.stop_order_id,
+                    t.target_order_id,
+                    t.error_message,
+                    t.indicator_snapshot_json,
+                    t.memory_consulted,
+                    t.memory_verdict_json,
+                    t.created_at,
+                    t.updated_at,
+                    (
+                        SELECT COALESCE(SUM(f.qty), 0)
+                        FROM fills f
+                        WHERE f.trade_id = t.trade_id AND f.is_entry = 1
+                    ) AS entry_qty_sum,
+                    (
+                        SELECT COALESCE(SUM(f.qty), 0)
+                        FROM fills f
+                        WHERE f.trade_id = t.trade_id AND f.is_entry = 0
+                    ) AS exit_qty_sum
+                FROM trades t
+                WHERE t.trade_id = ?
+                """,
+                (tid,),
+            ).fetchone()
+        if r is None:
+            return None
+        raw_json = r["indicator_snapshot_json"] or "{}"
+        try:
+            snap = json.loads(raw_json) if isinstance(raw_json, str) else {}
+        except json.JSONDecodeError:
+            snap = {}
+        if not isinstance(snap, dict):
+            snap = {}
+        entry_keys, exit_keys = self._split_indicator_entry_exit(snap)
+        mem_parsed: Any = None
+        mraw = r["memory_verdict_json"]
+        if mraw:
+            try:
+                mem_parsed = json.loads(mraw) if isinstance(mraw, str) else mraw
+            except json.JSONDecodeError:
+                mem_parsed = {"_raw": str(mraw)}
+        fills_out: list[dict[str, Any]] = []
+        with self._conn() as con:
+            con.row_factory = sqlite3.Row
+            for fr in con.execute(
+                """
+                SELECT fill_id, order_id, exec_id, symbol, side, qty, price, commission, time, is_entry
+                FROM fills
+                WHERE trade_id = ?
+                ORDER BY time ASC
+                """,
+                (tid,),
+            ).fetchall():
+                fills_out.append(
+                    {
+                        "fill_id": fr["fill_id"],
+                        "order_id": fr["order_id"],
+                        "exec_id": fr["exec_id"],
+                        "symbol": fr["symbol"],
+                        "side": fr["side"],
+                        "qty": float(fr["qty"] or 0.0),
+                        "price": float(fr["price"] or 0.0),
+                        "commission": fr["commission"],
+                        "time": fr["time"],
+                        "is_entry": bool(int(fr["is_entry"] or 0)),
+                    }
+                )
+        return {
+            "trade_id": r["trade_id"],
+            "run_id": r["run_id"],
+            "symbol": (r["symbol"] or "").strip().upper(),
+            "side": (r["side"] or "").strip().upper(),
+            "status": (r["status"] or "").strip().lower(),
+            "signal_value": int(r["signal_value"] or 0),
+            "intended_shares": int(r["intended_shares"] or 0),
+            "intended_entry_price": float(r["intended_entry_price"] or 0.0),
+            "stop_loss": float(r["stop_loss"]) if r["stop_loss"] is not None else None,
+            "target": float(r["target"]) if r["target"] is not None else None,
+            "order_id": int(r["order_id"]) if r["order_id"] is not None else None,
+            "stop_order_id": int(r["stop_order_id"]) if r["stop_order_id"] is not None else None,
+            "target_order_id": int(r["target_order_id"]) if r["target_order_id"] is not None else None,
+            "entry_fill_price": float(r["entry_fill_price"]) if r["entry_fill_price"] is not None else None,
+            "entry_fill_time": r["entry_fill_time"],
+            "exit_fill_price": float(r["exit_fill_price"]) if r["exit_fill_price"] is not None else None,
+            "exit_fill_time": r["exit_fill_time"],
+            "exit_fill_qty": float(r["exit_qty_sum"] or 0.0),
+            "entry_fill_qty": float(r["entry_qty_sum"] or 0.0),
+            "exit_reason": r["exit_reason"],
+            "realized_pnl": float(r["realized_pnl"]) if r["realized_pnl"] is not None else None,
+            "commission": float(r["commission"]) if r["commission"] is not None else None,
+            "error_message": r["error_message"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "memory_consulted": bool(int(r["memory_consulted"] or 0)),
+            "memory_verdict": mem_parsed,
+            "entry_snapshot": entry_keys,
+            "exit_snapshot": exit_keys,
+            "fills": fills_out,
+        }
+
     def purge_journal_before_calendar_date(
         self, first_day_to_keep: str, *, strict_trade_time: bool = False
     ) -> dict[str, int]:
