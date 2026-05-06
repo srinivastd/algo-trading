@@ -6,7 +6,9 @@ to view day-specific metrics: activity filters closed trades by exit date; **top
 use the last ``daily_snapshots`` row for that calendar ``date`` column (aligned with watch-mode snapshots).
 With a date selected, a **per-trade** section lists each ``trade_id`` grouped by symbol: entry/exit
 times, intended and filled quantities, P&amp;L, and JSON params (entry snapshot vs any ``exit_*`` keys).
-JSON: ``/api/trades-day?date=YYYY-MM-DD`` (optional ``limit=``).
+JSON: ``/api/trades-day?date=YYYY-MM-DD`` (optional ``limit=``) ·
+``/api/trade?trade_id=…`` (full entry/exit snapshot, no truncation) ·
+``/api/trade-zone-chart?symbol=…&day=…`` (zone chart + journal markers).
 
 Default: http://127.0.0.1:8765/ (shows latest + all-time activity)
 
@@ -17,7 +19,13 @@ From ``pythonclient``::
     ./py src/journal_dashboard.py --purge-before-date 2026-04-17   # destructive: drop history before that day
 
 If port 8765 is busy, the server tries the next ports (8766, …) automatically, or pass ``--port 8766``.
-Use ``--port 0`` to bind an ephemeral free port (URL printed on startup).
+Use ``--port 0`` to bind an ephemeral free port (URL printed on startup). If a separate
+``zone_validation_app`` (or any process) is already bound to 8765, start it on e.g. 8766
+(see ``run_zone_validation_server.sh``) so the journal URL matches the port printed on startup.
+
+**Per-trade Review** link opens a panel with the trade snapshot and a supply/demand + journal chart via
+``/api/trade-zone-chart?symbol=…&day=…`` (optional ``run_id=``, ``bar_size=``), same
+logic as the zone validation tool; requires a matching bar CSV under ``historical_data/``.
 """
 from __future__ import annotations
 
@@ -27,10 +35,13 @@ import html
 import json
 import re
 import sys
+import time
 from collections import defaultdict
 import urllib.parse
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 # pythonclient/ (parent of this file's directory)
 _PYTHONCLIENT_ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +50,10 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from trade_journal import TradeJournal  # noqa: E402
+
+
+def _journal_api_log(msg: str) -> None:
+    print(f"[journal-api] {msg}", file=sys.stderr, flush=True)
 
 
 def _fmt_money(v: float | None) -> str:
@@ -96,7 +111,9 @@ def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str
         f"<h2>Per-trade detail for {d_esc}</h2>",
         '<p class="meta">Grouped by symbol. <strong>Touch</strong> = whether the row’s <code>entry_fill_time</code> '
         "and/or <code>exit_fill_time</code> falls on this day. "
-        "<strong>E qty</strong> / <strong>X qty</strong> = Σ <code>fills</code> for entry vs exit legs.</p>",
+        "<strong>E qty</strong> / <strong>X qty</strong> = Σ <code>fills</code> for entry vs exit legs. "
+        "Use <strong>Review</strong> to open a panel with entry snapshot, exact decision-zone overlay when captured, and supply/demand context chart "
+        "(<code>historical_data/</code> CSV; if the view date is past the file end, candles use the last day in the file).</p>",
     ]
     for sym in sorted(by_sym.keys()):
         rows = by_sym[sym]
@@ -133,9 +150,28 @@ def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str
             pnl_cls = ""
             if pnl is not None:
                 pnl_cls = "pnl-pos" if float(pnl) > 0 else ("pnl-neg" if float(pnl) < 0 else "")
+            sym_d = (sym or "").strip()
+            run_raw = t.get("run_id")
+            run_id_s = (str(run_raw) if run_raw is not None else "").strip()
+            d_attr = html.escape(selected_date, quote=True)
+            s_attr = html.escape(sym_d, quote=True)
+            r_attr = html.escape(run_id_s, quote=True) if run_id_s else ""
+            tr_start = f'<tr class="trade-row" data-symbol="{s_attr}" data-day="{d_attr}"'
+            if r_attr:
+                tr_start += f' data-run-id="{r_attr}"'
+            tr_start += f' data-trade-id="{html.escape(raw_tid, quote=True)}"'
+            tr_start += ">"
+            _run_data_attr = f' data-run-id="{r_attr}"' if r_attr else ""
+            rev = (
+                f'<a class="trade-ctx-link" href="#trade-context" '
+                f'data-symbol="{s_attr}" data-day="{d_attr}"{_run_data_attr} '
+                f'data-trade-id="{html.escape(str(raw_tid), quote=True)}"'
+                f">Review</a>"
+            )
             body += (
-                "<tr>"
-                f"<td><strong>{touch}</strong></td>"
+                tr_start
+                + f"<td><strong>{touch}</strong></td>"
+                + f"<td class=\"ctx-cell\">{rev}</td>"
                 f"<td><code title='{tid_title}'>{tid_disp}</code></td>"
                 f"<td>{html.escape(str(t.get('side') or ''))}</td>"
                 f"<td>{html.escape(str(t.get('status') or ''))}</td>"
@@ -162,7 +198,7 @@ def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str
         parts.append('<div class="table-wrap"><table>')
         parts.append(
             "<thead><tr>"
-            "<th>Touch</th><th>Trade</th><th>Side</th><th>Status</th>"
+            "<th>Touch</th><th>Review</th><th>Trade</th><th>Side</th><th>Status</th>"
             "<th class='num'>Intend Q</th><th class='num'>E qty</th><th class='num'>X qty</th>"
             "<th class='num'>Entry px</th><th>Entry time</th><th class='num'>Exit px</th><th>Exit time</th>"
             "<th class='num'>Realized</th><th>Exit reason</th><th>Params</th>"
@@ -401,7 +437,30 @@ def _html_shell(
     .date-header {{ display: flex; align-items: center; gap: 1rem; }}
     .json-block {{ font-size: 0.72rem; white-space: pre-wrap; word-break: break-word; margin: 0.35rem 0; max-height: 14rem; overflow: auto; background: #fafafa; border: 1px solid #eee; padding: 0.4rem 0.5rem; border-radius: 4px; }}
     details {{ margin: 0.2rem 0; }}
+    a.trade-ctx-link {{ font-size: 0.85rem; white-space: nowrap; }}
+    td.ctx-cell {{ white-space: nowrap; }}
+    #zone-hover-panel {{
+      position: fixed; right: 0.5rem; bottom: 0.5rem; z-index: 10000;
+      width: min(96vw, 920px); height: min(78vh, 720px);
+      background: #fff; border: 1px solid #ccc; border-radius: 8px;
+      box-shadow: 0 6px 32px rgba(0,0,0,0.16);
+      display: none; flex-direction: column; max-width: 100%;
+    }}
+    #zone-hover-panel.visible {{ display: flex; }}
+    .zone-hover-head {{ display: flex; justify-content: space-between; align-items: center;
+      padding: 0.35rem 0.6rem; border-bottom: 1px solid #e5e5e5; font-size: 0.8rem; background: #fafafa; border-radius: 8px 8px 0 0; flex-shrink: 0; }}
+    .zone-hover-head button {{ background: none; border: none; font-size: 1.2rem; line-height: 1; cursor: pointer; padding: 0 0.2rem; color: #555; }}
+    #zone-hover-plot {{ flex: 1; min-height: 200px; }}
+    #zone-hover-decision {{
+      flex: 0 0 auto; max-height: 32%;
+      margin: 0 0.5rem 0.4rem; padding: 0.35rem 0.5rem; font-size: 0.75rem; line-height: 1.35;
+      overflow: auto; background: #fafbfc; border: 1px solid #e8e8e8; border-radius: 4px;
+      color: #222; font-family: ui-sans-serif, system-ui, sans-serif;
+    }}
+    #zone-hover-decision .zh-line {{ margin: 0.12rem 0; }}
+    #zone-hover-decision .zh-pre {{ margin: 0.25rem 0 0 0; white-space: pre-wrap; word-break: break-word; font-size: 0.7rem; max-height: 10rem; overflow: auto; font-family: ui-monospace, Menlo, monospace; }}
   </style>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 </head>
 <body>
   <h1>IBKR P&amp;L (from journal)</h1>
@@ -442,8 +501,236 @@ def _html_shell(
   </table>
   <p class="meta">DB: <code>{db_path}</code> · JSON:
   <a href="/api/latest">/api/latest</a> (optional <code>?date=YYYY-MM-DD</code>) · <a href="/api/activity">/api/activity</a> · <a href="/api/trades-day">/api/trades-day</a> (requires <code>?date=</code>) · <a href="/api/dates">/api/dates</a> · <code>/api/snapshot/&lt;id&gt;</code>
+  · <code>/api/trade?trade_id=…</code> (full entry/exit snapshot, no truncation) ·
+  <code>/api/trade-zone-chart?symbol=…&amp;day=…</code> (optional <code>run_id</code>, <code>bar_size</code>)
   · Auto-refresh every 60s (latest only).</p>
+  <div id="zone-hover-panel" aria-live="polite" aria-label="Trade context and zone chart">
+    <div class="zone-hover-head">
+      <span id="zone-hover-title">Trade + zones</span>
+      <button type="button" id="zone-hover-close" title="Close">×</button>
+    </div>
+    <p id="zone-hover-status" class="meta" style="margin:0.3rem 0.6rem; font-size:0.75rem; color:#555;"></p>
+    <div id="zone-hover-plot" aria-label="Candles: last available day in cache if the view date is missing. Entry/exit markers from journal."></div>
+    <div id="zone-hover-decision"></div>
+  </div>
   <script>
+    (function() {{
+      var panel = document.getElementById('zone-hover-panel');
+      var plotEl = document.getElementById('zone-hover-plot');
+      var statusEl = document.getElementById('zone-hover-status');
+      var decisionEl = document.getElementById('zone-hover-decision');
+      var titleEl = document.getElementById('zone-hover-title');
+      var closeBtn = document.getElementById('zone-hover-close');
+      var ac = null;
+      var loadSeq = 0;
+      var chartTimeoutId = null;
+      var chartTimedOut = false;
+      var CHART_FETCH_TIMEOUT_MS = 600000;
+      var cache = {{}};
+      function clearChartTimeout() {{
+        if (chartTimeoutId) {{ clearTimeout(chartTimeoutId); chartTimeoutId = null; }}
+        chartTimedOut = false;
+      }}
+      function showP() {{
+        if (!panel) return;
+        panel.classList.add('visible');
+        panel.style.display = 'flex';
+      }}
+      function hideP() {{
+        if (!panel) return;
+        clearChartTimeout();
+        loadSeq++;
+        if (ac) try {{ ac.abort(); }} catch (e) {{}}
+        ac = null;
+        panel.classList.remove('visible');
+        panel.style.display = 'none';
+        if (statusEl) statusEl.textContent = '';
+        if (decisionEl) decisionEl.innerHTML = '';
+        if (plotEl) try {{ Plotly.purge(plotEl); }} catch (e) {{}}
+      }}
+      function keyFor(tr) {{
+        if (!tr || !tr.dataset) return '';
+        return (tr.dataset.symbol || '') + '|' + (tr.dataset.day || '') + '|' + (tr.dataset.runId || '');
+      }}
+      function loadChart(el) {{
+        if (!el || !el.dataset || !el.dataset.symbol || !el.dataset.day) return;
+        if (typeof Plotly === 'undefined') {{
+          if (statusEl) statusEl.textContent = 'Plotly failed to load (network?)';
+          if (decisionEl) decisionEl.textContent = '';
+          showP();
+          return;
+        }}
+        var mySeq = ++loadSeq;
+        clearChartTimeout();
+        var tr = el;
+        var k = keyFor(tr);
+        var tid = tr.dataset.tradeId;
+        if (titleEl) titleEl.textContent = (tr.dataset.symbol || '') + ' · ' + (tr.dataset.day || '');
+        showP();
+        if (statusEl) statusEl.textContent = 'Loading snapshot…';
+        if (decisionEl) decisionEl.innerHTML = '';
+        if (plotEl) try {{ Plotly.purge(plotEl); }} catch (e) {{}}
+        if (ac) try {{ ac.abort(); }} catch (e) {{}}
+        ac = new AbortController();
+        var sig = ac.signal;
+        var p = new URLSearchParams();
+        p.set('symbol', tr.dataset.symbol);
+        p.set('day', tr.dataset.day);
+        if (tr.dataset.runId) p.set('run_id', tr.dataset.runId);
+        function apiMsg(j, r) {{
+          if (!j || typeof j !== 'object') return (r && r.status ? r.status + ' ' + r.statusText : 'Error');
+          if (j.error != null) return (typeof j.error === 'string') ? j.error : JSON.stringify(j.error);
+          if (j.detail != null) {{
+            if (typeof j.detail === 'string') return j.detail;
+            if (Array.isArray(j.detail)) return j.detail.map(function(d) {{ return d.msg != null ? d.msg : String(d); }}).join(' ');
+            return JSON.stringify(j.detail);
+          }}
+          return (r && r.status ? r.status + ' ' + r.statusText : 'Error');
+        }}
+        function parseRes(r) {{
+          return r.text().then(function(t) {{
+            var j = {{}};
+            if (t) try {{ j = JSON.parse(t); }} catch (e) {{ j = {{ error: t || r.statusText }}; }}
+            return {{ r: r, j: j, raw: t }};
+          }});
+        }}
+        function escHtml(s) {{
+          if (s == null) return '';
+          return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }}
+        var chartUrl = new URL('/api/trade-zone-chart', window.location.origin);
+        chartUrl.search = p.toString();
+        function getChart() {{
+          if (cache[k]) {{
+            return Promise.resolve({{ r: {{ ok: true, status: 200 }}, j: {{ figure: cache[k], meta: {{}} }}, raw: '' }});
+          }}
+          return fetch(chartUrl, {{ signal: sig, credentials: 'same-origin' }}).then(parseRes);
+        }}
+        var pTrade;
+        if (tid) {{
+          var tu = new URL('/api/trade', window.location.origin);
+          tu.searchParams.set('trade_id', tid);
+          pTrade = fetch(tu, {{ signal: sig, credentials: 'same-origin' }}).then(parseRes);
+        }} else {{
+          pTrade = Promise.resolve({{ r: {{ ok: true, status: 200 }}, j: null, raw: '' }});
+        }}
+        pTrade
+          .catch(function(e) {{
+            if (e && e.name === 'AbortError') return Promise.reject(e);
+            if (mySeq !== loadSeq) return Promise.reject(e);
+            return {{ r: {{ ok: false, status: 0 }}, j: {{ error: (e && e.message) || String(e) }} }};
+          }})
+          .then(function(tR) {{
+            if (mySeq !== loadSeq) return;
+            if (decisionEl) {{
+              if (!tid) {{
+                decisionEl.textContent = 'This row has no data-trade-id (use per-trade view with a date selected).';
+              }} else if (!tR || !tR.r.ok) {{
+                var errTxt = tR ? apiMsg(tR.j, tR.r) : 'Failed to load trade';
+                decisionEl.textContent = errTxt;
+              }} else if (tR.j) {{
+                var o = tR.j;
+                var h = [];
+                h.push('<div class="zh-line"><strong>At decision</strong> signal=' + escHtml(o.signal_value) + ' side=' + escHtml(o.side) + ' status=' + escHtml(o.status) + '</div>');
+                h.push('<div class="zh-line">risk intended ' + escHtml(o.intended_shares) + ' @ ' + escHtml(o.intended_entry_price) + ' · stop ' + escHtml(o.stop_loss != null ? o.stop_loss : '—') + ' · target ' + escHtml(o.target != null ? o.target : '—') + '</div>');
+                var dz = o.entry_snapshot && o.entry_snapshot.decision_zone;
+                if (dz) {{
+                  var dzLine = 'decision zone: ' + escHtml(dz.decision_rule || dz.decision_zone_type || 'zone')
+                    + ' [' + escHtml(dz.decision_zone_low) + ' - ' + escHtml(dz.decision_zone_high) + ']';
+                  if (dz.decision_distance_abs != null) dzLine += ' · distance ' + escHtml(dz.decision_distance_abs);
+                  if (dz.decision_distance_pct != null) dzLine += ' (' + escHtml(dz.decision_distance_pct) + '%)';
+                  h.push('<div class="zh-line"><strong>' + dzLine + '</strong></div>');
+                }} else {{
+                  h.push('<div class="zh-line">decision zone: not captured for this historical trade; chart uses reconstructed context zones.</div>');
+                }}
+                if (o.entry_fill_time) h.push('<div class="zh-line">fills entry: ' + escHtml(o.entry_fill_time) + (o.entry_fill_price != null ? (' @ ' + escHtml(o.entry_fill_price)) : '') + '</div>');
+                if (o.exit_fill_time) h.push('<div class="zh-line">fills exit: ' + escHtml(o.exit_fill_time) + (o.exit_fill_price != null ? (' @ ' + escHtml(o.exit_fill_price)) : '') + '</div>');
+                h.push('<details><summary style="cursor:pointer; font-size:0.8rem; color:#444">Indicator snapshot (JSON from DB)</summary>');
+                h.push('<pre class="zh-pre">' + escHtml(JSON.stringify(o.entry_snapshot || {{}}, null, 2)) + '</pre>');
+                if (o.exit_snapshot && Object.keys(o.exit_snapshot).length) {{
+                  h.push('<div class="zh-line">exit_snapshot</div><pre class="zh-pre">' + escHtml(JSON.stringify(o.exit_snapshot, null, 2)) + '</pre>');
+                }}
+                if (o.fills && o.fills.length) h.push('<div class="zh-line">fills</div><pre class="zh-pre">' + escHtml(JSON.stringify(o.fills, null, 2)) + '</pre>');
+                if (o.memory_consulted && o.memory_verdict) {{
+                  h.push('<div class="zh-line">memory_verdict</div><pre class="zh-pre">' + escHtml(JSON.stringify(o.memory_verdict, null, 2)) + '</pre>');
+                }}
+                h.push('</details>');
+                decisionEl.innerHTML = h.join('');
+              }}
+            }}
+            if (mySeq !== loadSeq) return;
+            if (statusEl) statusEl.textContent = 'Loading zone chart… (see [journal-api] in server terminal; large files are trimmed server-side after 45k rows)';
+            clearChartTimeout();
+            chartTimedOut = false;
+            var acSnap = ac;
+            chartTimeoutId = setTimeout(function() {{
+              if (mySeq !== loadSeq) return;
+              chartTimedOut = true;
+              try {{ if (acSnap === ac && ac) ac.abort(); }} catch (err) {{}}
+            }}, CHART_FETCH_TIMEOUT_MS);
+            return getChart();
+          }})
+          .then(function(cR) {{
+            if (mySeq !== loadSeq) return;
+            if (cR === undefined) return;
+            clearChartTimeout();
+            if (!cR.r || !cR.r.ok) throw new Error(cR ? apiMsg(cR.j, cR.r) : 'Chart: no response');
+            var fig = cR.j.figure;
+            if (!fig || !fig.data) throw new Error('Invalid chart: ' + (cR.raw && cR.raw.slice ? cR.raw.slice(0, 160) : ''));
+            if (!cache[k]) cache[k] = fig;
+            if (cR.j.meta && statusEl) {{
+              var m0 = cR.j.meta;
+              var ex = (m0.supply_zones != null && m0.demand_zones != null) ? (m0.supply_zones + ' supply, ' + m0.demand_zones + ' demand') : '';
+              var c0 = m0.csv ? String(m0.csv) : '';
+              var li0 = c0.lastIndexOf('/'); var lb0 = c0.lastIndexOf('\\\\');
+              var lo0 = (li0 > lb0) ? li0 : ((lb0 > li0) ? lb0 : -1);
+              var cap0 = (lo0 >= 0) ? c0.substring(lo0 + 1) : c0;
+              var parts = ['Chart: ' + ((ex && cap0) ? (ex + ' · ' + cap0) : (ex || cap0 || 'from cache'))];
+              if (m0.plot_session_day && tr.dataset.day && m0.plot_session_day !== tr.dataset.day) {{
+                parts.push('candles ' + m0.plot_session_day + ' (view ' + tr.dataset.day + ' has no bars in file yet)');
+              }}
+              if (m0.day_note) parts.push(m0.day_note);
+              if (m0.ohlcv_note) parts.push(m0.ohlcv_note);
+              if (m0.zone_plot_note) parts.push(m0.zone_plot_note);
+              if (m0.decision_zone_note) parts.push(m0.decision_zone_note);
+              if (m0.fill_marker_note) parts.push(m0.fill_marker_note);
+              statusEl.textContent = parts.join(' — ');
+            }} else if (statusEl) statusEl.textContent = 'Session from IB cache; entry/exit markers from journal when times are set.';
+            if (mySeq !== loadSeq) return;
+            return Plotly.newPlot('zone-hover-plot', fig.data, fig.layout, {{ responsive: true, displayModeBar: true }});
+          }})
+          .catch(function(e) {{
+            if (mySeq !== loadSeq) return;
+            var wasChartTimeout = chartTimedOut;
+            clearChartTimeout();
+            if (e && e.name === 'AbortError') {{
+              if (statusEl) statusEl.textContent = wasChartTimeout
+                ? 'Zone chart request timed out after 10m. See terminal: [journal-api] GET /api/trade-zone-chart. Prefer 15m cache; avoid multi-year 5s unless needed.'
+                : 'Request cancelled (closed panel or opened another trade).';
+              return;
+            }}
+            var s = (e && e.message) ? e.message : String(e);
+            if (e && e.name === 'TypeError' && /Failed to fetch|Load failed|NetworkError|fetch/i.test(s)) {{
+              s = s + ' — use the host/port printed when starting the journal server.';
+            }}
+            if (statusEl) statusEl.textContent = s;
+          }});
+      }}
+      function onReady() {{
+        document.addEventListener('click', function(ev) {{
+          var a = ev.target && ev.target.closest('a.trade-ctx-link');
+          if (!a) return;
+          ev.preventDefault();
+          loadChart(a);
+        }});
+        if (closeBtn) closeBtn.addEventListener('click', function() {{ hideP(); }});
+        document.addEventListener('keydown', function(ev) {{
+          if (ev.key === 'Escape' && panel && panel.classList.contains('visible')) hideP();
+        }});
+      }}
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', onReady);
+      else onReady();
+    }})();
     // Pre-select current value if URL has ?date= param
     const urlParams = new URLSearchParams(window.location.search);
     const urlDate = urlParams.get('date');
@@ -451,10 +738,17 @@ def _html_shell(
       const select = document.getElementById('date-select');
       if (select) select.value = urlDate;
     }}
-    setTimeout(function(){{ 
-      // Only auto-refresh if viewing latest (no date filter)
-      if (!urlDate) location.reload(); 
-    }}, 60000);
+    (function schedulePageRefresh() {{
+      setTimeout(function doRefresh() {{
+        if (urlDate) return;
+        var p = document.getElementById('zone-hover-panel');
+        if (p && p.classList.contains('visible')) {{
+          setTimeout(doRefresh, 20000);
+          return;
+        }}
+        location.reload();
+      }}, 60000);
+    }})();
   </script>
 </body>
 </html>"""
@@ -501,6 +795,36 @@ def main() -> None:
         return
     journal = TradeJournal(db_path)
 
+    # Load ``zone_validation`` + ``ib_insync`` on the **main** thread only. ``ThreadingHTTPServer``
+    # runs ``do_GET`` in worker threads; a lazy import there triggers
+    # ``eventkit`` / ``get_event_loop()`` in that thread and raises on Python 3.10+.
+    zone_render: Callable[..., Any] | None = None
+    zone_err_cls: type[BaseException] | None = None
+    zone_load_error: str | None = None
+    try:
+        import asyncio
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        from zone_validation.service import ZoneChartError, render_zone_trade_chart
+
+        zone_render = render_zone_trade_chart
+        zone_err_cls = ZoneChartError
+    except Exception as e:
+        zone_load_error = f"{type(e).__name__}: {e}"
+        print(f"Note: /api/trade-zone-chart disabled — {zone_load_error}", file=sys.stderr)
+
+    if zone_render is not None:
+        print(
+            "Journal: zone chart API v2 loaded — if the view date has no bars in "
+            "historical_data, the chart uses the last day on/before that date in the CSV. "
+            "GET /api/trade-zone-chart JSON meta includes chart_api_version: 2. "
+            "Stop this process and start again if you still see 'No bars for session …' for a future day.",
+            file=sys.stderr,
+        )
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *a: object) -> None:
             return
@@ -512,7 +836,10 @@ def main() -> None:
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
 
         def _send_html(self, html: str, status: int = 200) -> None:
             body = html.encode("utf-8")
@@ -520,7 +847,10 @@ def main() -> None:
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
 
         def do_GET(self) -> None:
             # ``self.path`` may include the query string, an absolute-form request-target
@@ -529,7 +859,15 @@ def main() -> None:
             path = parts.path or "/"
             if len(path) > 1 and path.endswith("/"):
                 path = path[:-1]
-            for _canon in ("/api/latest", "/api/recent", "/api/activity", "/api/dates", "/api/trades-day"):
+            for _canon in (
+                "/api/latest",
+                "/api/recent",
+                "/api/activity",
+                "/api/dates",
+                "/api/trades-day",
+                "/api/trade",
+                "/api/trade-zone-chart",
+            ):
                 if path.lower() == _canon.lower():
                     path = _canon
                     break
@@ -588,6 +926,96 @@ def main() -> None:
                     lim = 400
                 trows = journal.get_trades_touching_calendar_day(d_day, limit=lim)
                 self._send_json({"date": d_day, "count": len(trows), "trades": trows})
+                return
+            if path == "/api/trade":
+                rid = (qs.get("trade_id", [""])[0] or "").strip()
+                if not rid:
+                    self._send_json(
+                        {"error": "Required query: trade_id=<id>"},
+                        400,
+                    )
+                    return
+                t0 = time.perf_counter()
+                _journal_api_log(f"GET /api/trade begin trade_id={rid!r}")
+                full = journal.get_trade_full(rid)
+                if full is None:
+                    _journal_api_log(
+                        f"GET /api/trade 404 unknown trade_id={rid!r} in {(time.perf_counter() - t0) * 1e3:.0f}ms"
+                    )
+                    self._send_json({"error": f"Unknown trade_id: {rid!r}"}, 404)
+                    return
+                self._send_json(full)
+                _journal_api_log(
+                    f"GET /api/trade OK in {(time.perf_counter() - t0) * 1e3:.0f}ms trade_id={rid!r}"
+                )
+                return
+            if path == "/api/trade-zone-chart":
+                sym = (qs.get("symbol", [""])[0] or "").strip().upper()
+                day = (qs.get("day", [""])[0] or "").strip()[:10]
+                br = qs.get("bar_size", ["15 mins"])[0] or "15 mins"
+                bar_size = str(br).strip() or "15 mins"
+                rid = qs.get("run_id", [None])[0]
+                run_id = str(rid).strip() if rid is not None and str(rid).strip() else None
+                if not sym or not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+                    self._send_json(
+                        {"error": "Required query: symbol= and day=YYYY-MM-DD"},
+                        400,
+                    )
+                    return
+                if zone_render is None:
+                    self._send_json(
+                        {
+                            "error": (
+                                f"Zone chart not loaded on startup. {zone_load_error or ''}".strip()
+                            ),
+                            "meta": {},
+                        },
+                        503,
+                    )
+                    return
+                t0 = time.perf_counter()
+                _journal_api_log(
+                    f"GET /api/trade-zone-chart begin symbol={sym!r} day={day!r} run_id={run_id!r} bar_size={bar_size!r}"
+                )
+                try:
+                    fig, meta = zone_render(
+                        symbol=sym,
+                        day_yyyy_mm_dd=day,
+                        pythonclient_root=_PYTHONCLIENT_ROOT,
+                        data_dir=_PYTHONCLIENT_ROOT / "historical_data",
+                        csv_path=None,
+                        bar_size=bar_size,
+                        journal_db=db_path,
+                        no_journal=False,
+                        run_id=run_id,
+                        strategy_params=None,
+                    )
+                    t1 = time.perf_counter()
+                    _journal_api_log(
+                        f"GET /api/trade-zone-chart render() done in {(t1 - t0) * 1e3:.0f}ms; figure.to_json() next"
+                    )
+                    fig_dict = json.loads(fig.to_json())
+                    t2 = time.perf_counter()
+                    psd = meta.get("plot_session_day") if isinstance(meta, dict) else None
+                    chart_ver = meta.get("chart_api_version") if isinstance(meta, dict) else None
+                    _journal_api_log(
+                        f"GET /api/trade-zone-chart OK total {(t2 - t0) * 1e3:.0f}ms "
+                        f"(to_json {(t2 - t1) * 1e3:.0f}ms) plot_session_day={psd!r} "
+                        f"chart_api_version={chart_ver!r}"
+                    )
+                except Exception as e:
+                    if zone_err_cls is not None and isinstance(e, zone_err_cls):
+                        _journal_api_log(
+                            f"GET /api/trade-zone-chart ZoneChartError after {(time.perf_counter() - t0) * 1e3:.0f}ms: {e!r}"
+                        )
+                        self._send_json({"error": str(e), "meta": {}}, 400)
+                    else:
+                        _journal_api_log(
+                            f"GET /api/trade-zone-chart error after {(time.perf_counter() - t0) * 1e3:.0f}ms: {e!r}"
+                        )
+                        self._send_json({"error": str(e)}, 500)
+                    return
+                self._send_json({"figure": fig_dict, "meta": meta})
                 return
             m_snap = re.fullmatch(r"/api/snapshot/(\d+)", path)
             if m_snap:
