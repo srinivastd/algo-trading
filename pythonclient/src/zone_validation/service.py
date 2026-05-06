@@ -10,11 +10,18 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
+import pandas as pd
 from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy
 from trade_journal import TradeJournal
 
 from . import build_zone_trade_figure
-from .data import load_ohlcv_csv, pick_cache_csv, session_day_bars_error_hint
+from .data import (
+    et_day_bounds_for_index,
+    load_ohlcv_csv,
+    pick_cache_csv,
+    pick_display_session_day,
+    session_day_bars_error_hint,
+)
 
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -84,6 +91,26 @@ def render_zone_trade_chart(
     if raw.empty:
         raise ZoneChartError(f"Empty CSV: {csv_path}")
 
+    ohlcv_trim_note: str | None = None
+    ohlcv_rows_full = len(raw)
+    # Multi-year 5s (or very long) files make indicator/zone/Plotly JSON take minutes+ and hit client timeouts.
+    # Keep a rolling window around the view day so the chart API stays responsive.
+    _OHLCV_ROW_WARN = 45_000
+    if ohlcv_rows_full > _OHLCV_ROW_WARN:
+        _ds, _de = et_day_bounds_for_index(raw.index, day)
+        t_lo = max(raw.index.min(), _ds - pd.Timedelta(days=14))
+        t_hi = min(_de + pd.Timedelta(hours=12), raw.index.max() + pd.Timedelta(seconds=1))
+        w = raw.loc[(raw.index >= t_lo) & (raw.index < t_hi)]
+        if len(w) >= 500:
+            raw = w
+            ohlcv_trim_note = f"using {len(raw):,} of {ohlcv_rows_full:,} rows (14d+session around {day}; dense cache speed cap)"
+    _OHLCV_ROW_HARD = 60_000
+    if len(raw) > _OHLCV_ROW_HARD:
+        n0 = len(raw)
+        raw = raw.iloc[-_OHLCV_ROW_HARD :].copy()
+        extra = f" kept last {_OHLCV_ROW_HARD:,} of {n0:,} in window" if ohlcv_trim_note else f"kept last {_OHLCV_ROW_HARD:,} of {n0:,} rows for speed"
+        ohlcv_trim_note = (ohlcv_trim_note or "dense bar file") + extra
+
     strat_kw: dict[str, Any] = {}
     if run_id and str(run_id).strip():
         if not jpath.is_file():
@@ -111,19 +138,27 @@ def render_zone_trade_chart(
         trades = journal.get_trades_touching_calendar_day(day)
         trades = [t for t in trades if (t.get("symbol") or "").strip().upper() == sym]
 
-    no_day = session_day_bars_error_hint(df_ind, day)
-    if no_day:
-        raise ZoneChartError(no_day)
+    plot_day, pick_note = pick_display_session_day(df_ind, day)
+    if plot_day is None:
+        raise ZoneChartError(pick_note or "No session day to plot")
+    if session_day_bars_error_hint(df_ind, plot_day) is not None:
+        tmin, tmax = df_ind.index.min(), df_ind.index.max()
+        raise ZoneChartError(
+            f"Internal: chosen plot day {plot_day!r} has no bars (index {tmin} … {tmax})"
+        )
 
-    title = f"{sym} {day} | zones + journal | {csv_path.name}"
+    title = f"{sym} journal {day} | candles {plot_day}"
+    if pick_note:
+        title = f"{sym} journal {day} | candles {plot_day} (cache fallback)"
     try:
         fig = build_zone_trade_figure(
             df_ind,
-            day,
+            plot_day,
             supply,
             demand,
             trades,
             title=title,
+            day_requested=day,
         )
     except ValueError as e:
         raise ZoneChartError(str(e)) from e
@@ -131,6 +166,9 @@ def render_zone_trade_chart(
     meta: dict[str, Any] = {
         "symbol": sym,
         "day": day,
+        "plot_session_day": plot_day,
+        "day_note": pick_note,
+        "chart_api_version": 2,
         "csv": str(csv_path),
         "bar_rows_total": int(len(df_ind)),
         "cache_index_start": str(df_ind.index.min()),
@@ -139,6 +177,35 @@ def render_zone_trade_chart(
         "demand_zones": len(demand),
         "journal_trades_plotted": len(trades),
     }
+    fig_meta = fig.layout.meta if isinstance(fig.layout.meta, dict) else {}
+    if fig_meta:
+        meta.update(fig_meta)
+        if (
+            meta.get("supply_zones_plotted") != len(supply)
+            or meta.get("demand_zones_plotted") != len(demand)
+        ):
+            meta["zone_plot_note"] = (
+                f"collapsed {len(supply)} supply and {len(demand)} demand levels into "
+                f"{meta.get('supply_zone_bands_plotted', 0)} supply / "
+                f"{meta.get('demand_zone_bands_plotted', 0)} demand band(s)"
+            )
+        if meta.get("projected_off_session_fill_markers"):
+            meta["fill_marker_note"] = (
+                f"{meta['projected_off_session_fill_markers']} fill marker(s) are outside the candle session "
+                f"and are shown at the right edge with actual time in hover"
+            )
+        if meta.get("decision_zones_plotted"):
+            meta["decision_zone_note"] = (
+                f"plotted {meta['decision_zones_plotted']} exact decision zone(s) captured at signal time"
+            )
+        elif meta.get("trades_missing_decision_zone"):
+            meta["decision_zone_note"] = (
+                "Exact decision zone was not captured for this trade; showing reconstructed context only."
+            )
+    if ohlcv_rows_full > _OHLCV_ROW_WARN or ohlcv_trim_note:
+        meta["ohlcv_rows_in_file"] = ohlcv_rows_full
+    if ohlcv_trim_note:
+        meta["ohlcv_note"] = ohlcv_trim_note
     if run_id and str(run_id).strip():
         meta["run_id"] = str(run_id).strip()
         meta["params_from_run"] = True

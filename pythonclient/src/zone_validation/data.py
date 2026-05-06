@@ -133,3 +133,43 @@ def session_day_bars_error_hint(df: pd.DataFrame, day_yyyy_mm_dd: str) -> str | 
         f"File index range: {tmin} … {tmax}. "
         f"Choose a day inside that range, or refresh/download CSV that includes your session."
     )
+
+
+def pick_display_session_day(
+    df: pd.DataFrame, day_yyyy_mm_dd: str
+) -> tuple[str | None, str | None]:
+    """
+    Choose an ET **calendar** day to plot as the candle session.
+
+    - If the index has any bar on ``day_yyyy_mm_dd`` (ET), return that day.
+    - Else: last day in the index (ET date) that is **on or before** the request (e.g. stale cache).
+    - Else: first day **on or after** the request.
+    - Else: return the last calendar day present in the index.
+
+    Returns ``(day_str, note_or_none)`` where **note** explains a fallback. If the index is empty,
+    returns ``(None, "OHLCV is empty after load.")`` .
+    """
+    if df.empty:
+        return None, "OHLCV is empty after load."
+    d = day_yyyy_mm_dd.strip()[:10]
+    if session_day_bars_error_hint(df, d) is None:
+        return d, None
+    # Unique ET dates as YYYY-MM-DD, sorted
+    day_labels: list[str] = sorted(
+        {pd.Timestamp(x).tz_convert("America/New_York").strftime("%Y-%m-%d") for x in df.index}
+    )
+    if not day_labels:
+        tmin, tmax = df.index.min(), df.index.max()
+        return None, f"No index dates (range {tmin} … {tmax})."
+    le = [x for x in day_labels if x <= d]
+    if le:
+        chosen = le[-1]
+        if chosen == d:
+            return d, None
+        return chosen, f"No bars for {d!r} in this cache; showing last day on or before: {chosen} (refresh historical_data to include {d})."
+    ge = [x for x in day_labels if x >= d]
+    if ge:
+        chosen = ge[0]
+        return chosen, f"No bars for {d!r} in this cache; first available day is {chosen}."
+    chosen = day_labels[-1]
+    return chosen, f"Using last available day in file: {chosen}."
