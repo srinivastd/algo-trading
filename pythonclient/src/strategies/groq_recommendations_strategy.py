@@ -84,6 +84,7 @@ class GroqRecommendationsStrategy(StrategyBase):
         self.min_hold_hours = float(min_hold_hours)  # NEW: 2h default prevents cutting winners early
         self.chroma_client = None
         self.collection = None
+        self._last_realtime_decision_zone: Dict[str, Any] | None = None
         if skip_chromadb:
             logger.info("ChromaDB skipped (skip_chromadb=True) — no backtest embedding persistence for this instance.")
         else:
@@ -335,6 +336,87 @@ class GroqRecommendationsStrategy(StrategyBase):
             and float(df["close"].iloc[i]) < float(zone_low)
             and self._two_bar_volume_breakout(df, i)
         )
+
+    @staticmethod
+    def _iso_ts(ts: Any) -> str:
+        return ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+
+    def _decision_zone_payload(
+        self,
+        *,
+        df: pd.DataFrame,
+        i: int,
+        side: str,
+        zone_time: Any,
+        zone_high: float,
+        zone_low: float,
+        confidence: float | None = None,
+        decision_rule: str | None = None,
+    ) -> Dict[str, Any]:
+        current_price = float(df["close"].iloc[i])
+        zone_high_f = float(zone_high)
+        zone_low_f = float(zone_low)
+        zone_mid = (zone_high_f + zone_low_f) / 2.0
+        if side == "SHORT":
+            zone_type = "supply"
+            rule = "broke_above_supply"
+            boundary = zone_high_f
+            distance = current_price - boundary
+        else:
+            zone_type = "demand"
+            rule = decision_rule or "tested_demand"
+            boundary = zone_low_f
+            distance = current_price - boundary
+
+        prev_volume = float(df["volume"].iloc[i - 1]) if i >= 1 else 0.0
+        prev2_volume = float(df["volume"].iloc[i - 2]) if i >= 2 else 0.0
+        current_volume = float(df["volume"].iloc[i])
+        volume_ratio = (
+            current_volume / prev_volume if prev_volume > 0
+            else (float("inf") if current_volume > 0 else 0.0)
+        )
+        volume_ratio_json = None if volume_ratio == float("inf") else float(volume_ratio)
+        zone_age_hours = None
+        try:
+            zone_age_hours = (df.index[i] - zone_time).total_seconds() / 3600.0
+        except Exception:
+            zone_age_hours = None
+
+        payload: Dict[str, Any] = {
+            "decision_zone_type": zone_type,
+            "decision_rule": rule,
+            "decision_side": side,
+            "decision_time": self._iso_ts(df.index[i]),
+            "decision_price": current_price,
+            "decision_zone_time": self._iso_ts(zone_time),
+            "decision_zone_low": zone_low_f,
+            "decision_zone_high": zone_high_f,
+            "decision_zone_mid": zone_mid,
+            "decision_boundary_price": boundary,
+            "decision_distance_abs": float(distance),
+            "decision_distance_pct": float(distance / boundary * 100.0) if boundary else None,
+            "decision_zone_age_hours": zone_age_hours,
+            "decision_confidence": confidence,
+            "volume_chain": {
+                "prev2_volume": prev2_volume,
+                "prev_volume": prev_volume,
+                "current_volume": current_volume,
+                "last_prev_ratio": volume_ratio_json,
+                "breakout_mult": float(self.volume_breakout_mult),
+                "confirm_mult": float(self.volume_confirm_mult),
+            },
+            "adx": float(df["adx"].iloc[i]) if "adx" in df.columns and pd.notna(df["adx"].iloc[i]) else None,
+            "rsi": float(df["rsi"].iloc[i]) if "rsi" in df.columns and pd.notna(df["rsi"].iloc[i]) else None,
+        }
+        return payload
+
+    def get_last_realtime_decision_zone(self) -> Dict[str, Any] | None:
+        if not self._last_realtime_decision_zone:
+            return None
+        out = dict(self._last_realtime_decision_zone)
+        if isinstance(out.get("volume_chain"), dict):
+            out["volume_chain"] = dict(out["volume_chain"])
+        return out
 
     def _short_confidence_at(self, df: pd.DataFrame, i: int) -> float:
         profile_score = df["stock_profile_score"].iloc[i] if "stock_profile_score" in df.columns else 0
@@ -637,6 +719,7 @@ class GroqRecommendationsStrategy(StrategyBase):
         
     async def generate_realtime_signals(self, df: pd.DataFrame) -> int:
         """Same entry rules as ``generate_signals`` on the latest bar (index i = len(df)-1)."""
+        self._last_realtime_decision_zone = None
         if len(df) < 3:
             logger.debug("Insufficient data for signal generation (need at least 3 bars)")
             return 0
@@ -681,6 +764,15 @@ class GroqRecommendationsStrategy(StrategyBase):
                 logger.info(f"SHORT signal suppressed by filters ({why})")
                 continue
             out = -1
+            self._last_realtime_decision_zone = self._decision_zone_payload(
+                df=df,
+                i=i,
+                side="SHORT",
+                zone_time=zone_time,
+                zone_high=zone_high,
+                zone_low=zone_low,
+                confidence=self._short_confidence_at(df, i),
+            )
             logger.info("   -> SHORT signal accepted")
             break
 
@@ -718,6 +810,16 @@ class GroqRecommendationsStrategy(StrategyBase):
             if long_sig == 1:
                 logger.info(f"   -> LONG signal accepted (confidence {confidence:.2f})")
                 out = 1
+                self._last_realtime_decision_zone = self._decision_zone_payload(
+                    df=df,
+                    i=i,
+                    side="LONG",
+                    zone_time=zone_time,
+                    zone_high=zone_high,
+                    zone_low=zone_low,
+                    confidence=confidence,
+                    decision_rule="broke_below_demand",
+                )
             else:
                 if self.long_min_rsi > 0 and (np.isnan(cur_rsi) or cur_rsi <= self.long_min_rsi):
                     logger.info(
