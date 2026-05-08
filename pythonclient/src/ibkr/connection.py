@@ -719,16 +719,21 @@ class IBKRConnection:
             logger.debug("_sell_only_closes_or_reduces_long failed: %s", e)
         return False
 
-    async def pre_trade_check(self, symbol: str, action: str = "BUY", quantity: int = 100) -> Dict[str, Any]:
+    async def pre_trade_check(
+        self,
+        symbol: str,
+        action: str = "BUY",
+        quantity: int = 100,
+        ref_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """
         Comprehensive pre-trade gate that makes **paper behave like live**.
 
         - Uses ``get_account_margin_gate_snapshot()`` (DayTradesRemaining, SettledCash, BuyingPower...).
         - **PDT**: blocks if DayTradesRemaining==0.
-        - **Settlement**: checks SettledCash for CASH accounts.
-        - **Buying power** (rough share cap): applied to BUY and to SELL that **opens or adds**
-          a short (``reqPositions``: no long, or short already). **Skipped** only for SELL that
-          **only closes or trims** an existing long — that path does not need “purchase BP”.
+        - **Settlement**: checks SettledCash for CASH accounts (uses ``ref_price`` when provided).
+        - **Buying power**: enforced in ``place_order`` via live ``ref_price`` and
+          ``_affordable_max_shares`` (clip/skip), not here.
         - **--lax-paper** (paper only) bypasses all gates for diagnostics.
 
         Returns dict with "allowed", "reason", full gates, etc.
@@ -782,8 +787,9 @@ class IBKRConnection:
         # Settlement check for cash accounts
         acct_type = gates.get("account_type", "")
         settled = gates.get("settled_cash")
+        est_px = float(ref_price) if ref_price is not None and ref_price > 0 else 150.0
         if "CASH" in str(acct_type).upper() and settled is not None:
-            est_cost = quantity * 150.0  # rough estimate; better to use current price
+            est_cost = quantity * est_px
             if settled < est_cost * 1.1:  # 10% buffer
                 result.update({
                     "allowed": False,
@@ -791,37 +797,26 @@ class IBKRConnection:
                 })
                 logger.warning(
                     "PRE_TRADE_REJECTED symbol=%s action=%s reason=INSUFFICIENT_SETTLED_CASH "
-                    "settled_cash=%.2f est_cost=%.2f account_type=%s",
-                    symbol.upper(), action.upper(), settled, est_cost, acct_type
+                    "settled_cash=%.2f est_cost=%.2f est_px=%.2f account_type=%s",
+                    symbol.upper(), action.upper(), settled, est_cost, est_px, acct_type
                 )
                 return result
 
-        # Buying power — rough share cap vs BP. Skip for SELL that only closes/trims a long
-        # (same bug as before: comparing exit qty to affordable *buy* size). Run for BUY,
-        # for SELL that opens/adds short, and for oversized SELL (long→short flip).
+        # Buying-power sizing is applied in ``place_order`` using ``ref_price`` +
+        # ``_affordable_max_shares`` (clip or skip). Do not reject here with a placeholder
+        # price — that caused false INSUFFICIENT_BUYING_POWER before the live snapshot.
+
         bp: Optional[float] = None
         au = action.upper()
         apply_bp_share_cap = True
         if au == "SELL" and await self._sell_only_closes_or_reduces_long(symbol, quantity):
             apply_bp_share_cap = False
-        if apply_bp_share_cap:
+        if apply_bp_share_cap and ref_price is not None and ref_price > 0:
             headroom = await self.get_account_sizing_headroom()
             bp = headroom.get("buying_power") or headroom.get("available_funds")
-            if bp is not None and bp > 0:
-                est_price = 50.0  # placeholder; real price would be better
-                max_shares = int(bp * 0.85 / est_price)  # conservative
-                result["suggested_max_shares"] = max_shares
-                if quantity > max_shares * 2:  # very loose buffer
-                    result.update({
-                        "allowed": False,
-                        "reason": f"INSUFFICIENT_BUYING_POWER (bp=${bp:,.0f}, max_shares~{max_shares})",
-                    })
-                    logger.warning(
-                        "PRE_TRADE_REJECTED symbol=%s action=%s qty=%s reason=INSUFFICIENT_BUYING_POWER "
-                        "buying_power=%.0f max_shares_est=%d",
-                        symbol.upper(), action.upper(), quantity, bp, max_shares
-                    )
-                    return result
+            aff = _affordable_max_shares(float(ref_price), headroom)
+            if aff is not None:
+                result["suggested_max_shares"] = aff
 
         logger.debug(
             "PRE_TRADE_ALLOWED symbol=%s action=%s dtr=%s bp=%.0f settled=%.0f acct=%s",
@@ -851,27 +846,6 @@ class IBKRConnection:
                 return res
 
             logger.debug(f"Validating symbol {symbol} before placing order...")
-
-            # NEW: Comprehensive regulatory / account gate (PDT, buying power, settlement)
-            # This is the main protection that makes paper behave like live.
-            precheck = await self.pre_trade_check(symbol, action, qty_requested)
-            if not precheck.get("allowed", False):
-                res = PlaceOrderResult(
-                    ok=False,
-                    code=precheck.get("reason", "PRE_TRADE_REJECTED").split()[0],
-                    message=precheck.get("reason", "Pre-trade gate failed"),
-                    margin_gates=precheck.get("margin_gates"),
-                )
-                logger.error(
-                    "PRE_TRADE_REJECTED symbol=%s action=%s qty=%s reason=%s gates=%s",
-                    symbol.upper(),
-                    action.upper(),
-                    qty_requested,
-                    precheck.get("reason"),
-                    {k: v for k, v in (precheck.get("margin_gates") or {}).items()
-                     if k in ("day_trades_remaining", "settled_cash", "buying_power")}
-                )
-                return res
 
             if not await self.validate_symbol(symbol):
                 res = PlaceOrderResult(
@@ -991,55 +965,83 @@ class IBKRConnection:
 
             final_price = limit_price if order_type == 'LMT' else aux_price if order_type == 'STP' else None
 
+            ref_px: Optional[float] = None
+            if final_price is not None and final_price > 0:
+                ref_px = float(final_price)
+            elif market_price is not None and market_price > 0:
+                ref_px = float(market_price)
+
+            # PDT / settlement (with live ref when available); BP clip happens below.
+            precheck = await self.pre_trade_check(symbol, action, qty_requested, ref_price=ref_px)
+            if not precheck.get("allowed", False):
+                res = PlaceOrderResult(
+                    ok=False,
+                    code=precheck.get("reason", "PRE_TRADE_REJECTED").split()[0],
+                    message=precheck.get("reason", "Pre-trade gate failed"),
+                    margin_gates=precheck.get("margin_gates"),
+                    quantity_requested=qty_requested,
+                    quantity_submitted=0,
+                )
+                logger.error(
+                    "PRE_TRADE_REJECTED symbol=%s action=%s qty=%s reason=%s gates=%s",
+                    symbol.upper(),
+                    action.upper(),
+                    qty_requested,
+                    precheck.get("reason"),
+                    {k: v for k, v in (precheck.get("margin_gates") or {}).items()
+                     if k in ("day_trades_remaining", "settled_cash", "buying_power")},
+                )
+                return res
+
             qty = qty_requested
             sizing_meta: Optional[Dict[str, Any]] = None
             # Size only standalone equity orders; bracket legs must match parent quantity.
-            if not is_crypto and parent_id is None and qty > 0:
-                ref_px: Optional[float] = None
-                if final_price is not None and final_price > 0:
-                    ref_px = float(final_price)
-                elif market_price is not None and market_price > 0:
-                    ref_px = float(market_price)
-                if ref_px is not None and ref_px > 0:
-                    headroom = await self.get_account_sizing_headroom()
-                    max_q = _affordable_max_shares(ref_px, headroom)
-                    if max_q is not None:
-                        if max_q == 0:
-                            res = PlaceOrderResult(
-                                ok=False,
-                                code="INSUFFICIENT_BUYING_POWER",
-                                message="Account headroom does not allow any size at reference price",
-                                quantity_requested=qty_requested,
-                                quantity_submitted=0,
-                                sizing={
-                                    "ref_price": ref_px,
-                                    "headroom": {k: v for k, v in headroom.items() if v is not None},
-                                },
-                            )
-                            logger.error(
-                                "PLACE_ORDER_FAILED symbol=%s code=%s ref_px=%s headroom=%s",
-                                symbol.upper(),
-                                res.code,
-                                ref_px,
-                                res.sizing.get("headroom") if res.sizing else {},
-                            )
-                            return res
-                        if max_q < qty:
-                            logger.warning(
-                                "ORDER_SIZE_CLAMPED symbol=%s action=%s requested=%s capped=%s ref_px=%.4f",
-                                symbol.upper(),
-                                action.upper(),
-                                qty,
-                                max_q,
-                                ref_px,
-                            )
-                            sizing_meta = {
-                                "requested": qty_requested,
-                                "capped_to": max_q,
+            # Skip BP-based clamp for SELL that only closes/trims a long (exit liquidity).
+            apply_bp_clip = not is_crypto and parent_id is None and qty > 0
+            if apply_bp_clip and action.upper() == "SELL" and await self._sell_only_closes_or_reduces_long(
+                symbol, qty
+            ):
+                apply_bp_clip = False
+            if apply_bp_clip and ref_px is not None and ref_px > 0:
+                headroom = await self.get_account_sizing_headroom()
+                max_q = _affordable_max_shares(ref_px, headroom)
+                if max_q is not None:
+                    if max_q == 0:
+                        res = PlaceOrderResult(
+                            ok=False,
+                            code="SKIPPED_INSUFFICIENT_BP",
+                            message="No affordable size at reference price; order not submitted",
+                            quantity_requested=qty_requested,
+                            quantity_submitted=0,
+                            sizing={
                                 "ref_price": ref_px,
                                 "headroom": {k: v for k, v in headroom.items() if v is not None},
-                            }
-                            qty = max_q
+                            },
+                        )
+                        logger.warning(
+                            "PLACE_ORDER_SKIPPED symbol=%s code=%s ref_px=%s headroom=%s",
+                            symbol.upper(),
+                            res.code,
+                            ref_px,
+                            res.sizing.get("headroom") if res.sizing else {},
+                        )
+                        return res
+                    if max_q < qty:
+                        logger.warning(
+                            "ORDER_SIZE_CLAMPED symbol=%s action=%s requested=%s capped=%s ref_px=%.4f",
+                            symbol.upper(),
+                            action.upper(),
+                            qty,
+                            max_q,
+                            ref_px,
+                        )
+                        sizing_meta = {
+                            "requested": qty_requested,
+                            "capped_to": max_q,
+                            "ref_price": ref_px,
+                            "headroom": {k: v for k, v in headroom.items() if v is not None},
+                        }
+                        qty = max_q
 
             logger.info(
                 "ORDER_ATTEMPT symbol=%s action=%s qty=%s type=%s market_open=%s ref=%s "

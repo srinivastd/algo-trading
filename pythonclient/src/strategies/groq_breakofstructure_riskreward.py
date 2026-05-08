@@ -326,6 +326,13 @@ class GroqBreakOfStructureStrategy(StrategyBase):
             limit_price=entry_price
         )
 
+        if entry_res.code == "SKIPPED_INSUFFICIENT_BP":
+            return {
+                "status": "skipped",
+                "message": entry_res.message,
+                "ib_place_order": entry_res.as_dict(),
+            }
+
         if not entry_res.ok or not entry_res.order_id:
             return {
                 'status': 'error',

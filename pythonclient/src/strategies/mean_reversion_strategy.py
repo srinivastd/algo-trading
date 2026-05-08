@@ -294,6 +294,12 @@ class MeanReversionStrategy(StrategyBase):
                 order_type='LMT',
                 limit_price=limit_px,
             )
+            if parent_res.code == "SKIPPED_INSUFFICIENT_BP":
+                return {
+                    "status": "skipped",
+                    "message": parent_res.message,
+                    "ib_place_order": parent_res.as_dict(),
+                }
             if not parent_res.ok or not parent_res.order_id:
                 return {
                     'status': 'error',

@@ -961,6 +961,127 @@ class GroqRecommendationsStrategy(StrategyBase):
             return (0, "")
 
         return (0, "")
+
+    @staticmethod
+    def _exit_bar_float(row: pd.Series, col: str) -> Optional[float]:
+        if col not in row.index:
+            return None
+        v = row[col]
+        if pd.isna(v):
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _zone_exit_demand_break_detail(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """First demand zone matching LONG exit rule in ``_long_exit_bar_detail`` (fresh + breach)."""
+        _, demand_zones = self.identify_zones(df)
+        current_price = float(df["close"].iloc[-1])
+        now = df.index[-1]
+        out: Dict[str, Any] = {}
+        for zone_time, zone_high, zone_low in demand_zones:
+            age_h = (now - zone_time).total_seconds() / 3600.0
+            zl = float(zone_low)
+            thr = zl * 0.98
+            if age_h < 48 and current_price < thr:
+                breach_pct = ((current_price - thr) / thr * 100.0) if thr else None
+                out = {
+                    "exit_strategy_zone_rule": "below_demand_zone",
+                    "exit_zone_time": self._iso_ts(zone_time),
+                    "exit_zone_high": float(zone_high),
+                    "exit_zone_low": zl,
+                    "exit_zone_age_hours": float(age_h),
+                    "exit_zone_max_age_rule_hours": 48.0,
+                    "exit_zone_breach_threshold_price": float(thr),
+                    "exit_zone_breach_distance": float(current_price - thr),
+                    "exit_zone_breach_pct_of_threshold": float(breach_pct) if breach_pct is not None else None,
+                }
+                break
+        return out
+
+    def _zone_exit_supply_break_detail(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """First supply zone matching SHORT exit rule in ``_short_exit_bar_detail``."""
+        supply_zones, _ = self.identify_zones(df)
+        current_price = float(df["close"].iloc[-1])
+        now = df.index[-1]
+        out: Dict[str, Any] = {}
+        for zone_time, zone_high, zone_low in supply_zones:
+            age_h = (now - zone_time).total_seconds() / 3600.0
+            zh = float(zone_high)
+            thr = zh * 1.02
+            if age_h < 48 and current_price > thr:
+                breach_pct = ((current_price - thr) / thr * 100.0) if thr else None
+                out = {
+                    "exit_strategy_zone_rule": "above_supply_zone",
+                    "exit_zone_time": self._iso_ts(zone_time),
+                    "exit_zone_high": zh,
+                    "exit_zone_low": float(zone_low),
+                    "exit_zone_age_hours": float(age_h),
+                    "exit_zone_max_age_rule_hours": 48.0,
+                    "exit_zone_breach_threshold_price": float(thr),
+                    "exit_zone_breach_distance": float(current_price - thr),
+                    "exit_zone_breach_pct_of_threshold": float(breach_pct) if breach_pct is not None else None,
+                }
+                break
+        return out
+
+    def build_zone_exit_journal_patch(
+        self,
+        df: pd.DataFrame,
+        exit_reason: str,
+        *,
+        symbol: str,
+        is_long: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Build ``exit_*`` payload for ``TradeJournal.merge_exit_indicator_snapshot`` when Groq
+        zone exits fire (``strategy_exit:below_demand_zone`` / ``above_supply_zone``).
+
+        Safe to call only when ``exit_reason`` mentions those tags; returns ``None`` otherwise.
+        """
+        er = (exit_reason or "").strip()
+        if "below_demand_zone" not in er and "above_supply_zone" not in er:
+            return None
+        if len(df) < 1:
+            return None
+        row = df.iloc[-1]
+        ix = df.index[-1]
+        patch: Dict[str, Any] = {
+            "exit_snapshot_version": 1,
+            "exit_snapshot_reason_full": er,
+            "exit_symbol": str(symbol).strip().upper(),
+            "exit_position_side": "long" if is_long else "short",
+            "exit_bar_time": ix.isoformat() if hasattr(ix, "isoformat") else str(ix),
+            "exit_close": self._exit_bar_float(row, "close"),
+            "exit_rsi": self._exit_bar_float(row, "rsi"),
+            "exit_macd": self._exit_bar_float(row, "macd"),
+            "exit_macd_signal": self._exit_bar_float(row, "macd_signal"),
+            "exit_macd_histogram": self._exit_bar_float(row, "macd_histogram"),
+            "exit_adx": self._exit_bar_float(row, "adx"),
+            "exit_plus_di": self._exit_bar_float(row, "plus_di"),
+            "exit_minus_di": self._exit_bar_float(row, "minus_di"),
+            "exit_volume": self._exit_bar_float(row, "volume"),
+            "exit_bb_position": self._exit_bar_float(row, "bb_position"),
+            "exit_atr": self._exit_bar_float(row, "atr"),
+        }
+        if "below_demand_zone" in er:
+            if is_long:
+                zd = self._zone_exit_demand_break_detail(df)
+                patch.update(zd)
+                if not zd:
+                    patch["exit_zone_parse_note"] = "below_demand_zone_reason_but_no_matching_zone_row"
+            else:
+                patch["exit_zone_parse_note"] = "below_demand_zone_reason_but_position_not_long"
+        if "above_supply_zone" in er:
+            if not is_long:
+                zs = self._zone_exit_supply_break_detail(df)
+                patch.update(zs)
+                if not zs:
+                    patch["exit_zone_parse_note"] = "above_supply_zone_reason_but_no_matching_zone_row"
+            else:
+                patch["exit_zone_parse_note"] = "above_supply_zone_reason_but_position_not_short"
+        return patch
     
     async def execute_trade(self, symbol: str, signal: int, entry_price: float, shares: int, stop_loss: float, target: float) -> Dict:
         if not self.ib_client:
@@ -1017,6 +1138,13 @@ class GroqRecommendationsStrategy(StrategyBase):
                 order_type='LMT',
                 limit_price=live_entry_price
             )
+
+            if parent_res.code == "SKIPPED_INSUFFICIENT_BP":
+                return {
+                    "status": "skipped",
+                    "message": parent_res.message,
+                    "ib_place_order": parent_res.as_dict(),
+                }
 
             if not parent_res.ok or not parent_res.order_id:
                 return {

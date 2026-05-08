@@ -814,6 +814,10 @@ class TradeJournal:
         Shallow-merge numeric indicator fields into ``indicator_snapshot_json`` for keys
         that are missing or non-finite in the stored snapshot. Preserves bootstrap metadata.
         Returns True if at least one key was written.
+
+        **Exit-time context** (RSI/MACD/zones at close) uses ``merge_exit_indicator_snapshot``
+        with ``exit_*`` keys; see ``get_trades_touching_calendar_day`` /
+        ``_split_indicator_entry_exit``.
         """
         if not patch:
             return False
@@ -846,6 +850,64 @@ class TradeJournal:
                 if k not in merged or not _finite_number(merged.get(k)):
                     merged[k] = pv
                     changed = True
+            if not changed:
+                return False
+            con.execute(
+                """
+                UPDATE trades
+                SET indicator_snapshot_json = ?, updated_at = ?
+                WHERE trade_id = ?
+                """,
+                (self._dump_json(merged), now, trade_id),
+            )
+        return True
+
+    def merge_exit_indicator_snapshot(
+        self,
+        *,
+        trade_id: str,
+        patch: Mapping[str, Any],
+    ) -> bool:
+        """
+        Merge **exit** fields into ``indicator_snapshot_json``.
+
+        Convention (see ``_split_indicator_entry_exit`` / dashboard): keys prefixed ``exit_``
+        hold bar/time/indicator context at **close**, distinct from entry-time keys.
+
+        Unlike ``merge_indicator_snapshot``, this **always overwrites** matching keys so the
+        latest close wins on reconcile/retry.
+
+        Keys in ``patch`` may be passed with or without ``exit_`` prefix; bare names are
+        prefixed automatically.
+        """
+        if not patch:
+            return False
+        now = datetime.utcnow().isoformat()
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT indicator_snapshot_json FROM trades WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            raw = row[0] or "{}"
+            try:
+                cur = json.loads(raw) if isinstance(raw, str) else {}
+            except json.JSONDecodeError:
+                cur = {}
+            if not isinstance(cur, dict):
+                cur = {}
+            merged = dict(cur)
+            patch_s = _sanitize_json(dict(patch))
+            if not isinstance(patch_s, dict):
+                return False
+            changed = False
+            for k, v in patch_s.items():
+                ks = str(k)
+                key = ks if ks.lower().startswith("exit_") else f"exit_{ks}"
+                merged[key] = v
+                changed = True
+            merged["exit_snapshot_merged_at"] = now
             if not changed:
                 return False
             con.execute(

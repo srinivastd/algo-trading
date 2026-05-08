@@ -772,6 +772,49 @@ async def watch_mode(
                                                 realized_pnl=float(pnl),
                                                 status="closed",
                                             )
+                                            patch_fn = getattr(
+                                                strategy,
+                                                "build_zone_exit_journal_patch",
+                                                None,
+                                            )
+                                            if (
+                                                callable(patch_fn)
+                                                and er
+                                                and (
+                                                    "below_demand_zone" in er
+                                                    or "above_supply_zone" in er
+                                                )
+                                            ):
+                                                try:
+                                                    zp = patch_fn(
+                                                        df,
+                                                        er,
+                                                        symbol=pos_symbol,
+                                                        is_long=is_long,
+                                                    )
+                                                    if zp:
+                                                        journal.merge_exit_indicator_snapshot(
+                                                            trade_id=trade_id,
+                                                            patch=zp,
+                                                        )
+                                                        logger.info(
+                                                            "ZONE_STRATEGY_EXIT_ANALYSIS %s",
+                                                            json.dumps(
+                                                                {
+                                                                    "trade_id": trade_id,
+                                                                    "symbol": pos_symbol,
+                                                                    "exit_reason": er,
+                                                                    "exit_patch": zp,
+                                                                },
+                                                                default=str,
+                                                            ),
+                                                        )
+                                                except Exception as zone_snap_err:
+                                                    logger.warning(
+                                                        "Zone exit journal snapshot failed trade=%s: %s",
+                                                        trade_id,
+                                                        zone_snap_err,
+                                                    )
                                             if not matching_exit:
                                                 journal.record_fill(
                                                     trade_id=trade_id,
@@ -1010,6 +1053,12 @@ async def watch_mode(
                                         order_id=trade_result.get('order_id'),
                                         stop_order_id=trade_result.get('stop_order_id'),
                                         target_order_id=trade_result.get('target_order_id'),
+                                    )
+                                elif trade_result.get("status") == "skipped":
+                                    journal.update_trade_execution_result(
+                                        trade_id=trade_id,
+                                        status="skipped",
+                                        error_message=trade_result.get('message'),
                                     )
                                 else:
                                     journal.update_trade_execution_result(
