@@ -719,12 +719,64 @@ class IBKRConnection:
             logger.debug("_sell_only_closes_or_reduces_long failed: %s", e)
         return False
 
+    async def _net_stk_position_shares(self, symbol: str) -> Optional[float]:
+        """Net US equity shares (positive long, negative short); None when unavailable."""
+        sym_u = symbol.upper()
+        total = 0.0
+        try:
+            ib = self.get_ib()
+            positions = await ib.reqPositionsAsync()
+            for p in positions:
+                try:
+                    if p.contract.symbol.upper() != sym_u:
+                        continue
+                    if getattr(p.contract, "secType", "") not in ("STK", ""):
+                        continue
+                    total += float(getattr(p, "position", 0.0) or 0.0)
+                except Exception:
+                    continue
+            return total
+        except Exception as e:
+            logger.debug("_net_stk_position_shares failed: %s", e)
+            return None
+
+    def _legacy_opposite_side_block_reason(
+        self, symbol: str, action: str, quantity: int, net_position: float
+    ) -> Optional[str]:
+        """
+        Block standalone orders that would grow through zero (journal / bracket confusion).
+
+        Allow close-only: BUY qty <= abs(short); SELL qty <= long. Bracket legs pass
+        ``parent_id`` into ``pre_trade_check`` and skip this gate.
+        """
+        qty = max(0, int(quantity))
+        if qty <= 0:
+            return None
+        sym_u = symbol.upper()
+        au = action.upper()
+        if au == "BUY" and net_position < -1e-6:
+            cov = abs(net_position)
+            if qty > cov + 1e-3:
+                return (
+                    f"OPPOSITE_SIDE_POSITION (existing short {cov:.6g} sh in {sym_u}; "
+                    f"BUY {qty} would open/add net long — close or flatten short first)"
+                )
+        elif au == "SELL" and net_position > 1e-6:
+            clo = net_position
+            if qty > clo + 1e-3:
+                return (
+                    f"OPPOSITE_SIDE_POSITION (existing long {clo:.6g} sh in {sym_u}; "
+                    f"SELL {qty} would open/add net short — close or flatten long first)"
+                )
+        return None
+
     async def pre_trade_check(
         self,
         symbol: str,
         action: str = "BUY",
         quantity: int = 100,
         ref_price: Optional[float] = None,
+        parent_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Comprehensive pre-trade gate that makes **paper behave like live**.
@@ -734,7 +786,13 @@ class IBKRConnection:
         - **Settlement**: checks SettledCash for CASH accounts (uses ``ref_price`` when provided).
         - **Buying power**: enforced in ``place_order`` via live ``ref_price`` and
           ``_affordable_max_shares`` (clip/skip), not here.
+        - **Opposite side**: standalone orders (no ``parent_id``) cannot cross through an
+          existing stock position beyond a flatten (prevents orphaned shorts/longs fighting
+          the journal).
         - **--lax-paper** (paper only) bypasses all gates for diagnostics.
+
+        ``parent_id``: when set (bracket children), skips the opposite-side guard so stop
+        and profit targets sized to the intended parent quantity still submit.
 
         Returns dict with "allowed", "reason", full gates, etc.
         """
@@ -801,6 +859,27 @@ class IBKRConnection:
                     symbol.upper(), action.upper(), settled, est_cost, est_px, acct_type
                 )
                 return result
+
+        if (
+            parent_id is None
+            and not CryptoUtils.is_crypto(symbol)
+            and action.upper() in ("BUY", "SELL")
+        ):
+            net_pos = await self._net_stk_position_shares(symbol)
+            if net_pos is not None:
+                obl = self._legacy_opposite_side_block_reason(
+                    symbol, action, quantity, float(net_pos)
+                )
+                if obl:
+                    result.update({"allowed": False, "reason": obl})
+                    logger.warning(
+                        "PRE_TRADE_REJECTED symbol=%s action=%s qty=%s reason=%s",
+                        symbol.upper(),
+                        action.upper(),
+                        int(quantity),
+                        obl,
+                    )
+                    return result
 
         # Buying-power sizing is applied in ``place_order`` using ``ref_price`` +
         # ``_affordable_max_shares`` (clip or skip). Do not reject here with a placeholder
@@ -972,7 +1051,9 @@ class IBKRConnection:
                 ref_px = float(market_price)
 
             # PDT / settlement (with live ref when available); BP clip happens below.
-            precheck = await self.pre_trade_check(symbol, action, qty_requested, ref_price=ref_px)
+            precheck = await self.pre_trade_check(
+                symbol, action, qty_requested, ref_price=ref_px, parent_id=parent_id
+            )
             if not precheck.get("allowed", False):
                 res = PlaceOrderResult(
                     ok=False,
