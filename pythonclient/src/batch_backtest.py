@@ -209,6 +209,7 @@ def build_main_argv(
     volume_breakout_mult: float = 1.1,
     volume_confirm_mult: float = 1.05,
     position_size_cap: float = 0.95,
+    historical_data_dir: Optional[str] = None,
 ) -> List[str]:
     exe = sys.executable
     main_py = src_dir / "main.py"
@@ -252,6 +253,9 @@ def build_main_argv(
         cmd.append("--force-refresh")
     if debug:
         cmd.append("--debug")
+    pc_root = src_dir.resolve().parent
+    hdc = historical_data_dir if historical_data_dir is not None else str((pc_root / "historical_data").resolve())
+    cmd.extend(["--historical-data-dir", hdc])
     return cmd
 
 
@@ -377,6 +381,7 @@ def run_single_backtest(
     volume_breakout_mult: float = 1.1,
     volume_confirm_mult: float = 1.05,
     position_size_cap: float = 0.95,
+    historical_data_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one main.py backtest, read Chroma, return a result dict."""
     cmd = build_main_argv(
@@ -389,6 +394,7 @@ def run_single_backtest(
         volume_breakout_mult=volume_breakout_mult,
         volume_confirm_mult=volume_confirm_mult,
         position_size_cap=position_size_cap,
+        historical_data_dir=historical_data_dir,
     )
     label = f"{symbol} SL={stop_loss} T={target} maxDur={max_duration}"
     print(f"\n=== {label} ===", flush=True)
@@ -447,6 +453,11 @@ def main() -> None:
     p.add_argument("--volume-confirm-mult", type=float, default=1.05)
     p.add_argument("--position-size-cap", type=float, default=0.95)
     p.add_argument("--continue-on-error", action="store_true", help="Keep batch after a failed symbol")
+    p.add_argument(
+        "--historical-data-dir",
+        default=None,
+        help="Historical CSV cache directory (default: pythonclient/historical_data)",
+    )
     p.add_argument("--verify-schema", action="store_true", help="Print Chroma metadata checklist and exit")
     p.add_argument("--json", action="store_true", help="Also write a .json sidecar with full results")
 
@@ -471,6 +482,12 @@ def main() -> None:
 
     src_dir = Path(__file__).resolve().parent
     chroma_path = (src_dir / args.chroma_dir).resolve()
+    hist_root = (
+        Path(args.historical_data_dir).resolve()
+        if args.historical_data_dir
+        else (src_dir.parent / "historical_data").resolve()
+    )
+    hist_root.mkdir(parents=True, exist_ok=True)
 
     if args.verify_schema:
         verify_chroma_schema(chroma_path)
@@ -525,6 +542,7 @@ def main() -> None:
                 volume_breakout_mult=vb,
                 volume_confirm_mult=vc,
                 position_size_cap=args.position_size_cap,
+                historical_data_dir=str(hist_root),
             )
             all_rows.append(row)
             with output_path.open("a", newline="", encoding="utf-8") as f:
@@ -548,6 +566,7 @@ def main() -> None:
                 volume_breakout_mult=args.volume_breakout_mult,
                 volume_confirm_mult=args.volume_confirm_mult,
                 position_size_cap=args.position_size_cap,
+                historical_data_dir=str(hist_root),
             )
             all_rows.append(row)
             with output_path.open("a", newline="", encoding="utf-8") as f:

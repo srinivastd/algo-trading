@@ -26,8 +26,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Use centralized daily logging
-from src.logging_config import setup_daily_logging
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from logging_config import setup_daily_logging  # noqa: E402
 
 logger = setup_daily_logging(
     log_name="autoresearch",
@@ -35,9 +39,6 @@ logger = setup_daily_logging(
     console=True,
     backup_count=30,
 )
-
-ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
 BASELINE_PATH = ROOT / "baseline.json"
 NEXT_EXP_DIR = ROOT / "runs" / "next_experiments"
 LOG_PATH = ROOT / "logs" / "autoresearch_log.jsonl"

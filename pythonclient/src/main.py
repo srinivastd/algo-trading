@@ -6,6 +6,7 @@ import asyncio
 import logging
 import argparse
 import sys
+import math
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timedelta, time
@@ -50,6 +51,129 @@ market_data_logger = setup_market_data_logger()
 
 class WatchModeInsufficientBuyingPower(RuntimeError):
     """Watch mode stopped: an entry was rejected with INSUFFICIENT_BUYING_POWER."""
+
+
+async def _wait_symbol_not_short(
+    connection: IBKRConnection,
+    symbol: str,
+    *,
+    timeout_s: float = 75.0,
+    poll_s: float = 0.4,
+) -> bool:
+    """Poll until net position is not short (≥ ~0) or timeout."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    sym_u = symbol.upper()
+    while loop.time() < deadline:
+        net = await connection.net_stk_position_shares(sym_u)
+        if net is None:
+            await asyncio.sleep(poll_s)
+            continue
+        if net >= -1e-6:
+            return True
+        await asyncio.sleep(poll_s)
+    return False
+
+
+async def _maybe_flatten_portfolio_equity_shorts_paper(
+    connection: IBKRConnection,
+    *,
+    enabled: bool,
+    paper: bool,
+) -> None:
+    """
+    Paper watch startup (default): submit MKT BUY to cover **every** net-short US equity
+    position visible in IBKR inventory (aggregate per symbol).
+
+    Uses ``place_order`` (same gates as other paper orders). On failure or timeout exiting
+    short, exits the process.
+
+    Skipped when ``--no-flatten-paper-shorts`` (or legacy ``--no-flatten-watchlist-shorts``).
+    Live sessions never run this path.
+
+    Covers only listed stock (``STK``) legs; excludes options/crypto — same notion as zone / preflight.
+    """
+    if not enabled:
+        return
+    if not paper:
+        logger.error(
+            "Internal error: flatten portfolio shorts enabled without --paper; refusing.",
+        )
+        raise SystemExit(1)
+    shorts = await connection.stk_symbols_net_short()
+    if not shorts:
+        return
+    logger.info(
+        "Flatten shorts (paper watch startup): %s ticker(s) with net equity short inventory.",
+        len(shorts),
+    )
+    for sym_u, net in shorts:
+        if net >= -1e-6:
+            continue
+        qty = max(1, int(math.ceil(-float(net) - 1e-9)))
+        logger.info(
+            "Flatten shorts: BUY MKT %s sh %s to cover net %.6g sh short.",
+            qty,
+            sym_u,
+            net,
+        )
+        res = await connection.place_order(sym_u, "BUY", qty, "MKT")
+        if not res.ok:
+            logger.error(
+                "Flatten shorts failed on %s: %s — %s",
+                sym_u,
+                getattr(res, "code", "?"),
+                getattr(res, "message", ""),
+            )
+            raise SystemExit(1)
+        if not await _wait_symbol_not_short(connection, sym_u):
+            net2 = await connection.net_stk_position_shares(sym_u)
+            logger.error(
+                "Flatten shorts timeout: %s still net short (%s). Check TWS fills and rerun.",
+                sym_u,
+                net2,
+            )
+            raise SystemExit(1)
+
+
+async def _preflight_watchlist_no_net_short(
+    connection: IBKRConnection,
+    symbols: list[str],
+    *,
+    allow_net_short: bool,
+) -> None:
+    """
+    Abort watch startup if any watchlist symbol has a net SHORT at IBKR.
+
+    Full-size LONG entries are blocked by ``pre_trade_check`` when a legacy short exists
+    (OPPOSITE_SIDE_POSITION). On **paper watch** all net **portfolio** equity shorts are covered
+    with MKT BUYs before preflight unless ``--no-flatten-paper-shorts``. Otherwise flatten manually
+    in TWS or pass ``--allow-watchlist-net-short`` for diagnostics (watchlist symbols only).
+    """
+    if allow_net_short:
+        return
+    bad: list[tuple[str, float]] = []
+    for sym in symbols:
+        net = await connection.net_stk_position_shares(sym)
+        if net is None:
+            logger.warning(
+                "Watch preflight: could not read net position for %s (IB); "
+                "fix connectivity or use --allow-watchlist-net-short to bypass.",
+                sym,
+            )
+            continue
+        if net < -1e-6:
+            bad.append((sym.upper(), float(net)))
+    if not bad:
+        return
+    detail = "; ".join(f"{s} ({n:.6g} sh short)" for s, n in bad)
+    logger.error(
+        "Watch preflight failed: net SHORT on watchlist symbol(s): %s. "
+        "Paper watch normally clears all equity shorts at startup unless --no-flatten-paper-shorts; "
+        "cover manually or pass --allow-watchlist-net-short (diagnostics only).",
+        detail,
+    )
+    raise SystemExit(1)
 
 
 def _safe_float(v):
@@ -1300,6 +1424,11 @@ def parse_args():
     parser.add_argument("--bar-size", default="15 mins", help="Bar size for historical data (aligned with paper trading)")
     parser.add_argument("--strategy", default="groq", help="Trading strategy to use")
     parser.add_argument("--force-refresh", action="store_true", help="Force refresh historical data")
+    parser.add_argument(
+        "--historical-data-dir",
+        default=str(_PYTHONCLIENT_ROOT / "historical_data"),
+        help="Directory for cached IBKR historical CSVs (reused across backtests; repo default gitignored)",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--client-id", type=int, default=1, help="IBKR client ID")
     parser.add_argument("--paper", action="store_true", help="Use paper trading")
@@ -1307,6 +1436,20 @@ def parse_args():
         "--enable-shorts",
         action="store_true",
         help="Allow NEW short entries in watch mode (default: off; focus on LONG only).",
+    )
+    parser.add_argument(
+        "--allow-watchlist-net-short",
+        action="store_true",
+        help="Watch mode: allow startup when a watchlist symbol still has a net SHORT at IBKR. "
+        "Default aborts preflight so LONG entries are not blocked by OPPOSITE_SIDE_POSITION.",
+    )
+    parser.add_argument(
+        "--no-flatten-paper-shorts",
+        "--no-flatten-watchlist-shorts",
+        dest="no_flatten_paper_shorts",
+        action="store_true",
+        help="Paper watch only: skip auto MKT BUY to cover net **portfolio** equity (STK) shorts "
+        "before watch (default = cover all shorts so LONG entries are not blocked).",
     )
     parser.add_argument(
         "--daily-loss-stop-pct",
@@ -1518,7 +1661,7 @@ async def main():
             
         # Initialize historical data manager
         logger.info("Initializing historical data manager...")
-        data_manager = HistoricalDataManager(connection)
+        data_manager = HistoricalDataManager(connection, data_dir=args.historical_data_dir)
         
         if args.watch:
             # Real-time watching mode for multiple stocks
@@ -1526,6 +1669,17 @@ async def main():
             if args.strategy not in ['groq', 'mean_reversion']:
                 logger.error(f"Real-time watching only supported for groq and mean_reversion strategies, not: {args.strategy}")
                 return
+
+            await _maybe_flatten_portfolio_equity_shorts_paper(
+                connection,
+                enabled=bool(args.paper) and not bool(args.no_flatten_paper_shorts),
+                paper=bool(args.paper),
+            )
+            await _preflight_watchlist_no_net_short(
+                connection,
+                list(args.symbols),
+                allow_net_short=bool(args.allow_watchlist_net_short),
+            )
 
             # Set IB client for watch mode
             strategy.set_ib_client(connection)
@@ -1726,6 +1880,16 @@ async def main():
                     logger.info(
                         f"\nBacktest validation passed: Average return {total_return:.2f}% exceeds required 10% threshold."
                         f"\nStarting {'paper' if args.paper else 'live'} trading..."
+                    )
+                    await _maybe_flatten_portfolio_equity_shorts_paper(
+                        connection,
+                        enabled=bool(args.paper) and not bool(args.no_flatten_paper_shorts),
+                        paper=bool(args.paper),
+                    )
+                    await _preflight_watchlist_no_net_short(
+                        connection,
+                        list(args.symbols),
+                        allow_net_short=bool(args.allow_watchlist_net_short),
                     )
                     # Start trading in watch mode
                     run_id = None

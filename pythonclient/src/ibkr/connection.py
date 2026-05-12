@@ -10,7 +10,7 @@ import math
 import pytz
 from dataclasses import dataclass, field
 from ib_insync import IB, MarketOrder, StopOrder, LimitOrder, Trade, Stock, Order, Crypto
-from typing import Any, List, Optional, Dict
+from typing import Any, Dict, List, Optional, Tuple
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -719,6 +719,24 @@ class IBKRConnection:
             logger.debug("_sell_only_closes_or_reduces_long failed: %s", e)
         return False
 
+    async def _buy_only_covers_or_reduces_short(self, symbol: str, quantity: int) -> bool:
+        """
+        True when BUY size only flattens or trims an existing **short** (no flip through flat into net long).
+        """
+        qty = max(0, int(quantity))
+        if qty <= 0:
+            return True
+        try:
+            pos = await self._net_stk_position_shares(symbol)
+            if pos is None:
+                return False
+            if pos < -1e-6:
+                return qty <= abs(pos) + 1e-3
+            return False
+        except Exception as e:
+            logger.debug("_buy_only_covers_or_reduces_short failed: %s", e)
+            return False
+
     async def _net_stk_position_shares(self, symbol: str) -> Optional[float]:
         """Net US equity shares (positive long, negative short); None when unavailable."""
         sym_u = symbol.upper()
@@ -739,6 +757,45 @@ class IBKRConnection:
         except Exception as e:
             logger.debug("_net_stk_position_shares failed: %s", e)
             return None
+
+    async def net_stk_position_shares(self, symbol: str) -> Optional[float]:
+        """Net US equity shares for ``symbol`` (+ long, − short); public preflight/read API."""
+        return await self._net_stk_position_shares(symbol)
+
+    async def stk_symbols_net_short(self) -> List[Tuple[str, float]]:
+        """
+        US equity symbols with a **net short** position (aggregate all STK legs per symbol).
+
+        Same ``secType`` rules as ``_net_stk_position_shares``. Returns sorted
+        ``[(SYMBOL, net_shares), ...]`` where ``net_shares`` is negative.
+
+        Cryptos/options/futures are omitted.
+        """
+        from collections import defaultdict
+
+        if not self.is_connected():
+            return []
+        agg: defaultdict[str, float] = defaultdict(float)
+        try:
+            ib = self.get_ib()
+            positions = await ib.reqPositionsAsync()
+            for p in positions:
+                try:
+                    c = getattr(p, "contract", None)
+                    if c is None:
+                        continue
+                    if getattr(c, "secType", "") not in ("STK", ""):
+                        continue
+                    sym = (getattr(c, "symbol", "") or "").strip().upper()
+                    if not sym:
+                        continue
+                    agg[sym] += float(getattr(p, "position", 0.0) or 0.0)
+                except Exception:
+                    continue
+            return [(s, q) for s, q in sorted(agg.items()) if q < -1e-6]
+        except Exception as e:
+            logger.debug("stk_symbols_net_short failed: %s", e)
+            return []
 
     def _legacy_opposite_side_block_reason(
         self, symbol: str, action: str, quantity: int, net_position: float
@@ -1080,6 +1137,10 @@ class IBKRConnection:
             # Skip BP-based clamp for SELL that only closes/trims a long (exit liquidity).
             apply_bp_clip = not is_crypto and parent_id is None and qty > 0
             if apply_bp_clip and action.upper() == "SELL" and await self._sell_only_closes_or_reduces_long(
+                symbol, qty
+            ):
+                apply_bp_clip = False
+            if apply_bp_clip and action.upper() == "BUY" and await self._buy_only_covers_or_reduces_short(
                 symbol, qty
             ):
                 apply_bp_clip = False
