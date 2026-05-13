@@ -32,8 +32,7 @@ from trade_memory import TradeMemory
 
 _PYTHONCLIENT_ROOT = Path(__file__).resolve().parent.parent
 
-from pathlib import Path
-from src.logging_config import setup_daily_logging, setup_market_data_logger
+from logging_config import setup_daily_logging, setup_market_data_logger
 
 # Setup daily rotating logging (one file per day, keeps last 30 days)
 # This is now idempotent (Bug 2 fix) so it can safely be called from multiple modules
