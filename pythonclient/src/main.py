@@ -17,7 +17,6 @@ import pandas as pd
 from ibkr.connection import IBKRConnection
 from ibkr.historical_data import HistoricalDataManager
 from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy
-from strategies.adx_rsi_macd_pullback_strategy import AdxRsiMacdTrendPullbackStrategy
 
 from bar_size_hours import parse_bar_size_to_hours, zone_lookback_bars_from_clock_hours
 
@@ -1732,7 +1731,7 @@ def parse_args():
     parser.add_argument("symbols", nargs="+", help="Trading symbols")
     parser.add_argument("--duration", default="3 Y", help="Duration for historical data (aligned with tuned params)")
     parser.add_argument("--bar-size", default="15 mins", help="Bar size for historical data (aligned with paper trading)")
-    parser.add_argument("--strategy", default="groq", help="Trading strategy to use")
+    parser.add_argument("--strategy", default="groq", choices=["groq"], help="Trading strategy to use (groq only)")
     parser.add_argument("--force-refresh", action="store_true", help="Force refresh historical data")
     parser.add_argument(
         "--historical-data-dir",
@@ -1856,9 +1855,6 @@ def parse_args():
     parser.add_argument("--volume-breakout-mult", type=float, default=1.36, help="Volume multiplier for breakout bar (tuned)")
     parser.add_argument("--volume-confirm-mult", type=float, default=1.19, help="Volume multiplier for confirmation bar (tuned)")
     parser.add_argument("--position-size-cap", type=float, default=0.95, help="Max fraction of capital per position")
-    # ADX RSI MACD specific parameters (passed through to strategy)
-    parser.add_argument("--adx-threshold", type=float, default=35.0, help="ADX threshold for trend strength (adx_rsi_macd)")
-    parser.add_argument("--rsi-entry-cross", type=float, default=45.0, help="RSI cross level for entry (adx_rsi_macd)")
     parser.add_argument("--min-hold-hours", type=float, default=2.0, help="Minimum hold time before strategy exits")
     parser.add_argument(
         "--min-entry-confidence",
@@ -1978,16 +1974,6 @@ async def main():
             f"adx_min={strategy.adx_min}, long_min_rsi={getattr(strategy, 'long_min_rsi', 18.0)}, "
             f"zone_lookback={getattr(strategy, 'zone_lookback', 7)} bars"
         )
-    elif args.strategy == "adx_rsi_macd":
-        # Support higher risk and extended hours for the new strategy
-        adx_params = {
-            "adx_threshold": getattr(args, "adx_threshold", 35.0),
-            "rsi_entry_cross": getattr(args, "rsi_entry_cross", 45.0),
-            "min_hold_hours": getattr(args, "min_hold_hours", 2.0),
-        }
-        strategy = AdxRsiMacdTrendPullbackStrategy(**strategy_params, **adx_params)
-        logger.info(f"ADX_RSI_MACD Strategy initialized with: ADX>{strategy.adx_threshold}, RSI_cross>{strategy.rsi_entry_cross}, "
-                   f"risk=${strategy.risk_per_trade}, min_hold={strategy.min_hold_hours}h (extended hours OK)")
     else:
         raise ValueError(f"Unknown strategy: {args.strategy}")
     
@@ -2082,8 +2068,8 @@ async def main():
                     "--bt-start-day / --bt-end-day apply only to backtest/paper backtest slices; ignoring for --watch."
                 )
             logger.info(f"Starting real-time watch for {args.symbols} with check interval {args.check_interval} seconds")
-            if args.strategy not in ['groq', 'mean_reversion']:
-                logger.error(f"Real-time watching only supported for groq and mean_reversion strategies, not: {args.strategy}")
+            if args.strategy != 'groq':
+                logger.error(f"Real-time watching only supported for the groq strategy, not: {args.strategy}")
                 return
 
             await _maybe_flatten_portfolio_equity_shorts_paper(
@@ -2224,8 +2210,8 @@ async def main():
                     logger.info(f"Running in {mode} mode for {symbol}...")
                     strategy.set_ib_client(connection)  # Set IB client for paper trading
                     
-                # Validate risk per trade (higher limit allowed for adx_rsi_macd strategy)
-                max_risk = 5000.0 if args.strategy == "adx_rsi_macd" else 2000.0
+                # Validate risk per trade
+                max_risk = 2000.0
                 if args.risk_per_trade > max_risk:
                     logger.warning(f"Risk per trade (${args.risk_per_trade}) exceeds maximum allowed (${max_risk}). Setting to ${max_risk}.")
                     args.risk_per_trade = max_risk
