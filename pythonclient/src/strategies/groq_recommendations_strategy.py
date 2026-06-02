@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Union
+
+from bar_size_hours import parse_bar_size_to_hours
 from .base import (
     StrategyBase,
     normalize_strategy_exit_signal,
@@ -30,7 +32,7 @@ class GroqRecommendationsStrategy(StrategyBase):
     Supply/demand zones with ADX, volume, and realtime filters.
 
     Tuned for **15-minute bars** (aligned with paper trading) + 3Y backtests.
-    New defaults: risk=$4000, SL=1.1%, TGT=4.8%, zone_lookback=7, adx_min=28.5,
+    New defaults: risk=$4000, SL=1.1%, TGT=4.8%, zone_lookback=7, adx_min=32.0,
     long_min_rsi=18.0, volume_mults=(1.36, 1.19). Long-only recommended
     (short_realtime_filters_enabled=False). min_hold_hours=2.0 reduces noise.
     """
@@ -39,7 +41,7 @@ class GroqRecommendationsStrategy(StrategyBase):
 
     def __init__(self, risk_per_trade: float = 4000, max_duration_hours: float = 12.0, paper_trading: bool = True,
                  stop_loss_pct: float = 1.1, target_pct: float = 4.8, bar_size: str = "15 mins", duration: str = "3 Y",
-                 zone_lookback: int = 7, adx_min: float = 28.5,
+                 zone_lookback: int = 7, adx_min: float = 32.0,
                  long_min_rsi: float = 18.0,
                  zone_freshness_hours: float = 8.0,
                  volume_breakout_mult: float = 1.36,
@@ -56,6 +58,12 @@ class GroqRecommendationsStrategy(StrategyBase):
                  short_realtime_max_macd_histogram: float | None = None,
                  min_hold_hours: float = 2.0,  # suppress early programmatic exits (noise reduction on 15m)
                  skip_chromadb: bool = False,  # zone UI: skip Chroma + sentence-transformer load
+                 zone_lookback_hours_requested: Optional[float] = None,
+                 # Realtime/paper/watch + backtest: skip entries when computed confidence is below floor.
+                 min_entry_confidence: float | None = None,
+                 # Realtime only: skip entries when zone age (hours since zone touch) >= cap (strict < cap).
+                 # None or <=0 disables. Paper defaults set via main.py (typically 3h).
+                 max_entry_zone_age_hours: float | None = None,
     ):
         super().__init__("Groq Recommendations Strategy")
         self.risk_per_trade = risk_per_trade
@@ -67,6 +75,11 @@ class GroqRecommendationsStrategy(StrategyBase):
         self.bar_size = bar_size
         self.duration = duration
         self.zone_lookback = zone_lookback
+        self.zone_lookback_hours_requested = (
+            float(zone_lookback_hours_requested)
+            if zone_lookback_hours_requested is not None
+            else None
+        )
         self.adx_min = adx_min
         self.long_min_rsi = float(long_min_rsi)
         self.zone_freshness_hours = zone_freshness_hours
@@ -82,6 +95,13 @@ class GroqRecommendationsStrategy(StrategyBase):
         self.short_realtime_require_minus_di_gt_plus_di = bool(short_realtime_require_minus_di_gt_plus_di)
         self.short_realtime_max_macd_histogram = short_realtime_max_macd_histogram
         self.min_hold_hours = float(min_hold_hours)  # NEW: 2h default prevents cutting winners early
+        self.min_entry_confidence = (
+            float(min_entry_confidence) if min_entry_confidence is not None else None
+        )
+        if max_entry_zone_age_hours is not None and float(max_entry_zone_age_hours) > 0:
+            self.max_entry_zone_age_hours = float(max_entry_zone_age_hours)
+        else:
+            self.max_entry_zone_age_hours = None
         self.chroma_client = None
         self.collection = None
         self._last_realtime_decision_zone: Dict[str, Any] | None = None
@@ -109,6 +129,16 @@ class GroqRecommendationsStrategy(StrategyBase):
             f"stop_loss={stop_loss_pct}%, target={target_pct}%, bar_size={bar_size}, duration={duration}, "
             f"adx_min={self.adx_min}, long_min_rsi={self.long_min_rsi}, zone_lookback={self.zone_lookback}"
         )
+        if self.min_entry_confidence is not None:
+            logger.info(
+                "min_entry_confidence=%.4f — entries require score >= this (bucket floor 0.80 aligns with CONF_BUCKET analytics)",
+                self.min_entry_confidence,
+            )
+        if self.max_entry_zone_age_hours is not None:
+            logger.info(
+                "max_entry_zone_age_hours=%.4f — realtime entries require zone age < this many hours",
+                self.max_entry_zone_age_hours,
+            )
         if self.short_realtime_filters_enabled:
             logger.info(
                 "Realtime SHORT filters ON: block adx<%s rsi>%s | (+di>-di & rsi>%s); "
@@ -514,6 +544,24 @@ class GroqRecommendationsStrategy(StrategyBase):
             return "0.80-0.89"
         return "0.90-1.00"
 
+    def _zone_age_under_entry_cap(self, zone_age_hours: float) -> bool:
+        cap = self.max_entry_zone_age_hours
+        if cap is None:
+            return True
+        try:
+            return float(zone_age_hours) < float(cap)
+        except (TypeError, ValueError):
+            return True
+
+    def _meets_min_entry_confidence(self, confidence: float) -> bool:
+        m = self.min_entry_confidence
+        if m is None:
+            return True
+        try:
+            return float(confidence) >= float(m)
+        except (TypeError, ValueError):
+            return False
+
     @staticmethod
     def _trade_return_pct(trade: Dict[str, Any]) -> float | None:
         entry = trade.get("entry_price")
@@ -693,6 +741,13 @@ class GroqRecommendationsStrategy(StrategyBase):
                         logger.debug("Short zone hit but filtered at %s: %s", df.index[i], why)
                         continue
                     confidence = self._short_confidence_at(df, i)
+                    if not self._meets_min_entry_confidence(confidence):
+                        logger.debug(
+                            "Short zone hit but confidence %.3f < min_entry_confidence at %s",
+                            confidence,
+                            df.index[i],
+                        )
+                        continue
                     signals.loc[signals.index[i], 'signal'] = -1
                     signals.loc[signals.index[i], 'confidence_score'] = confidence
                     logger.debug(
@@ -703,12 +758,18 @@ class GroqRecommendationsStrategy(StrategyBase):
             for zone_time, zone_high, zone_low in demand_zones:
                 if self._demand_long_zone_hit(df, i, zone_time, zone_high, zone_low):
                     long_sig, confidence = self._long_signal_and_confidence_at(df, i)
-                    if long_sig == 1:
+                    if long_sig == 1 and self._meets_min_entry_confidence(confidence):
                         signals.loc[signals.index[i], 'signal'] = 1
                         signals.loc[signals.index[i], 'confidence_score'] = confidence
                         logger.debug(
                             f"Long signal at {df.index[i]}, price: {current_price:.2f}, "
                             f"confidence: {confidence:.2f}, profile: {profile_score:.3f}"
+                        )
+                    elif long_sig == 1:
+                        logger.debug(
+                            "Long zone hit but confidence %.3f < min_entry_confidence at %s",
+                            confidence,
+                            df.index[i],
                         )
                     break
 
@@ -758,10 +819,27 @@ class GroqRecommendationsStrategy(StrategyBase):
             logger.info(
                 f"   Zone age: {time_diff_hours:.1f} h (freshness < {self.zone_freshness_hours} h)"
             )
+            if not self._zone_age_under_entry_cap(time_diff_hours):
+                logger.info(
+                    "SHORT signal suppressed: zone age %.2fh >= max_entry_zone_age_hours %.2f",
+                    time_diff_hours,
+                    float(self.max_entry_zone_age_hours)
+                    if self.max_entry_zone_age_hours is not None
+                    else -1.0,
+                )
+                continue
             logger.info(f"   Zone range: ${zone_low:.2f} - ${zone_high:.2f}")
             ok, why = self._passes_short_realtime_filters(df.iloc[: i + 1])
             if not ok:
                 logger.info(f"SHORT signal suppressed by filters ({why})")
+                continue
+            confidence = self._short_confidence_at(df, i)
+            if not self._meets_min_entry_confidence(confidence):
+                logger.info(
+                    "SHORT signal suppressed: confidence %.2f < min_entry_confidence %.2f",
+                    confidence,
+                    float(self.min_entry_confidence) if self.min_entry_confidence is not None else -1.0,
+                )
                 continue
             out = -1
             self._last_realtime_decision_zone = self._decision_zone_payload(
@@ -771,7 +849,7 @@ class GroqRecommendationsStrategy(StrategyBase):
                 zone_time=zone_time,
                 zone_high=zone_high,
                 zone_low=zone_low,
-                confidence=self._short_confidence_at(df, i),
+                confidence=confidence,
             )
             logger.info("   -> SHORT signal accepted")
             break
@@ -804,22 +882,40 @@ class GroqRecommendationsStrategy(StrategyBase):
             logger.info(
                 f"   Zone age: {time_diff_hours:.1f} h (freshness < {self.zone_freshness_hours} h)"
             )
+            if not self._zone_age_under_entry_cap(time_diff_hours):
+                logger.info(
+                    "   -> LONG suppressed: zone age %.2fh >= max_entry_zone_age_hours %.2f",
+                    time_diff_hours,
+                    float(self.max_entry_zone_age_hours)
+                    if self.max_entry_zone_age_hours is not None
+                    else -1.0,
+                )
+                continue
             logger.info(f"   Zone range: ${zone_low:.2f} - ${zone_high:.2f}")
             if not np.isnan(cur_rsi):
                 logger.info(f"   RSI: {cur_rsi:.1f} (long_min_rsi={self.long_min_rsi})")
             if long_sig == 1:
-                logger.info(f"   -> LONG signal accepted (confidence {confidence:.2f})")
-                out = 1
-                self._last_realtime_decision_zone = self._decision_zone_payload(
-                    df=df,
-                    i=i,
-                    side="LONG",
-                    zone_time=zone_time,
-                    zone_high=zone_high,
-                    zone_low=zone_low,
-                    confidence=confidence,
-                    decision_rule="broke_below_demand",
-                )
+                if self._meets_min_entry_confidence(confidence):
+                    logger.info(f"   -> LONG signal accepted (confidence {confidence:.2f})")
+                    out = 1
+                    self._last_realtime_decision_zone = self._decision_zone_payload(
+                        df=df,
+                        i=i,
+                        side="LONG",
+                        zone_time=zone_time,
+                        zone_high=zone_high,
+                        zone_low=zone_low,
+                        confidence=confidence,
+                        decision_rule="broke_below_demand",
+                    )
+                else:
+                    logger.info(
+                        "   -> LONG suppressed: confidence %.2f < min_entry_confidence %.2f",
+                        confidence,
+                        float(self.min_entry_confidence)
+                        if self.min_entry_confidence is not None
+                        else -1.0,
+                    )
             else:
                 if self.long_min_rsi > 0 and (np.isnan(cur_rsi) or cur_rsi <= self.long_min_rsi):
                     logger.info(
@@ -1482,6 +1578,18 @@ class GroqRecommendationsStrategy(StrategyBase):
             except (TypeError, ValueError):
                 return default
 
+        try:
+            _zl_bar_h = parse_bar_size_to_hours(self.bar_size)
+            zone_lookback_hours_effective = round(float(self.zone_lookback) * _zl_bar_h, 6)
+        except ValueError:
+            zone_lookback_hours_effective = 0.0
+
+        md0_zone_h: Dict[str, Any] = {
+            "zone_lookback_hours_effective": float(zone_lookback_hours_effective),
+        }
+        if self.zone_lookback_hours_requested is not None:
+            md0_zone_h["zone_lookback_hours_requested"] = float(self.zone_lookback_hours_requested)
+
         metadatas = [{
             "strategy": self.STRATEGY_SLUG,
             "symbol": symbol,
@@ -1537,6 +1645,7 @@ class GroqRecommendationsStrategy(StrategyBase):
             "short_realtime_require_minus_di_gt_plus_di": int(self.short_realtime_require_minus_di_gt_plus_di),
             "short_realtime_max_macd_histogram": self.short_realtime_max_macd_histogram,
             "min_hold_hours": float(min_hold_hours),  # NEW: key param for exit tuning
+            **md0_zone_h,
         }]
 
         def _sanitize_chroma_meta(d: Dict[str, Any]) -> Dict[str, Any]:

@@ -204,12 +204,15 @@ def build_main_argv(
     client_id: int,
     debug: bool,
     zone_lookback: int = 4,
+    zone_lookback_hours: Optional[float] = None,
     adx_min: float = 15.0,
     zone_freshness_hours: float = 12.0,
     volume_breakout_mult: float = 1.1,
     volume_confirm_mult: float = 1.05,
     position_size_cap: float = 0.95,
     historical_data_dir: Optional[str] = None,
+    bt_start_day: Optional[str] = None,
+    bt_end_day: Optional[str] = None,
 ) -> List[str]:
     exe = sys.executable
     main_py = src_dir / "main.py"
@@ -236,8 +239,13 @@ def build_main_argv(
         str(initial_capital),
         "--client-id",
         str(client_id),
-        "--zone-lookback",
-        str(zone_lookback),
+    ]
+    if zone_lookback_hours is not None:
+        cmd.extend(["--zone-lookback-hours", str(zone_lookback_hours)])
+    else:
+        cmd.extend(["--zone-lookback", str(zone_lookback)])
+    cmd.extend(
+        [
         "--adx-min",
         str(adx_min),
         "--zone-freshness-hours",
@@ -248,7 +256,10 @@ def build_main_argv(
         str(volume_confirm_mult),
         "--position-size-cap",
         str(position_size_cap),
-    ]
+        ]
+    )
+    if bt_start_day and bt_end_day:
+        cmd.extend(["--bt-start-day", str(bt_start_day), "--bt-end-day", str(bt_end_day)])
     if force_refresh:
         cmd.append("--force-refresh")
     if debug:
@@ -376,12 +387,15 @@ def run_single_backtest(
     chroma_path: Path,
     continue_on_error: bool,
     zone_lookback: int = 4,
+    zone_lookback_hours: Optional[float] = None,
     adx_min: float = 15.0,
     zone_freshness_hours: float = 12.0,
     volume_breakout_mult: float = 1.1,
     volume_confirm_mult: float = 1.05,
     position_size_cap: float = 0.95,
     historical_data_dir: Optional[str] = None,
+    bt_start_day: Optional[str] = None,
+    bt_end_day: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one main.py backtest, read Chroma, return a result dict."""
     cmd = build_main_argv(
@@ -389,12 +403,15 @@ def run_single_backtest(
         risk, max_duration, stop_loss, target, initial_capital,
         force_refresh, client_id, debug,
         zone_lookback=zone_lookback,
+        zone_lookback_hours=zone_lookback_hours,
         adx_min=adx_min,
         zone_freshness_hours=zone_freshness_hours,
         volume_breakout_mult=volume_breakout_mult,
         volume_confirm_mult=volume_confirm_mult,
         position_size_cap=position_size_cap,
         historical_data_dir=historical_data_dir,
+        bt_start_day=bt_start_day,
+        bt_end_day=bt_end_day,
     )
     label = f"{symbol} SL={stop_loss} T={target} maxDur={max_duration}"
     print(f"\n=== {label} ===", flush=True)
@@ -447,6 +464,13 @@ def main() -> None:
     p.add_argument("--client-id", type=int, default=1)
     p.add_argument("--debug", action="store_true")
     p.add_argument("--zone-lookback", type=int, default=4)
+    p.add_argument(
+        "--zone-lookback-hours",
+        type=float,
+        default=None,
+        metavar="H",
+        help="If set, pass --zone-lookback-hours to main (groq clock-normalized LB); excludes --zone-lookback.",
+    )
     p.add_argument("--adx-min", type=float, default=15.0)
     p.add_argument("--zone-freshness-hours", type=float, default=12.0)
     p.add_argument("--volume-breakout-mult", type=float, default=1.1)
@@ -537,6 +561,7 @@ def main() -> None:
                 args.force_refresh, args.client_id, args.debug,
                 chroma_path, args.continue_on_error,
                 zone_lookback=zlb,
+                zone_lookback_hours=args.zone_lookback_hours,
                 adx_min=adxm,
                 zone_freshness_hours=zfh,
                 volume_breakout_mult=vb,
@@ -561,6 +586,7 @@ def main() -> None:
                 args.initial_capital, args.force_refresh, args.client_id, args.debug,
                 chroma_path, args.continue_on_error,
                 zone_lookback=args.zone_lookback,
+                zone_lookback_hours=args.zone_lookback_hours,
                 adx_min=args.adx_min,
                 zone_freshness_hours=args.zone_freshness_hours,
                 volume_breakout_mult=args.volume_breakout_mult,
