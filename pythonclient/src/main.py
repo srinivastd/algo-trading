@@ -19,6 +19,8 @@ from ibkr.historical_data import HistoricalDataManager
 from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy
 from strategies.adx_rsi_macd_pullback_strategy import AdxRsiMacdTrendPullbackStrategy
 
+from bar_size_hours import parse_bar_size_to_hours, zone_lookback_bars_from_clock_hours
+
 from strategies.base import (
     normalize_strategy_exit_signal,
     suppress_strategy_exit_if_scratch_win_zone,
@@ -42,6 +44,27 @@ logger = setup_daily_logging(
     console=True,
     backup_count=30,
 )
+
+
+def _slice_df_by_et_calendar_days(df: pd.DataFrame, start_day: str, end_day: str) -> pd.DataFrame:
+    """
+    Restrict bar rows to ET calendar dates [start_day .. end_day] inclusive.
+    Applies after `--duration` fetch + indicator calc (warmup leaks see walk-forward docs).
+    """
+    eastern = pytz.timezone("US/Eastern")
+    lo = pd.Timestamp(str(start_day)[:10]).tz_localize(eastern)
+    hi_excl = pd.Timestamp(str(end_day)[:10]).tz_localize(eastern) + timedelta(days=1)
+
+    idx = df.index
+    if idx.tz is None:
+        idx = idx.tz_localize(eastern)
+    else:
+        idx = idx.tz_convert(eastern)
+
+    out = df.copy()
+    out.index = idx
+    mask = (out.index >= lo) & (out.index < hi_excl)
+    return out.loc[mask]
 
 # Market data logger with dedicated JSON handler (one JSON object per line, daily rotation)
 # This fixes Bug 3: previously had propagate=False with no handler
@@ -173,6 +196,214 @@ async def _preflight_watchlist_no_net_short(
         detail,
     )
     raise SystemExit(1)
+
+
+def _profit_lock_clip_candidates(remaining_abs: int) -> list[int]:
+    """
+    Decreasing unique clip sizes when IB rejects / margin-limits large ``MKT`` exits (e.g. Error 201).
+
+    Starts at full remainder, tries fractional cuts, then common round lots down to **1** share.
+    """
+    rem = max(1, int(remaining_abs))
+    raw: list[int] = []
+    for f in (
+        float(rem),
+        rem / 2.0,
+        (rem * 3.0) / 10.0,
+        rem / 4.0,
+        rem / 10.0,
+    ):
+        raw.append(max(1, min(rem, int(math.floor(f)))))
+    for c in (100, 75, 50, 40, 35, 30, 25, 20, 15, 10, 7, 5, 4, 3, 2, 1):
+        raw.append(max(1, min(rem, int(c))))
+    seen: set[int] = set()
+    out: list[int] = []
+    for cq in raw:
+        if cq in seen:
+            continue
+        seen.add(cq)
+        out.append(cq)
+    out.sort(reverse=True)
+    return out
+
+
+async def _flatten_one_stk_symbol_profit_lock_slices(connection: IBKRConnection, symbol: str) -> tuple[int, list[str]]:
+    """
+    Repeatedly submits ``DAY`` MKT exits (profit-lock wait-for-fill mode) across a clip ladder until
+    the symbol reads flat, no clip succeeds, or position stops shrinking despite reported fills.
+
+    ``n_orders_filled``: count of discrete ``place_order`` calls that returned ``ok``.
+    """
+    sym_u = symbol.strip().upper()
+    errs: list[str] = []
+    n_orders_filled = 0
+    stagnant_after_fill = 0
+    max_outer = 160
+
+    for _outer in range(max_outer):
+        net_opt = await connection.net_stk_position_shares(sym_u)
+        if net_opt is None:
+            errs.append(f"{sym_u}:could_not_read_net_position")
+            return n_orders_filled, errs
+        net = float(net_opt)
+        if abs(net) < 0.09:
+            return n_orders_filled, errs
+
+        action = "SELL" if net > 0 else "BUY"
+        abs_before = max(1, abs(int(round(net))))
+
+        attempts = _profit_lock_clip_candidates(abs_before)
+        last_fail = ""
+
+        got_fill_this_round = False
+        qty_filled_last = -1
+
+        for clip_cap in attempts:
+            qty = max(1, min(abs_before, clip_cap))
+            logger.info(
+                "Flatten-all (profit lock / clip ladder): %s MKT DAY %s %s sh (~net=%.6g ladder_cap=%s)",
+                action,
+                qty,
+                sym_u,
+                net,
+                clip_cap,
+            )
+            res = await connection.place_order(
+                sym_u, action, qty, "MKT", profit_lock_flatten=True
+            )
+            last_fail = getattr(res, "message", "") or getattr(res, "code", "?")
+
+            if res.ok:
+                n_orders_filled += 1
+                got_fill_this_round = True
+                qty_filled_last = qty
+                logger.info(
+                    "Profit-lock clip FILLED symbol=%s action=%s qty=%s ib_code=%s",
+                    sym_u,
+                    action,
+                    qty,
+                    getattr(res, "code", "?"),
+                )
+                await asyncio.sleep(0.65)
+                position_dropped = False
+                for _poll in range(26):
+                    await asyncio.sleep(0.35)
+                    fresh = await connection.net_stk_position_shares(sym_u)
+                    if fresh is None:
+                        continue
+                    na = abs(float(fresh))
+                    if na < 0.09:
+                        position_dropped = True
+                        break
+                    if na + 0.51 <= float(abs_before):
+                        position_dropped = True
+                        break
+                if position_dropped:
+                    stagnant_after_fill = 0
+                else:
+                    stagnant_after_fill += 1
+
+                aft = await connection.net_stk_position_shares(sym_u)
+                aft_abs = abs(float(aft)) if aft is not None else abs_before
+
+                logger.info(
+                    "Profit-lock clip settle %s abs_before≈%s abs_after_poll≈%.4f stagnant=%s qty=%s",
+                    sym_u,
+                    abs_before,
+                    aft_abs,
+                    stagnant_after_fill,
+                    qty,
+                )
+                break
+
+            logger.warning(
+                "Profit-lock clip failed %s qty=%s code=%s message=%s",
+                sym_u,
+                qty,
+                getattr(res, "code", "?"),
+                last_fail,
+            )
+
+        if not got_fill_this_round:
+            errs.append(f"{sym_u}:all_slices_failed_latest={last_fail}")
+            return n_orders_filled, errs
+
+        if stagnant_after_fill >= 5:
+            errs.append(
+                f"{sym_u}:no_position_reduction_after_fills_last_qty={qty_filled_last}:{last_fail}"
+            )
+            return n_orders_filled, errs
+
+    errs.append(f"{sym_u}:max_outer_iterations_{max_outer}")
+    return n_orders_filled, errs
+
+
+async def _flatten_all_stk_positions_market(connection: IBKRConnection) -> tuple[int, list[str]]:
+    """
+    Flatten non-zero US equity (STK) inventory with ``DAY`` MKT exits (profit-lock fill wait).
+
+    Cancels working orders on those symbols first (brackets/OCAs). For each symbol, walks a clip
+    ladder—full size down to single shares—to clear Error 201 / margin rejects until flat or stalled.
+    """
+    rows = await connection.get_current_positions()
+    symbols_ordered: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        st = row.get("secType") or "STK"
+        if st not in ("STK", ""):
+            continue
+        pos = float(row.get("position") or 0.0)
+        if abs(pos) < 1e-6:
+            continue
+        sym_u = str(row.get("symbol") or "").upper()
+        if not sym_u or sym_u in seen:
+            continue
+        seen.add(sym_u)
+        symbols_ordered.append(sym_u)
+
+    if symbols_ordered:
+        n_canceled = await connection.cancel_open_orders_for_equity_symbols(symbols_ordered)
+        if n_canceled:
+            logger.info(
+                "Profit-lock flatten prep: canceled %s working equity order leg(s) for symbol(s): %s",
+                n_canceled,
+                sorted(symbols_ordered),
+            )
+        await asyncio.sleep(1.5)
+        rows = await connection.get_current_positions()
+
+    work_rows: list[dict] = []
+    for row in rows:
+        st = row.get("secType") or "STK"
+        if st not in ("STK", ""):
+            continue
+        pos = float(row.get("position") or 0.0)
+        if abs(pos) < 1e-6:
+            continue
+        sym_u = str(row.get("symbol") or "").upper()
+        if not sym_u:
+            continue
+        work_rows.append(row)
+
+    work_rows.sort(key=lambda r: abs(float(r.get("position") or 0.0)), reverse=True)
+
+    errs: list[str] = []
+    n_ok = 0
+    for row in work_rows:
+        sym_u = str(row.get("symbol") or "").upper()
+        pos = float(row.get("position") or 0.0)
+        logger.info(
+            "Flatten-all (profit lock / per-symbol ladder): IB position=%s sh %s → slice flatten",
+            pos,
+            sym_u,
+        )
+        n_sym, sym_err = await _flatten_one_stk_symbol_profit_lock_slices(connection, sym_u)
+        n_ok += n_sym
+        for e in sym_err:
+            logger.error("%s", e)
+        errs.extend(sym_err)
+
+    return n_ok, errs
 
 
 def _safe_float(v):
@@ -385,6 +616,7 @@ async def watch_mode(
     paper_margin_gates_interval_sec: int = 0,
     allow_shorts: bool = False,
     daily_loss_stop_pct: float = 0.02,
+    daily_unrealized_profit_lock_pct: float = 0.0,
     strategy_exit_signals: bool = True,
     strategy_exit_min_unrealized_pct: float = 0.0,
 ):
@@ -400,6 +632,12 @@ async def watch_mode(
             "Strategy exits: suppressing signals while unrealized P&L %% is between 0 and %.2f%% "
             "(losers still exit; use bracket target for larger wins).",
             strategy_exit_min_unrealized_pct,
+        )
+    if daily_unrealized_profit_lock_pct > 0:
+        logger.info(
+            "Daily unrealized profit lock: when IB unrealized / net liquidation >= %.2f%% with unrealized > 0, "
+            "flatten all STK once (new entries continue after flatten).",
+            float(daily_unrealized_profit_lock_pct) * 100.0,
         )
 
     allow_outside_rth = getattr(connection, "_allow_equity_orders_when_market_closed", False)
@@ -620,6 +858,8 @@ async def watch_mode(
     daily_day = None
     day_start_net_liq: float | None = None
     entries_halted_for_day = False
+    entries_halt_reason: str | None = None
+    profit_lock_engaged_for_day = False
     last_halt_log_day = None
 
     # Start watching loop
@@ -643,6 +883,8 @@ async def watch_mode(
                 daily_day = current_time.date()
                 day_start_net_liq = None
                 entries_halted_for_day = False
+                entries_halt_reason = None
+                profit_lock_engaged_for_day = False
                 last_halt_log_day = None
 
             # Evaluate kill-switch against net liquidation drawdown.
@@ -667,6 +909,9 @@ async def watch_mode(
                     dd = (float(net_liq) - float(day_start_net_liq)) / float(day_start_net_liq)
                     if (not entries_halted_for_day) and dd <= -abs(float(daily_loss_stop_pct)):
                         entries_halted_for_day = True
+                        entries_halt_reason = (
+                            f"daily_loss_stop drawdown_limit={abs(float(daily_loss_stop_pct)) * 100.0:.2f}%"
+                        )
                         logger.error(
                             "DAILY_KILL_SWITCH TRIPPED day=%s start_net_liq=%.2f net_liq=%.2f drawdown=%.2f%% (limit=%.2f%%). "
                             "Halting NEW entries for the rest of the day; exits still allowed.",
@@ -676,6 +921,36 @@ async def watch_mode(
                             dd * 100.0,
                             abs(float(daily_loss_stop_pct)) * 100.0,
                         )
+
+            # Optional: IB unrealized / net liquidation profit lock — flatten STK once per ET day (entries continue).
+            if (
+                float(daily_unrealized_profit_lock_pct) > 0
+                and net_liq is not None
+                and float(net_liq) > 0
+                and not profit_lock_engaged_for_day
+            ):
+                try:
+                    pnl_ib = await connection.get_account_pnl_ib_snapshot()
+                    unreal = _safe_float(pnl_ib.get("unrealized_pnl"))
+                    if unreal is not None and unreal > 0:
+                        upnl_ratio = float(unreal) / float(net_liq)
+                        if upnl_ratio >= float(daily_unrealized_profit_lock_pct):
+                            profit_lock_engaged_for_day = True
+                            n_flat, flat_errs = await _flatten_all_stk_positions_market(connection)
+                            logger.critical(
+                                "UNREALIZED_PROFIT_LOCK day=%s unrealized=%.2f net_liq=%.2f ratio=%.2f%% "
+                                "flatten_attempts_ok=%s errors=%s — new entries remain enabled.",
+                                daily_day,
+                                float(unreal),
+                                float(net_liq),
+                                upnl_ratio * 100.0,
+                                n_flat,
+                                flat_errs or "none",
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as pl_err:
+                    logger.warning("Unrealized profit lock check failed: %s", pl_err)
 
             # STEP 1: Check existing positions for exit signals
             try:
@@ -723,6 +998,42 @@ async def watch_mode(
                                 exit_signal, exit_reason_tag = normalize_strategy_exit_signal(raw_exit)
                             else:
                                 exit_signal = 0
+
+                            # Enforce min_hold_hours on programmatic exits for parity with backtest.
+                            # Bracket SL/TGT child orders at the broker are unaffected; this only
+                            # suppresses early strategy_exit churn (journal showed ~61% scratch exits
+                            # at <0.3h holds eroding the edge).
+                            #
+                            # Exemption: the MACD-flip reversal exits ("overbought_macd_flip" for
+                            # longs, "oversold_macd_flip" for shorts) are historically the most
+                            # profitable exits — they only fire after price has already run in our
+                            # favor, so they are take-profit signals, not noise. Never delay them
+                            # with the hold gate (a 1.89h AAPL run showed the gate suppressing a
+                            # winning overbought_macd_flip exit).
+                            if strategy_exit_signals and exit_signal != 0:
+                                reason_l = (exit_reason_tag or "").lower()
+                                hold_exempt = (
+                                    "overbought_macd_flip" in reason_l
+                                    or "oversold_macd_flip" in reason_l
+                                )
+                                min_hold_h = float(getattr(strategy, "min_hold_hours", 0.0) or 0.0)
+                                if min_hold_h > 0 and not hold_exempt:
+                                    entry_time_at = active_trades.get(pos_symbol, {}).get("entry_time")
+                                    held_h = None
+                                    if entry_time_at is not None:
+                                        try:
+                                            held_h = (current_time - entry_time_at).total_seconds() / 3600.0
+                                        except (TypeError, ValueError):
+                                            held_h = None
+                                    if held_h is not None and held_h < min_hold_h:
+                                        logger.info(
+                                            "STRATEGY_EXIT_SUPPRESSED %s held=%.2fh < min_hold_hours=%.2f reason_would_be=%s",
+                                            pos_symbol,
+                                            held_h,
+                                            min_hold_h,
+                                            exit_reason_tag or "strategy_signal",
+                                        )
+                                        exit_signal = 0
 
                             if strategy_exit_signals and exit_signal != 0:
                                 mark = float(df["close"].iloc[-1])
@@ -996,9 +1307,9 @@ async def watch_mode(
             if entries_halted_for_day:
                 if last_halt_log_day != daily_day:
                     logger.warning(
-                        "NEW_ENTRIES_HALTED day=%s reason=DAILY_KILL_SWITCH (loss > %.2f%%)",
+                        "NEW_ENTRIES_HALTED day=%s reason=%s",
                         daily_day,
-                        abs(float(daily_loss_stop_pct)) * 100.0,
+                        entries_halt_reason or "unknown",
                     )
                     last_halt_log_day = daily_day
                 await asyncio.sleep(check_interval)
@@ -1458,6 +1769,15 @@ def parse_args():
         help="Daily kill-switch: if net liquidation drawdown exceeds this fraction (e.g. 0.02=2%%), halt NEW entries for the rest of the ET day. Exits still allowed. Default 0.02.",
     )
     parser.add_argument(
+        "--daily-unrealized-profit-lock-pct",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Watch mode: if IB unrealized P&L divided by net liquidation is >= this fraction (e.g. 0.07=7%%) "
+        "with unrealized > 0, flatten all US equity (STK) via clip ladder once per ET day (entries continue). "
+        "With --paper --watch, defaults to 0.07 when omitted; use 0 to disable. Otherwise defaults to 0 (off).",
+    )
+    parser.add_argument(
         "--allow-closed-market",
         action="store_true",
         help="Paper only: run watch loop and equity orders outside US RTH (extended-hours diagnostics)",
@@ -1503,7 +1823,28 @@ def parse_args():
     parser.add_argument("--vwap-threshold", type=float, default=0.5, help="VWAP threshold for entry")
     parser.add_argument("--phase2-rules", action="store_true", help="Use Phase 2 trading rules")
     parser.add_argument("--zone-lookback", type=int, default=7, help="Bars to look back for supply/demand zones (tuned)")
-    parser.add_argument("--adx-min", type=float, default=28.5, help="Minimum ADX for zone validity (tuned for 15m)")
+    parser.add_argument(
+        "--zone-lookback-hours",
+        type=float,
+        default=None,
+        metavar="H",
+        help="Groq only: derive zone lookback **bar count** from clock hours matching --bar-size "
+        "(rounded). When set, overrides --zone-lookback. Example: 28 with 15m≈112 bars (≈same depth as lb=7 on 4h).",
+    )
+    parser.add_argument(
+        "--bt-start-day",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Inclusive ET calendar first day for backtest window (requires --bt-end-day); "
+        "slice runs after indicators are computed on the full fetched range.",
+    )
+    parser.add_argument(
+        "--bt-end-day",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Inclusive ET calendar last day for backtest window.",
+    )
+    parser.add_argument("--adx-min", type=float, default=32.0, help="Minimum ADX for zone validity (tuned for 15m; raised 28.5->32 — journal showed ADX>=33 entries avg +$25/trade vs lower ADX)")
     parser.add_argument(
         "--long-min-rsi",
         type=float,
@@ -1519,6 +1860,22 @@ def parse_args():
     parser.add_argument("--adx-threshold", type=float, default=35.0, help="ADX threshold for trend strength (adx_rsi_macd)")
     parser.add_argument("--rsi-entry-cross", type=float, default=45.0, help="RSI cross level for entry (adx_rsi_macd)")
     parser.add_argument("--min-hold-hours", type=float, default=2.0, help="Minimum hold time before strategy exits")
+    parser.add_argument(
+        "--min-entry-confidence",
+        type=float,
+        default=None,
+        metavar="C",
+        help="Groq only: require computed entry confidence >= C before taking a trade "
+        "(e.g. 0.80 filters out scores below the 0.80–0.89 bucket floor). Omit to disable.",
+    )
+    parser.add_argument(
+        "--max-entry-zone-age-hours",
+        type=float,
+        default=None,
+        metavar="H",
+        help="Groq realtime only: require zone age < H hours at signal time. "
+        "With --paper (and without --backtest-only), defaults to 3 when omitted; use 0 to disable.",
+    )
     parser.add_argument("--no-journal", action="store_true", help="Disable SQLite trade journaling in watch mode")
     parser.add_argument("--journal-db", default=str(_PYTHONCLIENT_ROOT / "trade_journal.db"), help="Path to SQLite journal db")
     parser.add_argument("--journal-snapshot-interval", type=int, default=60, help="Seconds between account/position snapshots in journal")
@@ -1528,13 +1885,36 @@ def parse_args():
 
 async def main():
     args = parse_args()
-    
+
+    bt_lo = getattr(args, "bt_start_day", None)
+    bt_hi = getattr(args, "bt_end_day", None)
+    if bool(bt_lo) ^ bool(bt_hi):
+        raise SystemExit("Use --bt-start-day and --bt-end-day together, or omit both.")
+
     # Configure logging
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
+
+    zone_lookback_effective = int(args.zone_lookback)
+    if getattr(args, "zone_lookback_hours", None) is not None:
+        if args.strategy != "groq":
+            logger.warning("--zone-lookback-hours applies to groq strategy only; ignoring.")
+        else:
+            zlh_req = float(args.zone_lookback_hours)
+            zone_lookback_effective = zone_lookback_bars_from_clock_hours(zlh_req, args.bar_size)
+            eff_h = zone_lookback_effective * parse_bar_size_to_hours(args.bar_size)
+            logger.info(
+                "Groq zone lookback from clock: requested=%.6fh bar_size=%r → %d bars "
+                "(~%.6fh calendar on bar spacing); ignoring --zone-lookback=%d",
+                zlh_req,
+                args.bar_size,
+                zone_lookback_effective,
+                eff_h,
+                args.zone_lookback,
+            )
     
     # Initialize strategy with mode-specific parameters
     strategy_params = {
@@ -1547,7 +1927,7 @@ async def main():
         "duration": args.duration,
     }
     groq_extra = {
-        "zone_lookback": args.zone_lookback,
+        "zone_lookback": zone_lookback_effective if args.strategy == "groq" else args.zone_lookback,
         "adx_min": args.adx_min,
         "long_min_rsi": args.long_min_rsi,
         "zone_freshness_hours": args.zone_freshness_hours,
@@ -1556,15 +1936,47 @@ async def main():
         "position_size_cap": args.position_size_cap,
         "min_hold_hours": getattr(args, "min_hold_hours", 2.0),
         "short_realtime_filters_enabled": False,  # long-only for 15m consistency
+        "min_entry_confidence": getattr(args, "min_entry_confidence", None),
+        "max_entry_zone_age_hours": getattr(args, "max_entry_zone_age_hours", None),
     }
-    
+    if args.strategy == "groq" and getattr(args, "zone_lookback_hours", None) is not None:
+        groq_extra["zone_lookback_hours_requested"] = float(args.zone_lookback_hours)
+
+    if args.strategy == "groq" and args.paper and not args.backtest_only:
+        if groq_extra.get("min_entry_confidence") is None:
+            groq_extra["min_entry_confidence"] = 0.8
+            logger.info(
+                "Paper execution default: min_entry_confidence=0.80 "
+                "(override with --min-entry-confidence)"
+            )
+        mza = groq_extra.get("max_entry_zone_age_hours")
+        if mza is None:
+            groq_extra["max_entry_zone_age_hours"] = 3.0
+            logger.info(
+                "Paper execution default: max_entry_zone_age_hours=3.0 "
+                "(realtime entries require zone age < 3 h; override with --max-entry-zone-age-hours; 0 disables)"
+            )
+        elif mza == 0:
+            groq_extra["max_entry_zone_age_hours"] = None
+
+    if args.daily_unrealized_profit_lock_pct is None:
+        if args.paper and args.watch and not args.backtest_only:
+            args.daily_unrealized_profit_lock_pct = 0.07
+            logger.info(
+                "Paper watch default: daily_unrealized_profit_lock_pct=7.00%% "
+                "(checked each watch cycle; flatten STK via clip ladder when IB unrealized/net_liq >= threshold; "
+                "override with --daily-unrealized-profit-lock-pct; use 0 to disable)"
+            )
+        else:
+            args.daily_unrealized_profit_lock_pct = 0.0
+
     if args.strategy == "groq":
         strategy = GroqRecommendationsStrategy(**strategy_params, **groq_extra)
         logger.info(
             f"Strategy initialized with: risk=${strategy.risk_per_trade}, SL={strategy.stop_loss_pct}%, "
             f"TGT={strategy.target_pct}%, bar_size={strategy.bar_size}, duration={strategy.duration}, "
             f"adx_min={strategy.adx_min}, long_min_rsi={getattr(strategy, 'long_min_rsi', 18.0)}, "
-            f"zone_lookback={getattr(strategy, 'zone_lookback', 7)} (15m tuned params)"
+            f"zone_lookback={getattr(strategy, 'zone_lookback', 7)} bars"
         )
     elif args.strategy == "adx_rsi_macd":
         # Support higher risk and extended hours for the new strategy
@@ -1612,6 +2024,7 @@ async def main():
         client_id=client_id,
         allow_equity_orders_when_market_closed=allow_closed_market,
         lax_paper=lax_paper,
+        block_accidental_shorts=not bool(args.enable_shorts),
     )
     if allow_closed_market:
         logger.warning(
@@ -1664,6 +2077,10 @@ async def main():
         
         if args.watch:
             # Real-time watching mode for multiple stocks
+            if bt_lo or bt_hi:
+                logger.warning(
+                    "--bt-start-day / --bt-end-day apply only to backtest/paper backtest slices; ignoring for --watch."
+                )
             logger.info(f"Starting real-time watch for {args.symbols} with check interval {args.check_interval} seconds")
             if args.strategy not in ['groq', 'mean_reversion']:
                 logger.error(f"Real-time watching only supported for groq and mean_reversion strategies, not: {args.strategy}")
@@ -1693,6 +2110,10 @@ async def main():
                             **strategy_params,
                             **groq_extra,
                                     "check_interval": args.check_interval,
+                                    "daily_loss_stop_pct": float(args.daily_loss_stop_pct),
+                                    "daily_unrealized_profit_lock_pct": float(
+                                        args.daily_unrealized_profit_lock_pct
+                                    ),
                                     "strategy_exit_signals": bool(args.strategy_exit_signals),
                                     "strategy_exit_min_unrealized_pct": float(
                                         args.strategy_exit_min_unrealized_pct
@@ -1718,6 +2139,7 @@ async def main():
                     ),
                     allow_shorts=bool(args.enable_shorts),
                     daily_loss_stop_pct=float(args.daily_loss_stop_pct),
+                    daily_unrealized_profit_lock_pct=float(args.daily_unrealized_profit_lock_pct),
                     strategy_exit_signals=bool(args.strategy_exit_signals),
                     strategy_exit_min_unrealized_pct=float(
                         args.strategy_exit_min_unrealized_pct
@@ -1778,6 +2200,23 @@ async def main():
                     continue
                 logger.info(f"Calculating technical indicators for {symbol}...")
                 df = strategy.calculate_indicators(df)
+
+                if bt_lo and bt_hi:
+                    n0 = len(df)
+                    df = _slice_df_by_et_calendar_days(df, str(bt_lo), str(bt_hi))
+                    logger.info(
+                        "Backtest calendar slice %s .. %s (ET, inclusive): %d → %d bars",
+                        bt_lo,
+                        bt_hi,
+                        n0,
+                        len(df),
+                    )
+                    if df.empty or len(df) < 10:
+                        logger.error(
+                            "Slice produced too few bars for %s — widen --duration or adjust --bt-*-day.",
+                            symbol,
+                        )
+                        continue
                 
                 if args.backtest_only:
                     logger.info(f"Running backtest in simulation mode for {symbol} (no trades will be executed)...")
@@ -1901,6 +2340,10 @@ async def main():
                                     **strategy_params,
                                     **groq_extra,
                                     "check_interval": args.check_interval,
+                                    "daily_loss_stop_pct": float(args.daily_loss_stop_pct),
+                                    "daily_unrealized_profit_lock_pct": float(
+                                        args.daily_unrealized_profit_lock_pct
+                                    ),
                                     "strategy_exit_signals": bool(args.strategy_exit_signals),
                                     "strategy_exit_min_unrealized_pct": float(
                                         args.strategy_exit_min_unrealized_pct
@@ -1923,6 +2366,9 @@ async def main():
                             snapshot_interval_sec=args.journal_snapshot_interval,
                             allow_shorts=bool(args.enable_shorts),
                             daily_loss_stop_pct=float(args.daily_loss_stop_pct),
+                            daily_unrealized_profit_lock_pct=float(
+                                args.daily_unrealized_profit_lock_pct
+                            ),
                             strategy_exit_signals=bool(args.strategy_exit_signals),
                             strategy_exit_min_unrealized_pct=float(
                                 args.strategy_exit_min_unrealized_pct

@@ -264,6 +264,7 @@ class IBKRConnection:
         client_id: int = 0,
         allow_equity_orders_when_market_closed: bool = False,
         lax_paper: bool = False,
+        block_accidental_shorts: bool = True,
     ):
         """
         Initialize IBKR connection with host, port, and client ID.
@@ -274,6 +275,10 @@ class IBKRConnection:
             client_id: Client ID for this connection (default: 0)
             allow_equity_orders_when_market_closed: If True, skip the local US-hours gate
                 for stocks and set ``outsideRth`` on equity orders (for paper diagnostics).
+            block_accidental_shorts: If True (default), a standalone equity SELL is clamped to
+                the current long position and skipped when already flat, so exits/flatten/
+                profit-lock orders can never flip a long into a net short. Set False only when
+                deliberate short entries are enabled.
         """
         self.ib = IB()
         self.host = host
@@ -281,6 +286,7 @@ class IBKRConnection:
         self.client_id = client_id
         self._allow_equity_orders_when_market_closed = allow_equity_orders_when_market_closed
         self._lax_paper = bool(lax_paper)
+        self._block_accidental_shorts = bool(block_accidental_shorts)
         self._connected = False
         self.client = self.ib  # For compatibility with main.py
 
@@ -963,8 +969,14 @@ class IBKRConnection:
 
     async def place_order(self, symbol: str, action: str, quantity: int, order_type: str,
                          limit_price: float = None, aux_price: float = None,
-                         parent_id: int = None) -> PlaceOrderResult:
-        """Place a trade order. Inspect ``result.as_dict()`` for IB log lines and error codes."""
+                         parent_id: int = None,
+                         *,
+                         profit_lock_flatten: bool = False) -> PlaceOrderResult:
+        """Place a trade order. Inspect ``result.as_dict()`` for IB log lines and error codes.
+
+        When ``profit_lock_flatten`` is True for an equity ``MKT`` order: ``tif=DAY``, no early
+        return on ``Submitted``—wait until ``Filled`` or failure/timeout (profit-lock helpers only).
+        """
         try:
             qty_requested = max(0, int(quantity))
             if not self.is_connected():
@@ -1133,6 +1145,51 @@ class IBKRConnection:
 
             qty = qty_requested
             sizing_meta: Optional[Dict[str, Any]] = None
+            # Short guardrail: a standalone equity SELL must never exceed the live long
+            # position (overselling would open/extend a short). Bracket exit legs
+            # (``parent_id`` set) are sized to their entry and are left alone. Disabled
+            # only when deliberate short entries are enabled (``block_accidental_shorts``).
+            if (
+                self._block_accidental_shorts
+                and not is_crypto
+                and parent_id is None
+                and action.upper() == "SELL"
+                and qty > 0
+            ):
+                net_shares = await self._net_stk_position_shares(symbol)
+                long_qty = int(max(0.0, net_shares)) if net_shares is not None else 0
+                if long_qty <= 0:
+                    res = PlaceOrderResult(
+                        ok=False,
+                        code="SHORT_BLOCKED",
+                        message=(
+                            f"SELL blocked for {symbol}: no long position to reduce "
+                            f"(net={net_shares}); shorts disabled"
+                        ),
+                        quantity_requested=qty_requested,
+                        quantity_submitted=0,
+                    )
+                    logger.warning(
+                        "SHORT_GUARD_BLOCKED symbol=%s requested=%s net=%s",
+                        symbol.upper(),
+                        qty_requested,
+                        net_shares,
+                    )
+                    return res
+                if qty > long_qty:
+                    logger.warning(
+                        "SHORT_GUARD_CLAMP symbol=%s requested=%s clamped=%s net_long=%s",
+                        symbol.upper(),
+                        qty,
+                        long_qty,
+                        long_qty,
+                    )
+                    sizing_meta = {
+                        "requested": qty_requested,
+                        "short_guard_clamped_to": long_qty,
+                        "net_long": long_qty,
+                    }
+                    qty = long_qty
             # Size only standalone equity orders; bracket legs must match parent quantity.
             # Skip BP-based clamp for SELL that only closes/trims a long (exit liquidity).
             apply_bp_clip = not is_crypto and parent_id is None and qty > 0
@@ -1200,7 +1257,12 @@ class IBKRConnection:
                 parent_id if parent_id is not None else "-",
             )
 
-            tif = 'IOC' if is_crypto else 'GTC'
+            if is_crypto:
+                tif = 'IOC'
+            elif profit_lock_flatten and order_type.upper() == 'MKT':
+                tif = 'DAY'
+            else:
+                tif = 'GTC'
 
             if order_type == 'LMT':
                 order = LimitOrder(action, qty, limit_price, tif=tif, transmit=True)
@@ -1218,6 +1280,55 @@ class IBKRConnection:
                     order.outsideRth = True
 
             trade = self.get_ib().placeOrder(contract, order)
+            order_id_pf = trade.order.orderId if trade and hasattr(trade, "order") else None
+
+            if (
+                profit_lock_flatten
+                and not is_crypto
+                and order_type.upper() == "MKT"
+                and order_id_pf is not None
+            ):
+                await asyncio.sleep(0.75)
+                filled_ok, term_trade, diag = await self._await_profit_lock_market_terminal(
+                    int(order_id_pf), timeout_sec=180.0
+                )
+                if filled_ok and term_trade is not None:
+                    ost = getattr(term_trade.orderStatus, "status", "Filled") or "Filled"
+                    return PlaceOrderResult(
+                        order_id=int(order_id_pf),
+                        ok=True,
+                        code="FILLED",
+                        message=f"Profit-lock MKT exit filled ({diag})",
+                        ib_status=ost,
+                        quantity_requested=qty_requested,
+                        quantity_submitted=qty,
+                        sizing=sizing_meta,
+                    )
+                if term_trade is not None:
+                    res_pf = place_order_failure_from_trade(
+                        term_trade,
+                        "PROFIT_LOCK_FILL_FAILED",
+                        diag or "profit-lock MKT exit did not fill",
+                    )
+                    logger.error(
+                        "PLACE_ORDER_FAILED symbol=%s code=%s ib_status=%s ib_error_code=%s log_tail=%s",
+                        symbol.upper(),
+                        res_pf.code,
+                        res_pf.ib_status,
+                        res_pf.ib_error_code,
+                        res_pf.ib_log[-8:] if res_pf.ib_log else [],
+                    )
+                    return res_pf
+                return PlaceOrderResult(
+                    order_id=int(order_id_pf),
+                    ok=False,
+                    code="PROFIT_LOCK_TRADE_MISSING",
+                    message=diag or "profit-lock wait ended without usable trade snapshot",
+                    quantity_requested=qty_requested,
+                    quantity_submitted=qty,
+                    sizing=sizing_meta,
+                )
+
             await asyncio.sleep(3)
 
             if hasattr(trade, 'orderStatus') and trade.orderStatus:
@@ -1535,3 +1646,137 @@ class IBKRConnection:
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {str(e)}")
             return False
+
+    def _trade_by_order_id(self, order_id: int) -> Optional[Trade]:
+        for t in self.get_ib().trades():
+            if t.order.orderId == order_id:
+                return t
+        return None
+
+    async def _await_profit_lock_market_terminal(
+        self,
+        order_id: int,
+        *,
+        timeout_sec: float = 180.0,
+        poll_interval: float = 0.4,
+    ) -> tuple[bool, Optional[Trade], str]:
+        """
+        Equity profit-lock exits: wait for ``Filled``, or definitive failure states.
+        Treats partial fills as in-progress until ``Filled`` or timeout.
+        """
+        loop_tm = asyncio.get_running_loop().time
+        deadline = loop_tm() + timeout_sec
+        terminal_fail = frozenset(
+            {
+                "Cancelled",
+                "Inactive",
+                "ApiCancelled",
+                "Rejected",
+                "RiskPendingCancel",
+                "PendingExpire",
+                "Expired",
+            }
+        )
+        last_trade: Optional[Trade] = None
+        last_detail = ""
+
+        while loop_tm() < deadline:
+            tr = self._trade_by_order_id(order_id)
+            last_trade = tr
+            if tr is None or not getattr(tr, "orderStatus", None):
+                await asyncio.sleep(poll_interval)
+                continue
+
+            os = tr.orderStatus
+            st = (getattr(os, "status", None) or "").strip()
+
+            remaining = getattr(os, "remaining", None)
+            filled = getattr(os, "filled", None)
+            try:
+                if remaining is not None and filled is not None:
+                    last_detail = f"status={st} filled={float(filled):.6g} remaining={float(remaining):.6g}"
+                else:
+                    last_detail = f"status={st}"
+            except (TypeError, ValueError):
+                last_detail = f"status={st}"
+
+            if st == "Filled":
+                return True, tr, last_detail
+            if st in terminal_fail:
+                return False, tr, last_detail
+            if st in ("PendingCancel",):
+                await asyncio.sleep(poll_interval)
+                continue
+
+            await asyncio.sleep(poll_interval)
+
+        # Timeout snapshot
+        tr = self._trade_by_order_id(order_id)
+        msg = (
+            last_detail
+            if last_detail
+            else (f"{getattr(tr.orderStatus,'status','?')} after {timeout_sec:.0f}s" if tr else "?")
+        )
+        return False, tr or last_trade, msg or "FILL_WAIT_TIMEOUT"
+
+    async def cancel_open_orders_for_equity_symbols(self, symbols: List[str]) -> int:
+        """
+        Cancel all **open** trades whose contract is US equity stock (``STK`` / empty)
+        and whose symbol matches ``symbols``. Two passes give IB/TWS time to release OCA/brackets.
+
+        Used before profit-lock MKT exits so exits are not rejected as ``Inactive`` against
+        working target/stop legs.
+        """
+        if not symbols or not self.is_connected():
+            return 0
+        sym_u = {s.strip().upper() for s in symbols if str(s).strip()}
+        if not sym_u:
+            return 0
+
+        def _cancel_matching_pass() -> int:
+            ib = self.get_ib()
+            n = 0
+            for trade in ib.openTrades():
+                ct = getattr(trade, "contract", None)
+                if ct is None or not getattr(ct, "symbol", None):
+                    continue
+                st = getattr(ct, "secType", "STK") or "STK"
+                if st not in ("STK", ""):
+                    continue
+                if ct.symbol.upper() not in sym_u:
+                    continue
+                try:
+                    ib.cancelOrder(trade.order)
+                    logger.info(
+                        "PROFIT_LOCK_CANCEL_WORKING symbol=%s orderId=%s orderType=%s action=%s qty=%s",
+                        ct.symbol.upper(),
+                        getattr(trade.order, "orderId", "?"),
+                        getattr(trade.order, "orderType", "?"),
+                        getattr(trade.order, "action", "?"),
+                        getattr(trade.order, "totalQuantity", "?"),
+                    )
+                    n += 1
+                except Exception as cex:
+                    logger.warning(
+                        "PROFIT_LOCK_CANCEL_FAILED symbol=%s orderId=%s err=%s",
+                        ct.symbol.upper(),
+                        getattr(trade.order, "orderId", "?"),
+                        cex,
+                    )
+            return n
+
+        total = 0
+        for pass_i in range(2):
+            n = _cancel_matching_pass()
+            total += n
+            if pass_i == 0:
+                await asyncio.sleep(3.0)
+            else:
+                await asyncio.sleep(1.5)
+        if total:
+            logger.info(
+                "PROFIT_LOCK_CANCEL_DONE requested_symbols=%s total_cancel_requests=%d",
+                sorted(sym_u),
+                total,
+            )
+        return total
