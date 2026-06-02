@@ -30,18 +30,22 @@ logic as the zone validation tool; requires a matching bar CSV under ``historica
 from __future__ import annotations
 
 import argparse
+import asyncio
 import errno
 import html
 import json
 import re
 import sys
+import threading
 import time
 from collections import defaultdict
 import urllib.parse
 from collections.abc import Callable
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # pythonclient/ (parent of this file's directory)
 _PYTHONCLIENT_ROOT = Path(__file__).resolve().parent.parent
@@ -50,6 +54,8 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from trade_journal import TradeJournal  # noqa: E402
+
+ET = ZoneInfo("America/New_York")
 
 
 def _journal_api_log(msg: str) -> None:
@@ -72,6 +78,19 @@ def _fmt_qty_cell(v: float | None) -> str:
     if abs(x - round(x)) < 1e-6:
         return str(int(round(x)))
     return f"{x:,.2f}"
+
+
+def _today_et() -> str:
+    return datetime.now(ET).strftime("%Y-%m-%d")
+
+
+def _safe_float(v: object) -> float | None:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _json_pre_block(obj: object, max_chars: int = 1200) -> str:
@@ -212,6 +231,144 @@ def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str
     return "\n".join(parts)
 
 
+async def _fetch_live_ib_snapshot_async(args: argparse.Namespace) -> dict[str, Any]:
+    from ibkr.connection import IBKRConnection, _account_summary_tag_float
+
+    connection = IBKRConnection(
+        host=args.ib_host,
+        port=args.ib_port,
+        client_id=args.ib_client_id,
+    )
+    connected = False
+    try:
+        connected = await connection.connect(max_retries=1, retry_delay=0)
+        if not connected:
+            raise RuntimeError("IBKR connect failed")
+        ib = connection.get_ib()
+        accounts = ib.managedAccounts() or []
+        acct = accounts[0] if accounts else ""
+        account_summary = await ib.accountSummaryAsync(acct)
+        pnl = await connection.get_account_pnl_ib_snapshot()
+        account_values: list[Any] = []
+        portfolio_items: list[Any] = []
+        try:
+            ib.client.reqAccountUpdates(True, acct)
+            await asyncio.sleep(max(0.0, float(args.live_ib_account_wait)))
+            try:
+                account_values = list(ib.accountValues(acct))
+            except TypeError:
+                account_values = list(ib.accountValues())
+            try:
+                portfolio_items = list(ib.portfolio(acct))
+            except TypeError:
+                portfolio_items = list(ib.portfolio())
+        finally:
+            try:
+                ib.client.reqAccountUpdates(False, acct)
+            except Exception:
+                pass
+        positions = _portfolio_items_to_positions(portfolio_items)
+        if not positions:
+            positions = await connection.get_current_positions()
+        margin = await connection.get_account_margin_gate_snapshot()
+        net_liq = _safe_float(margin.get("net_liquidation"))
+        if net_liq is None:
+            net_liq = _account_summary_tag_float(account_summary, "NetLiquidation")
+        if net_liq is None:
+            net_liq = _safe_float(await connection.get_account_equity())
+        # The IBKR app's Account Window "Realized P&L" / "Unrealized P&L" aligns
+        # with account summary tags more reliably than reqPnL.realizedPnL after a
+        # fresh dashboard-only API connection.
+        values_realized = _account_summary_tag_float(account_values, "RealizedPnL")
+        summary_realized = _account_summary_tag_float(account_summary, "RealizedPnL")
+        values_unrealized = _account_summary_tag_float(account_values, "UnrealizedPnL")
+        summary_unrealized = _account_summary_tag_float(account_summary, "UnrealizedPnL")
+        portfolio_unrealized = None
+        pnl_values = [
+            _safe_float(getattr(item, "unrealizedPNL", None))
+            for item in portfolio_items
+            if _safe_float(getattr(item, "unrealizedPNL", None)) is not None
+        ]
+        if pnl_values:
+            portfolio_unrealized = sum(pnl_values)
+        realized_pnl = values_realized
+        if realized_pnl is None:
+            realized_pnl = summary_realized
+        if realized_pnl is None:
+            realized_pnl = _safe_float(pnl.get("realized_pnl"))
+        unrealized_pnl = values_unrealized
+        if unrealized_pnl is None:
+            unrealized_pnl = summary_unrealized
+        if unrealized_pnl is None:
+            unrealized_pnl = portfolio_unrealized
+        if unrealized_pnl is None:
+            unrealized_pnl = _safe_float(pnl.get("unrealized_pnl"))
+        now = datetime.now(ET)
+        return {
+            "snapshot_id": None,
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.isoformat(),
+            "net_liquidation": net_liq,
+            "unrealized_pnl": unrealized_pnl,
+            "realized_pnl_today": realized_pnl,
+            "ib_daily_pnl": _safe_float(pnl.get("daily_pnl")),
+            "positions": positions,
+            "snapshot_source": "live_ib",
+            "pnl_source": {
+                "realized_pnl_today": (
+                    "accountValues.RealizedPnL"
+                    if values_realized is not None
+                    else ("accountSummary.RealizedPnL" if summary_realized is not None else "reqPnL.realizedPnL")
+                ),
+                "unrealized_pnl": (
+                    "accountValues.UnrealizedPnL"
+                    if values_unrealized is not None
+                    else (
+                        "accountSummary.UnrealizedPnL"
+                        if summary_unrealized is not None
+                        else ("portfolio.unrealizedPNL" if portfolio_unrealized is not None else "reqPnL.unrealizedPnL")
+                    )
+                ),
+                "ib_daily_pnl": "reqPnL.dailyPnL",
+            },
+        }
+    finally:
+        if connected:
+            await connection.disconnect()
+
+
+def _fetch_live_ib_snapshot(args: argparse.Namespace) -> dict[str, Any]:
+    return asyncio.run(
+        asyncio.wait_for(
+            _fetch_live_ib_snapshot_async(args),
+            timeout=max(1.0, float(args.live_ib_timeout)),
+        )
+    )
+
+
+def _portfolio_items_to_positions(items: list[Any]) -> list[dict[str, Any]]:
+    positions: list[dict[str, Any]] = []
+    for item in items:
+        pos = _safe_float(getattr(item, "position", None))
+        if pos is None or abs(pos) < 0.001:
+            continue
+        contract = getattr(item, "contract", None)
+        symbol = getattr(contract, "symbol", "UNKNOWN").upper() if contract else "UNKNOWN"
+        positions.append(
+            {
+                "symbol": symbol,
+                "secType": getattr(contract, "secType", "STK") if contract else "STK",
+                "position": pos,
+                "avgCost": _safe_float(getattr(item, "averageCost", None)),
+                "unrealizedPNL": _safe_float(getattr(item, "unrealizedPNL", None)),
+                "realizedPNL": _safe_float(getattr(item, "realizedPNL", None)),
+                "marketValue": _safe_float(getattr(item, "marketValue", None)),
+                "marketPrice": _safe_float(getattr(item, "marketPrice", None)),
+            }
+        )
+    return positions
+
+
 def _html_shell(
     snap: dict | None,
     recent: list,
@@ -229,6 +386,22 @@ def _html_shell(
     ts = (snap or {}).get("time") or "—"
     sid = (snap or {}).get("snapshot_id")
     sid_s = f" (id={sid})" if sid is not None else ""
+    is_live = bool(snap and snap.get("snapshot_source") == "live_ib")
+    live_error = (snap or {}).get("live_ib_error")
+    snapshot_label = "Live IBKR as of" if is_live else "Latest stored snapshot"
+    source_note = (
+        '<p class="meta"><strong>Source:</strong> Live IBKR Gateway/API. '
+        "Cards and positions are pulled on page refresh; Realized/Unrealized prefer IB account-summary "
+        "Account Window tags, Daily total uses IB reqPnL. Journal tables below still come from SQLite.</p>"
+        if is_live
+        else '<p class="meta"><strong>Source:</strong> Stored <code>daily_snapshots</code> row. '
+        + (
+            f"Live IBKR fetch failed: <code>{html.escape(str(live_error))}</code>. "
+            if live_error
+            else ""
+        )
+        + "Start Gateway / use a free client id to refresh cards and positions live.</p>"
+    )
     r_lbl = "Realized today (IB)"
     d_lbl = "Daily total (IB)"
     if snap and snap.get("realized_pnl_today_src") == "journal":
@@ -247,9 +420,9 @@ def _html_shell(
 
     if selected_date:
         ib_vs_journal = (
-            '<p class="meta"><strong>IB vs this table</strong> — Top cards use the <strong>last</strong> '
-            f"<code>daily_snapshots</code> row for journal calendar date <strong>{selected_date}</strong> "
-            "(same <code>date</code> column as watch-mode snapshots). IB account-level <code>reqPnL</code> is "
+            '<p class="meta"><strong>IB vs this table</strong> — Top cards use '
+            + ("<strong>live IBKR</strong>" if is_live else "the <strong>last stored</strong> <code>daily_snapshots</code> row")
+            + f" for calendar date <strong>{selected_date}</strong>. IB account-level <code>reqPnL</code> is "
             "whole-account / all products. Σ realized and Closed counts use only <code>trades</code> rows "
             "marked <code>closed</code> with <code>exit_fill_time</code> on that day. "
             "They diverge if IB realized came from activity not journaled here, or if closes never updated "
@@ -257,8 +430,9 @@ def _html_shell(
         )
     else:
         ib_vs_journal = (
-            '<p class="meta"><strong>IB vs this table</strong> — The cards use the latest '
-            "<code>daily_snapshots</code> row: IB account-level <code>reqPnL</code> (whole account, all products). "
+            '<p class="meta"><strong>IB vs this table</strong> — The cards use '
+            + ("<strong>live IBKR</strong>" if is_live else "the latest <code>daily_snapshots</code> row")
+            + ": IB account-level <code>reqPnL</code> (whole account, all products). "
             "Σ realized and Closed counts use only <code>trades</code> rows your process marked "
             "<code>closed</code> with an <code>exit_fill_time</code> on the selected day. "
             "They diverge if IB realized came from activity not journaled here, or if closes never updated "
@@ -384,8 +558,8 @@ def _html_shell(
                 f"<td class='num'>{_fmt_money(p.get('unrealizedPNL'))}</td></tr>"
             )
         positions_html = f'''
-  <h2>Live IBKR Positions (from latest snapshot)</h2>
-  <p class="meta">Pulled from IBKR `reqPositionsAsync()` in snapshot_loop. Positive qty = LONG, negative = SHORT. Matches logs (e.g. AMZN/TSLA shorts). Journal "open" rows may include stale/historical from previous runs.</p>
+  <h2>{"Live IBKR Positions" if is_live else "IBKR Positions (from stored snapshot)"}</h2>
+  <p class="meta">{"Pulled directly from IBKR <code>reqPositionsAsync()</code> on this page refresh." if is_live else "Loaded from the latest stored snapshot written by watch mode."} Positive qty = LONG, negative = SHORT. Journal "open" rows may include stale/historical from previous runs.</p>
   <div class="table-wrap">
     <table>
       <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Avg Cost</th><th>Unrealized PnL</th></tr></thead>
@@ -394,7 +568,7 @@ def _html_shell(
   </div>
 '''
     else:
-        positions_html = '<p class="meta">No positions in latest snapshot yet (run watch mode longer).</p>'
+        positions_html = '<p class="meta">No IBKR positions available from this refresh/snapshot.</p>'
 
     _api_example_day = "2026-04-17"
     api_trades_quick = (
@@ -463,7 +637,7 @@ def _html_shell(
   <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 </head>
 <body>
-  <h1>IBKR P&amp;L (from journal)</h1>
+  <h1>IBKR P&amp;L</h1>
   <div class="date-header">
     <label for="date-select">View metrics for date:</label>
     <select id="date-select" onchange="window.location = '?date=' + this.value">
@@ -472,13 +646,14 @@ def _html_shell(
     </select>
   </div>
   {api_trades_quick}
-  <p>Showing data{date_title}. Latest snapshot: <strong>{ts}</strong>{sid_s}</p>
+  <p>Showing data{date_title}. {snapshot_label}: <strong>{ts}</strong>{sid_s}</p>
   <div class="cards">
     <div class="card"><div class="label">Net liquidation</div><div class="value">{nl}</div></div>
     <div class="card"><div class="label">Unrealized (IB)</div><div class="value">{u}</div></div>
     <div class="card"><div class="label">{r_lbl}</div><div class="value">{r}</div></div>
     <div class="card"><div class="label">{d_lbl}</div><div class="value">{d}</div></div>
   </div>
+  {source_note}
   {pnl_note}
   {positions_html}
   {ib_vs_journal}
@@ -780,6 +955,32 @@ def main() -> None:
         action="store_true",
         help="When used with --purge-before-date, also purge trades by their own timestamps (entry/exit/created_at) and clean orphan rows.",
     )
+    ap.add_argument(
+        "--no-live-ib",
+        action="store_true",
+        help="Disable live IBKR cards/positions; show only stored daily_snapshots.",
+    )
+    ap.add_argument("--ib-host", default="127.0.0.1", help="IBKR Gateway/TWS host for live dashboard cards.")
+    ap.add_argument("--ib-port", type=int, default=4002, help="IBKR paper port for live dashboard cards.")
+    ap.add_argument("--ib-client-id", type=int, default=98, help="Client id used by the dashboard live IBKR connection.")
+    ap.add_argument(
+        "--live-ib-timeout",
+        type=float,
+        default=12.0,
+        help="Max seconds to spend fetching live IBKR cards/positions before falling back to DB.",
+    )
+    ap.add_argument(
+        "--live-ib-cache-sec",
+        type=float,
+        default=20.0,
+        help="Seconds to cache one successful/failed live IBKR fetch between page/API requests.",
+    )
+    ap.add_argument(
+        "--live-ib-account-wait",
+        type=float,
+        default=1.5,
+        help="Seconds to wait for IB account update/portfolio P&L after subscribing.",
+    )
     args = ap.parse_args()
     db_path = args.db.resolve()
     if args.purge_before_date:
@@ -794,6 +995,39 @@ def main() -> None:
         print(f"Purge complete (kept {args.purge_before_date} onward). DB: {db_path}")
         return
     journal = TradeJournal(db_path)
+    live_lock = threading.Lock()
+    live_cache: dict[str, Any] = {"at": 0.0, "snapshot": None, "error": None}
+
+    def _should_use_live_ib(day: str | None) -> bool:
+        return not args.no_live_ib and (day is None or day == _today_et())
+
+    def _snapshot_with_live_ib(stored: dict[str, Any] | None, day: str | None) -> dict[str, Any] | None:
+        if not _should_use_live_ib(day):
+            return stored
+        now = time.monotonic()
+        with live_lock:
+            cache_age = now - float(live_cache.get("at") or 0.0)
+            if cache_age > max(0.0, float(args.live_ib_cache_sec)):
+                try:
+                    live_cache["snapshot"] = _fetch_live_ib_snapshot(args)
+                    live_cache["error"] = None
+                except Exception as e:
+                    live_cache["snapshot"] = None
+                    live_cache["error"] = f"{type(e).__name__}: {e}"
+                live_cache["at"] = time.monotonic()
+            live_snap = live_cache.get("snapshot")
+            live_error = live_cache.get("error")
+        if isinstance(live_snap, dict):
+            return live_snap
+        if stored is None:
+            if live_error:
+                return {"time": "—", "positions": [], "live_ib_error": live_error}
+            return None
+        if live_error:
+            fallback = dict(stored)
+            fallback["live_ib_error"] = live_error
+            return fallback
+        return stored
 
     # Load ``zone_validation`` + ``ib_insync`` on the **main** thread only. ``ThreadingHTTPServer``
     # runs ``do_GET`` in worker threads; a lazy import there triggers
@@ -861,6 +1095,7 @@ def main() -> None:
                 path = path[:-1]
             for _canon in (
                 "/api/latest",
+                "/api/live",
                 "/api/recent",
                 "/api/activity",
                 "/api/dates",
@@ -881,9 +1116,13 @@ def main() -> None:
             if path == "/api/latest":
                 d = qs.get("date", [None])[0]
                 if d and re.match(r"^\d{4}-\d{2}-\d{2}$", d):
-                    snap = journal.get_daily_snapshot_last_for_date(d)
+                    snap = _snapshot_with_live_ib(journal.get_daily_snapshot_last_for_date(d), d)
                 else:
-                    snap = journal.get_latest_daily_snapshot()
+                    snap = _snapshot_with_live_ib(journal.get_latest_daily_snapshot(), None)
+                self._send_json(snap if snap else {})
+                return
+            if path == "/api/live":
+                snap = _snapshot_with_live_ib(None, _today_et())
                 self._send_json(snap if snap else {})
                 return
             if path == "/api/recent":
@@ -1043,6 +1282,7 @@ def main() -> None:
                     if effective_date
                     else []
                 )
+                cards_snap = _snapshot_with_live_ib(cards_snap, effective_date)
                 trades_detail_html = _build_trades_day_html(trades_rows, effective_date)
                 self._send_html(
                     _html_shell(
