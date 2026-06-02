@@ -39,8 +39,14 @@ jobs:
             BASE_SHA="${{ github.event.before }}"
           fi
           HEAD_SHA="${{ github.sha }}"
-          FILES="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep '^pythonclient/src/.*\.py$' || true)"
-          FILES="${FILES//$'\n'/ }"
+          # --diff-filter=d excludes deleted paths so ruff is never handed a file
+          # that no longer exists on disk (would fail with E902). Belt-and-suspenders:
+          # keep only paths that are still present in the working tree.
+          CHANGED="$(git diff --name-only --diff-filter=d "$BASE_SHA" "$HEAD_SHA" | grep '^pythonclient/src/.*\.py$' || true)"
+          FILES=""
+          while IFS= read -r f; do
+            [[ -n "$f" && -f "$f" ]] && FILES="${FILES:+$FILES }$f"
+          done <<< "$CHANGED"
           echo "files=$FILES" >> "$GITHUB_OUTPUT"
           echo "Changed Python files: $FILES"
 
