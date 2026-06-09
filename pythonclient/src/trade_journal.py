@@ -223,6 +223,10 @@ class TradeJournal:
             self._ensure_column(con, "trades", "classification_score", "INTEGER")
             self._ensure_column(con, "trades", "classification_rationale", "TEXT")
             self._ensure_column(con, "daily_snapshots", "ib_daily_pnl", "REAL")
+            self._ensure_column(con, "runs", "git_commit", "TEXT")
+            self._ensure_column(con, "runs", "git_commit_short", "TEXT")
+            self._ensure_column(con, "runs", "git_branch", "TEXT")
+            self._ensure_column(con, "runs", "git_dirty", "INTEGER")
             self._ensure_ib_executions_table(con)
             self._ensure_fills_exec_id_unique_index(con)
 
@@ -271,16 +275,56 @@ class TradeJournal:
             return
         con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
 
-    def start_run(self, strategy: str, symbols: list[str], params: Mapping[str, Any]) -> str:
+    def start_run(
+        self,
+        strategy: str,
+        symbols: list[str],
+        params: Mapping[str, Any],
+        *,
+        capture_git: bool = True,
+    ) -> str:
         run_id = f"RUN_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         now = datetime.utcnow().isoformat()
+        params_dict = dict(params)
+        if capture_git and "code_provenance" not in params_dict:
+            try:
+                from git_provenance import get_git_provenance
+
+                params_dict["code_provenance"] = get_git_provenance()
+            except Exception:
+                params_dict.setdefault("code_provenance", {"available": False, "reason": "capture_failed"})
+
+        prov = params_dict.get("code_provenance")
+        prov = prov if isinstance(prov, dict) else {}
+        git_commit = prov.get("commit") if prov.get("available") else None
+        git_commit_short = prov.get("commit_short") if prov.get("available") else None
+        git_branch = prov.get("branch") if prov.get("available") else None
+        git_dirty = (
+            int(bool(prov.get("dirty")))
+            if prov.get("available") and prov.get("dirty") is not None
+            else None
+        )
+
         with self._conn() as con:
             con.execute(
                 """
-                INSERT INTO runs(run_id, strategy, symbols_json, params_json, started_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO runs(
+                    run_id, strategy, symbols_json, params_json, started_at,
+                    git_commit, git_commit_short, git_branch, git_dirty
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, strategy, self._dump_json(symbols), self._dump_json(dict(params)), now),
+                (
+                    run_id,
+                    strategy,
+                    self._dump_json(symbols),
+                    self._dump_json(params_dict),
+                    now,
+                    git_commit,
+                    git_commit_short,
+                    git_branch,
+                    git_dirty,
+                ),
             )
         return run_id
 
@@ -305,6 +349,34 @@ class TradeJournal:
             return None
         return obj if isinstance(obj, dict) else None
 
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        """Full run row including git provenance columns and parsed params."""
+        rid = (run_id or "").strip()
+        if not rid:
+            return None
+        with self._conn() as con:
+            row = con.execute(
+                """
+                SELECT run_id, strategy, symbols_json, params_json, started_at, ended_at,
+                       git_commit, git_commit_short, git_branch, git_dirty
+                FROM runs WHERE run_id = ?
+                """,
+                (rid,),
+            ).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            out["symbols"] = json.loads(out.pop("symbols_json") or "[]")
+        except json.JSONDecodeError:
+            out["symbols"] = []
+        try:
+            out["params"] = json.loads(out.pop("params_json") or "{}")
+        except json.JSONDecodeError:
+            out["params"] = {}
+        out["code_provenance"] = out["params"].get("code_provenance")
+        return out
+
     def list_recent_runs(self, limit: int = 30) -> list[dict[str, Any]]:
         """Recent journal runs (for zone UI / tooling). Newest first."""
         lim = max(1, min(int(limit), 200))
@@ -312,7 +384,8 @@ class TradeJournal:
             con.row_factory = sqlite3.Row
             rows = con.execute(
                 """
-                SELECT run_id, strategy, symbols_json, started_at
+                SELECT run_id, strategy, symbols_json, started_at,
+                       git_commit_short, git_branch, git_dirty
                 FROM runs
                 ORDER BY started_at DESC
                 LIMIT ?
@@ -334,6 +407,9 @@ class TradeJournal:
                     "strategy": r["strategy"],
                     "started_at": r["started_at"],
                     "symbols": [str(s).upper() for s in syms],
+                    "git_commit_short": r["git_commit_short"],
+                    "git_branch": r["git_branch"],
+                    "git_dirty": r["git_dirty"],
                 }
             )
         return out

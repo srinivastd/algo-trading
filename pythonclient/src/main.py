@@ -1699,6 +1699,16 @@ async def main():
                                     ),
                                 },
                             )
+                    if run_id:
+                        prov = (journal.get_run(run_id) or {}).get("code_provenance") or {}
+                        if prov.get("available"):
+                            logger.info(
+                                "Trade journal run %s — code %s (%s)%s",
+                                run_id,
+                                prov.get("commit_short"),
+                                prov.get("branch"),
+                                " dirty" if prov.get("dirty") else "",
+                            )
                 except Exception as run_err:
                     logger.warning(f"Could not start trade journal run: {run_err}")
                     run_id = None
@@ -1907,6 +1917,16 @@ async def main():
                                     ),
                                 },
                             )
+                            if run_id:
+                                prov = (journal.get_run(run_id) or {}).get("code_provenance") or {}
+                                if prov.get("available"):
+                                    logger.info(
+                                        "Trade journal run %s — code %s (%s)%s",
+                                        run_id,
+                                        prov.get("commit_short"),
+                                        prov.get("branch"),
+                                        " dirty" if prov.get("dirty") else "",
+                                    )
                         except Exception as run_err:
                             logger.warning(f"Could not start trade journal run: {run_err}")
                             run_id = None
