@@ -1,0 +1,11 @@
+---
+description: Never add Cursor/AI co-author trailers to git commits or PRs
+alwaysApply: true
+---
+
+# No Cursor commit attribution
+
+- Do **not** add `Co-authored-by: Cursor`, `cursoragent@cursor.com`, `Made-with: Cursor`, or any similar AI/tool attribution to commit messages or PR bodies.
+- When creating commits, use only the subject/body you write. Do not pass `--trailer` for Cursor attribution.
+- If a commit still gets a Cursor trailer (IDE injection), rewrite it with `git commit-tree` / amend outside the injecting path before push — do not leave the trailer in history.
+- Prefer clean author-only commits under the user's git identity.

@@ -208,12 +208,16 @@ def _affordable_max_shares(
     ref_price: float,
     headroom: Dict[str, Optional[float]],
     *,
-    utilization: float = 0.88,
+    utilization: float = 0.20,
     reg_t_margin_fraction: float = 0.52,
 ) -> Optional[int]:
     """
     Conservative whole-share cap from IB summary tags. Uses the minimum of
     independent caps so we stay under buying power, cash, and rough Reg-T margin.
+
+    Default ``utilization=0.20`` limits each order to ~20% of available margin/BP
+    so paper/live cannot stack most of the account into one name.
+
     Returns None if no tags available (caller should not clamp).
     """
     if ref_price <= 0:

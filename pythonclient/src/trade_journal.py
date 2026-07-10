@@ -222,6 +222,11 @@ class TradeJournal:
             # classification scoring fields were introduced.
             self._ensure_column(con, "trades", "classification_score", "INTEGER")
             self._ensure_column(con, "trades", "classification_rationale", "TEXT")
+            self._ensure_column(con, "trades", "reconcile_status", "TEXT")
+            self._ensure_column(con, "trades", "reconciled_at", "TEXT")
+            self._ensure_column(con, "trades", "ib_entry_qty", "REAL")
+            self._ensure_column(con, "trades", "ib_exit_qty", "REAL")
+            self._ensure_column(con, "trades", "reconcile_notes", "TEXT")
             self._ensure_column(con, "daily_snapshots", "ib_daily_pnl", "REAL")
             self._ensure_column(con, "runs", "git_commit", "TEXT")
             self._ensure_column(con, "runs", "git_commit_short", "TEXT")
@@ -229,6 +234,10 @@ class TradeJournal:
             self._ensure_column(con, "runs", "git_dirty", "INTEGER")
             self._ensure_ib_executions_table(con)
             self._ensure_fills_exec_id_unique_index(con)
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trades_reconcile_status "
+                "ON trades(reconcile_status)"
+            )
 
     def _ensure_ib_executions_table(self, con: sqlite3.Connection) -> None:
         con.execute(
@@ -878,6 +887,172 @@ class TradeJournal:
                     trade_id,
                 ),
             )
+
+    def update_trade_reconcile(
+        self,
+        *,
+        trade_id: str,
+        reconcile_status: str,
+        reconciled_at: Any | None = None,
+        ib_entry_qty: float | None = None,
+        ib_exit_qty: float | None = None,
+        reconcile_notes: str | None = None,
+        status: str | None = None,
+        entry_fill_price: float | None = None,
+        entry_fill_time: Any | None = None,
+        exit_fill_price: float | None = None,
+        exit_fill_time: Any | None = None,
+        exit_reason: str | None = None,
+        realized_pnl: float | None = None,
+        clear_realized_pnl: bool = False,
+    ) -> None:
+        """
+        Persist IB↔journal reconcile outcome for a trade.
+
+        ``reconcile_status`` values: matched | qty_mismatch | status_mismatch |
+        journal_only | unreconciled | ib_only (ib_only is for reporting only).
+        Optionally patches fill/status fields when the sync closes or corrects a row.
+        """
+        tid = (trade_id or "").strip()
+        if not tid:
+            return
+        now = datetime.utcnow().isoformat()
+        at = _to_iso(reconciled_at) if reconciled_at is not None else now
+        sets = [
+            "reconcile_status = ?",
+            "reconciled_at = ?",
+            "ib_entry_qty = ?",
+            "ib_exit_qty = ?",
+            "reconcile_notes = ?",
+            "updated_at = ?",
+        ]
+        vals: list[Any] = [
+            str(reconcile_status),
+            at,
+            float(ib_entry_qty) if ib_entry_qty is not None else None,
+            float(ib_exit_qty) if ib_exit_qty is not None else None,
+            reconcile_notes,
+            now,
+        ]
+        if status is not None:
+            sets.append("status = ?")
+            vals.append(str(status))
+        if entry_fill_price is not None:
+            sets.append("entry_fill_price = ?")
+            vals.append(float(entry_fill_price))
+        if entry_fill_time is not None:
+            sets.append("entry_fill_time = ?")
+            vals.append(_to_iso(entry_fill_time))
+        if exit_fill_price is not None:
+            sets.append("exit_fill_price = ?")
+            vals.append(float(exit_fill_price))
+        if exit_fill_time is not None:
+            sets.append("exit_fill_time = ?")
+            vals.append(_to_iso(exit_fill_time))
+        if exit_reason is not None:
+            sets.append("exit_reason = ?")
+            vals.append(str(exit_reason))
+        if clear_realized_pnl:
+            sets.append("realized_pnl = NULL")
+        elif realized_pnl is not None:
+            sets.append("realized_pnl = ?")
+            vals.append(float(realized_pnl))
+        vals.append(tid)
+        with self._conn() as con:
+            con.execute(
+                f"UPDATE trades SET {', '.join(sets)} WHERE trade_id = ?",
+                tuple(vals),
+            )
+
+    def list_trades_for_reconcile(
+        self,
+        *,
+        day_yyyy_mm_dd: str | None = None,
+        include_open: bool = True,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """
+        Trades to sync against IB: open rows and/or rows touching ``day_yyyy_mm_dd``.
+        """
+        lim = max(1, min(int(limit), 2000))
+        day = (day_yyyy_mm_dd or "").strip()[:10]
+        clauses: list[str] = []
+        params: list[Any] = []
+        if include_open:
+            clauses.append("LOWER(TRIM(status)) IN ('open', 'submitted')")
+        if len(day) == 10:
+            clauses.append(
+                """(
+                    (entry_fill_time IS NOT NULL AND substr(trim(entry_fill_time), 1, 10) = ?)
+                    OR (exit_fill_time IS NOT NULL AND substr(trim(exit_fill_time), 1, 10) = ?)
+                    OR (created_at IS NOT NULL AND substr(trim(created_at), 1, 10) = ?)
+                )"""
+            )
+            params.extend([day, day, day])
+        if not clauses:
+            return []
+        where = " OR ".join(f"({c})" for c in clauses)
+        with self._conn() as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                f"""
+                SELECT
+                    trade_id, run_id, symbol, side, status, signal_value,
+                    intended_entry_price, intended_shares, stop_loss, target,
+                    entry_fill_price, entry_fill_time, exit_fill_price, exit_fill_time,
+                    exit_reason, realized_pnl, order_id, stop_order_id, target_order_id,
+                    reconcile_status, reconciled_at, ib_entry_qty, ib_exit_qty, reconcile_notes,
+                    created_at, updated_at,
+                    (
+                        SELECT COALESCE(SUM(f.qty), 0) FROM fills f
+                        WHERE f.trade_id = trades.trade_id AND f.is_entry = 1
+                    ) AS entry_qty_sum,
+                    (
+                        SELECT COALESCE(SUM(f.qty), 0) FROM fills f
+                        WHERE f.trade_id = trades.trade_id AND f.is_entry = 0
+                    ) AS exit_qty_sum
+                FROM trades
+                WHERE {where}
+                ORDER BY COALESCE(entry_fill_time, created_at) ASC
+                LIMIT ?
+                """,
+                (*params, lim),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "trade_id": r["trade_id"],
+                    "run_id": r["run_id"],
+                    "symbol": (r["symbol"] or "").strip().upper(),
+                    "side": (r["side"] or "").strip().upper(),
+                    "status": (r["status"] or "").strip().lower(),
+                    "signal_value": int(r["signal_value"] or 0),
+                    "intended_shares": int(r["intended_shares"] or 0),
+                    "intended_entry_price": float(r["intended_entry_price"] or 0.0),
+                    "stop_loss": float(r["stop_loss"]) if r["stop_loss"] is not None else None,
+                    "target": float(r["target"]) if r["target"] is not None else None,
+                    "entry_fill_price": float(r["entry_fill_price"]) if r["entry_fill_price"] is not None else None,
+                    "entry_fill_time": r["entry_fill_time"],
+                    "exit_fill_price": float(r["exit_fill_price"]) if r["exit_fill_price"] is not None else None,
+                    "exit_fill_time": r["exit_fill_time"],
+                    "exit_reason": r["exit_reason"],
+                    "realized_pnl": float(r["realized_pnl"]) if r["realized_pnl"] is not None else None,
+                    "order_id": int(r["order_id"]) if r["order_id"] is not None else None,
+                    "stop_order_id": int(r["stop_order_id"]) if r["stop_order_id"] is not None else None,
+                    "target_order_id": int(r["target_order_id"]) if r["target_order_id"] is not None else None,
+                    "reconcile_status": (r["reconcile_status"] or "").strip().lower() or None,
+                    "reconciled_at": r["reconciled_at"],
+                    "ib_entry_qty": float(r["ib_entry_qty"]) if r["ib_entry_qty"] is not None else None,
+                    "ib_exit_qty": float(r["ib_exit_qty"]) if r["ib_exit_qty"] is not None else None,
+                    "reconcile_notes": r["reconcile_notes"],
+                    "entry_fill_qty": float(r["entry_qty_sum"] or 0.0),
+                    "exit_fill_qty": float(r["exit_qty_sum"] or 0.0),
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                }
+            )
+        return out
 
     def merge_indicator_snapshot(
         self,
@@ -1636,6 +1811,11 @@ class TradeJournal:
                     t.realized_pnl,
                     t.commission,
                     t.order_id,
+                    t.reconcile_status,
+                    t.reconciled_at,
+                    t.ib_entry_qty,
+                    t.ib_exit_qty,
+                    t.reconcile_notes,
                     t.indicator_snapshot_json,
                     (
                         SELECT COALESCE(SUM(f.qty), 0)
@@ -1707,6 +1887,11 @@ class TradeJournal:
                     "realized_pnl": float(r["realized_pnl"]) if r["realized_pnl"] is not None else None,
                     "commission": float(r["commission"]) if r["commission"] is not None else None,
                     "order_id": int(r["order_id"]) if r["order_id"] is not None else None,
+                    "reconcile_status": (r["reconcile_status"] or "").strip().lower() or None,
+                    "reconciled_at": r["reconciled_at"],
+                    "ib_entry_qty": float(r["ib_entry_qty"]) if r["ib_entry_qty"] is not None else None,
+                    "ib_exit_qty": float(r["ib_exit_qty"]) if r["ib_exit_qty"] is not None else None,
+                    "reconcile_notes": r["reconcile_notes"],
                     "entry_calendar_day": entry_day,
                     "exit_calendar_day": exit_day,
                     "touch": "+".join(touch_parts) if touch_parts else "",
@@ -1750,6 +1935,11 @@ class TradeJournal:
                     t.stop_order_id,
                     t.target_order_id,
                     t.error_message,
+                    t.reconcile_status,
+                    t.reconciled_at,
+                    t.ib_entry_qty,
+                    t.ib_exit_qty,
+                    t.reconcile_notes,
                     t.indicator_snapshot_json,
                     t.memory_consulted,
                     t.memory_verdict_json,
@@ -1837,6 +2027,11 @@ class TradeJournal:
             "realized_pnl": float(r["realized_pnl"]) if r["realized_pnl"] is not None else None,
             "commission": float(r["commission"]) if r["commission"] is not None else None,
             "error_message": r["error_message"],
+            "reconcile_status": (r["reconcile_status"] or "").strip().lower() or None,
+            "reconciled_at": r["reconciled_at"],
+            "ib_entry_qty": float(r["ib_entry_qty"]) if r["ib_entry_qty"] is not None else None,
+            "ib_exit_qty": float(r["ib_exit_qty"]) if r["ib_exit_qty"] is not None else None,
+            "reconcile_notes": r["reconcile_notes"],
             "created_at": r["created_at"],
             "updated_at": r["updated_at"],
             "memory_consulted": bool(int(r["memory_consulted"] or 0)),

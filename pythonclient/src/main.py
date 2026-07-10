@@ -383,6 +383,7 @@ async def watch_mode(
     run_id: str | None = None,
     snapshot_interval_sec: int = 60,
     paper_margin_gates_interval_sec: int = 0,
+    reconcile_interval_sec: int = 300,
     allow_shorts: bool = False,
     daily_loss_stop_pct: float = 0.02,
     strategy_exit_signals: bool = True,
@@ -580,6 +581,45 @@ async def watch_mode(
                     logger.warning("Paper margin gates periodic log failed: %s", loop_err)
 
         margin_gates_task = asyncio.create_task(_margin_gates_loop())
+
+    reconcile_task = None
+    if journal and reconcile_interval_sec and reconcile_interval_sec > 0:
+
+        async def _reconcile_loop():
+            # First pass shortly after startup so dashboard badges populate quickly.
+            await asyncio.sleep(15)
+            while True:
+                try:
+                    from reconcile_ib_journal import sync_journal_with_ib
+
+                    res = await sync_journal_with_ib(
+                        journal=journal,
+                        connection=connection,
+                        apply_closes=True,
+                    )
+                    # Drop active_trades entries that reconcile closed.
+                    try:
+                        for t in journal.list_trades_for_reconcile(include_open=False, day_yyyy_mm_dd=res.day):
+                            if str(t.get("status") or "").lower() != "closed":
+                                continue
+                            sym = str(t.get("symbol") or "").upper()
+                            at = active_trades.get(sym)
+                            if at and at.get("trade_id") == t.get("trade_id"):
+                                del active_trades[sym]
+                                save_active_trades_cache(active_trades)
+                    except Exception as cache_err:
+                        logger.debug("reconcile active_trades cleanup: %s", cache_err)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as loop_err:
+                    logger.warning("Journal IB reconcile loop failed: %s", loop_err)
+                await asyncio.sleep(reconcile_interval_sec)
+
+        reconcile_task = asyncio.create_task(_reconcile_loop())
+        logger.info(
+            "Journal IB reconcile enabled every %ss (status badges + optional close sync)",
+            reconcile_interval_sec,
+        )
 
     ib = connection.get_ib()
     journal_exec_events_registered = False
@@ -1113,11 +1153,13 @@ async def watch_mode(
                         if shares <= 0:
                             shares = 100
 
-                        # Pre-entry margin / buying-power check (same caps as place_order).
+                        # Pre-entry margin / buying-power check: max ~20% of available margin/BP.
                         if not getattr(connection, "_lax_paper", False):
                             try:
                                 headroom = await connection.get_account_sizing_headroom()
-                                max_q = _affordable_max_shares(entry_price, headroom)
+                                max_q = _affordable_max_shares(
+                                    entry_price, headroom, utilization=0.20
+                                )
                                 av = headroom.get("available_funds")
                                 bp = headroom.get("buying_power")
                                 ex = headroom.get("excess_liquidity")
@@ -1133,7 +1175,7 @@ async def watch_mode(
                                     continue
                                 if max_q is not None and max_q < shares:
                                     logger.warning(
-                                        "ENTRY_SIZE_CLAMPED %s: risk shares=%s -> margin cap=%s "
+                                        "ENTRY_SIZE_CLAMPED %s: risk shares=%s -> 20%% margin cap=%s "
                                         "(available_funds=%s buying_power=%s)",
                                         symbol_upper,
                                         shares,
@@ -1360,11 +1402,22 @@ async def watch_mode(
                                 fill_price = entry_price
                                 fill_qty = float(shares)
 
+                            # Prefer IB fill qty / submitted qty over risk-sized intent
+                            # so active_trades and logs match the live position.
+                            actual_shares = int(round(float(fill_qty))) if fill_qty else int(shares)
+                            bracket_q = trade_result.get("bracket_qty")
+                            if bracket_q is not None:
+                                try:
+                                    actual_shares = max(1, int(bracket_q))
+                                except (TypeError, ValueError):
+                                    pass
+
                             active_trades[symbol.upper()] = {
                                 'entry_time': fill_time,
                                 'trade_id': trade_id,
                                 'entry_price': entry_price,
-                                'shares': shares,
+                                'shares': actual_shares,
+                                'intended_shares': int(shares),
                                 'is_long': is_long,
                                 'signal_value': int(signal),
                                 'entry_regime': regime,
@@ -1392,7 +1445,7 @@ async def watch_mode(
                                             exec_id=None,
                                             symbol=symbol,
                                             side="BUY" if signal == 1 else "SELL",
-                                            qty=fill_qty,
+                                            qty=float(actual_shares),
                                             price=fill_price,
                                             commission=None,
                                             time=fill_time,
@@ -1403,7 +1456,7 @@ async def watch_mode(
 
                             logger.info(
                                 f"TRADE {trade_id}: Executed {'Buy' if signal == 1 else 'Sell'} trade for {symbol}: "
-                                f"Entry ${entry_price:.2f}, Shares {shares}"
+                                f"Entry ${fill_price:.2f}, Shares {actual_shares} (intended {shares})"
                             )
                             logger.info(
                                 f"TRADE {trade_id}: Stop Loss Order ID: {trade_result.get('stop_order_id')}, "
@@ -1430,6 +1483,12 @@ async def watch_mode(
             margin_gates_task.cancel()
             try:
                 await margin_gates_task
+            except asyncio.CancelledError:
+                pass
+        if reconcile_task:
+            reconcile_task.cancel()
+            try:
+                await reconcile_task
             except asyncio.CancelledError:
                 pass
         if journal_exec_events_registered:
@@ -1598,6 +1657,12 @@ def parse_args():
     parser.add_argument("--no-journal", action="store_true", help="Disable SQLite trade journaling in watch mode")
     parser.add_argument("--journal-db", default=str(_PYTHONCLIENT_ROOT / "trade_journal.db"), help="Path to SQLite journal db")
     parser.add_argument("--journal-snapshot-interval", type=int, default=60, help="Seconds between account/position snapshots in journal")
+    parser.add_argument(
+        "--reconcile-interval",
+        type=int,
+        default=300,
+        help="Seconds between IB↔journal reconcile sync in watch mode (0=off). Default 300 (5 min).",
+    )
     parser.add_argument("--no-memory", action="store_true", help="Disable Chroma trade memory recall/capture in watch mode")
     parser.add_argument("--memory-db", default=str(_PYTHONCLIENT_ROOT / "chroma_db"), help="Path to ChromaDB for trade memory")
     return parser.parse_args()
@@ -1816,6 +1881,9 @@ async def main():
                     paper_margin_gates_interval_sec=(
                         args.paper_margin_gates_interval if args.paper else 0
                     ),
+                    reconcile_interval_sec=(
+                        int(args.reconcile_interval) if journal else 0
+                    ),
                     allow_shorts=bool(allow_shorts),
                     daily_loss_stop_pct=float(args.daily_loss_stop_pct),
                     strategy_exit_signals=bool(args.strategy_exit_signals),
@@ -2032,6 +2100,9 @@ async def main():
                             memory=memory,
                             run_id=run_id,
                             snapshot_interval_sec=args.journal_snapshot_interval,
+                            reconcile_interval_sec=(
+                                int(args.reconcile_interval) if journal else 0
+                            ),
                             allow_shorts=bool(allow_shorts),
                             daily_loss_stop_pct=float(args.daily_loss_stop_pct),
                             strategy_exit_signals=bool(args.strategy_exit_signals),

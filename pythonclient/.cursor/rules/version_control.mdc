@@ -24,6 +24,7 @@ Rule Type: Always
 - Reference issues
 - Include scope
 - Follow format
+- Never add Cursor/AI attribution trailers (`Co-authored-by: Cursor`, `Made-with: Cursor`, `cursoragent@cursor.com`)
 
 ## Branch Strategy
 ### Branch Types

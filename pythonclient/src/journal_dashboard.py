@@ -84,7 +84,27 @@ def _json_pre_block(obj: object, max_chars: int = 1200) -> str:
     return f"<pre class='json-block'>{html.escape(s)}</pre>"
 
 
-def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str:
+def _reconcile_badge(status: str | None) -> str:
+    """HTML badge for trades.reconcile_status."""
+    s = (status or "").strip().lower() or "unreconciled"
+    labels = {
+        "matched": ("Matched", "badge-ok"),
+        "qty_mismatch": ("Qty ≠", "badge-warn"),
+        "status_mismatch": ("Status ≠", "badge-bad"),
+        "journal_only": ("Journal only", "badge-warn"),
+        "unreconciled": ("Unreconciled", "badge-muted"),
+        "ib_only": ("IB only", "badge-warn"),
+    }
+    label, cls = labels.get(s, (s or "—", "badge-muted"))
+    return f'<span class="badge {cls}" title="reconcile_status={html.escape(s)}">{html.escape(label)}</span>'
+
+
+def _build_trades_day_html(
+    trades: list[dict],
+    selected_date: str | None,
+    *,
+    reconcile_filter: str | None = None,
+) -> str:
     """
     Per-trade rows for a calendar day: entry/exit times, quantities, prices, reasons,
     and indicator snapshot (entry keys vs ``exit_*`` keys in JSON).
@@ -96,24 +116,69 @@ def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str
             "<strong>entry</strong> or <strong>exit</strong> fill timestamp falls on that day. Quantities "
             "use <code>intended_shares</code> plus Σ <code>fills</code> qty (entry vs exit legs). "
             "Params come from <code>indicator_snapshot_json</code> at trade creation (entry block); "
-            "separate exit-bar indicators are only shown if stored under <code>exit_*</code> keys.</p>"
+            "separate exit-bar indicators are only shown if stored under <code>exit_*</code> keys. "
+            "Reconcile badges come from the 5‑min IB sync (<code>reconcile_status</code>).</p>"
         )
     d_esc = html.escape(selected_date)
-    if not trades:
+    filt_raw = (reconcile_filter or "all").strip().lower()
+    if filt_raw in ("", "all"):
+        filtered = list(trades)
+        filt_raw = "all"
+    elif filt_raw == "unreconciled":
+        # Anything not fully matched (needs attention)
+        filtered = [
+            t
+            for t in trades
+            if (t.get("reconcile_status") or "unreconciled") != "matched"
+        ]
+    else:
+        filtered = [
+            t
+            for t in trades
+            if (t.get("reconcile_status") or "unreconciled") == filt_raw
+        ]
+
+    filter_opts = [
+        ("all", "All"),
+        ("unreconciled", "Needs attention"),
+        ("matched", "Matched"),
+        ("qty_mismatch", "Qty mismatch"),
+        ("status_mismatch", "Status mismatch"),
+        ("journal_only", "Journal only"),
+    ]
+    opt_html = ""
+    for val, lab in filter_opts:
+        sel = " selected" if filt_raw == val else ""
+        opt_html += f'<option value="{html.escape(val)}"{sel}>{html.escape(lab)}</option>'
+
+    filter_bar = (
+        f'<div class="date-header" style="margin:0.5rem 0">'
+        f'<label for="recon-filter">Reconcile:</label> '
+        f'<select id="recon-filter" onchange="(function(s){{'
+        f'var u=new URL(window.location.href);'
+        f'if(s.value===\'all\')u.searchParams.delete(\'reconcile\');'
+        f'else u.searchParams.set(\'reconcile\',s.value);'
+        f'window.location=u.toString();'
+        f'}})(this)">{opt_html}</select>'
+        f'<span class="meta" style="margin-left:0.75rem">'
+        f"Showing {len(filtered)} / {len(trades)} trade(s)</span></div>"
+    )
+
+    if not filtered:
         return (
-            f"<h2>Per-trade detail for {d_esc}</h2>"
-            "<p class=\"meta\">No <code>trades</code> rows with entry or exit on this day.</p>"
+            f"<h2>Per-trade detail for {d_esc}</h2>{filter_bar}"
+            "<p class=\"meta\">No trades match this reconcile filter.</p>"
         )
     by_sym: dict[str, list[dict]] = defaultdict(list)
-    for row in trades:
+    for row in filtered:
         by_sym[str(row.get("symbol") or "")].append(row)
     parts: list[str] = [
         f"<h2>Per-trade detail for {d_esc}</h2>",
-        '<p class="meta">Grouped by symbol. <strong>Touch</strong> = whether the row’s <code>entry_fill_time</code> '
-        "and/or <code>exit_fill_time</code> falls on this day. "
-        "<strong>E qty</strong> / <strong>X qty</strong> = Σ <code>fills</code> for entry vs exit legs. "
-        "Use <strong>Review</strong> to open a panel with entry snapshot, exact decision-zone overlay when captured, and supply/demand context chart "
-        "(<code>historical_data/</code> CSV; if the view date is past the file end, candles use the last day in the file).</p>",
+        filter_bar,
+        '<p class="meta">Grouped by symbol. <strong>IB sync</strong> badge = last reconcile vs broker fills. '
+        "<strong>E qty</strong> / <strong>X qty</strong> = Σ <code>fills</code>; "
+        "<strong>IB E/X</strong> = qty from matched IB executions. "
+        "Use <strong>Review</strong> for zone chart.</p>",
     ]
     for sym in sorted(by_sym.keys()):
         rows = by_sym[sym]
@@ -124,6 +189,8 @@ def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str
             tid_disp = html.escape(raw_tid[:22] + ("…" if len(raw_tid) > 22 else ""))
             tid_title = html.escape(raw_tid)
             touch = html.escape(str(t.get("touch") or "—"))
+            badge = _reconcile_badge(t.get("reconcile_status"))
+            notes = html.escape(str(t.get("reconcile_notes") or "")[:120])
             ep = t.get("entry_params") or {}
             xp_snap = t.get("exit_params_from_snapshot") or {}
             exit_struct = {
@@ -140,6 +207,11 @@ def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str
                 "entry_fill_price": t.get("entry_fill_price"),
                 "entry_fill_time": t.get("entry_fill_time"),
                 "entry_fill_qty": t.get("entry_fill_qty"),
+                "ib_entry_qty": t.get("ib_entry_qty"),
+                "ib_exit_qty": t.get("ib_exit_qty"),
+                "reconcile_status": t.get("reconcile_status"),
+                "reconcile_notes": t.get("reconcile_notes"),
+                "reconciled_at": t.get("reconciled_at"),
                 "stop_loss": t.get("stop_loss"),
                 "target": t.get("target"),
                 "signal_value": t.get("signal_value"),
@@ -156,7 +228,11 @@ def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str
             d_attr = html.escape(selected_date, quote=True)
             s_attr = html.escape(sym_d, quote=True)
             r_attr = html.escape(run_id_s, quote=True) if run_id_s else ""
-            tr_start = f'<tr class="trade-row" data-symbol="{s_attr}" data-day="{d_attr}"'
+            rs = html.escape(str(t.get("reconcile_status") or "unreconciled"), quote=True)
+            tr_start = (
+                f'<tr class="trade-row" data-symbol="{s_attr}" data-day="{d_attr}" '
+                f'data-reconcile="{rs}"'
+            )
             if r_attr:
                 tr_start += f' data-run-id="{r_attr}"'
             tr_start += f' data-trade-id="{html.escape(raw_tid, quote=True)}"'
@@ -175,9 +251,12 @@ def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str
                 f"<td><code title='{tid_title}'>{tid_disp}</code></td>"
                 f"<td>{html.escape(str(t.get('side') or ''))}</td>"
                 f"<td>{html.escape(str(t.get('status') or ''))}</td>"
+                f"<td title=\"{notes}\">{badge}</td>"
                 f"<td class='num'>{_fmt_qty_cell(t.get('intended_shares'))}</td>"
                 f"<td class='num'>{_fmt_qty_cell(t.get('entry_fill_qty'))}</td>"
+                f"<td class='num'>{_fmt_qty_cell(t.get('ib_entry_qty'))}</td>"
                 f"<td class='num'>{_fmt_qty_cell(t.get('exit_fill_qty'))}</td>"
+                f"<td class='num'>{_fmt_qty_cell(t.get('ib_exit_qty'))}</td>"
                 f"<td class='num'>{_fmt_money(t.get('entry_fill_price'))}</td>"
                 f"<td style='font-size:0.8rem'>{html.escape(str(t.get('entry_fill_time') or '—'))}</td>"
                 f"<td class='num'>{_fmt_money(t.get('exit_fill_price'))}</td>"
@@ -198,15 +277,17 @@ def _build_trades_day_html(trades: list[dict], selected_date: str | None) -> str
         parts.append('<div class="table-wrap"><table>')
         parts.append(
             "<thead><tr>"
-            "<th>Touch</th><th>Review</th><th>Trade</th><th>Side</th><th>Status</th>"
-            "<th class='num'>Intend Q</th><th class='num'>E qty</th><th class='num'>X qty</th>"
+            "<th>Touch</th><th>Review</th><th>Trade</th><th>Side</th><th>Status</th><th>IB sync</th>"
+            "<th class='num'>Intend</th><th class='num'>E qty</th><th class='num'>IB E</th>"
+            "<th class='num'>X qty</th><th class='num'>IB X</th>"
             "<th class='num'>Entry px</th><th>Entry time</th><th class='num'>Exit px</th><th>Exit time</th>"
             "<th class='num'>Realized</th><th>Exit reason</th><th>Params</th>"
             "</tr></thead>"
         )
         parts.append(f"<tbody>{body}</tbody></table></div>")
+    q = urllib.parse.urlencode({"date": selected_date})
     parts.append(
-        f'<p class="meta">JSON: <a href="/api/trades-day?date={urllib.parse.quote(selected_date)}">'
+        f'<p class="meta">JSON: <a href="/api/trades-day?{q}">'
         f"/api/trades-day?date={d_esc}</a></p>"
     )
     return "\n".join(parts)
@@ -435,6 +516,12 @@ def _html_shell(
     code {{ background: #f0f0f0; padding: 0.1rem 0.35rem; border-radius: 4px; }}
     select {{ padding: 0.5rem; font-size: 1rem; margin: 0.5rem 0; }}
     .date-header {{ display: flex; align-items: center; gap: 1rem; }}
+    .badge {{ display: inline-block; font-size: 0.72rem; font-weight: 600; padding: 0.15rem 0.45rem;
+      border-radius: 999px; white-space: nowrap; border: 1px solid transparent; }}
+    .badge-ok {{ background: #e8f7ef; color: #0a6; border-color: #b7e4c7; }}
+    .badge-warn {{ background: #fff6e5; color: #9a6700; border-color: #f0d9a0; }}
+    .badge-bad {{ background: #fdecea; color: #a30; border-color: #f0b4ae; }}
+    .badge-muted {{ background: #f0f0f0; color: #666; border-color: #ddd; }}
     .json-block {{ font-size: 0.72rem; white-space: pre-wrap; word-break: break-word; margin: 0.35rem 0; max-height: 14rem; overflow: auto; background: #fafafa; border: 1px solid #eee; padding: 0.4rem 0.5rem; border-radius: 4px; }}
     details {{ margin: 0.2rem 0; }}
     a.trade-ctx-link {{ font-size: 0.85rem; white-space: nowrap; }}
@@ -877,6 +964,7 @@ def main() -> None:
             selected_date = qs.get("date", [None])[0]
             if selected_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", selected_date):
                 selected_date = None
+            reconcile_filter = (qs.get("reconcile", ["all"])[0] or "all").strip().lower()
 
             if path == "/api/latest":
                 d = qs.get("date", [None])[0]
@@ -1043,7 +1131,11 @@ def main() -> None:
                     if effective_date
                     else []
                 )
-                trades_detail_html = _build_trades_day_html(trades_rows, effective_date)
+                trades_detail_html = _build_trades_day_html(
+                    trades_rows,
+                    effective_date,
+                    reconcile_filter=reconcile_filter,
+                )
                 self._send_html(
                     _html_shell(
                         cards_snap,
