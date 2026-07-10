@@ -346,21 +346,48 @@ class GroqBreakOfStructureStrategy(StrategyBase):
             if entry_res.quantity_submitted is not None
             else shares
         )
+
+        # Wait for fill; place standalone OCA stop/target (no parentId).
+        filled_qty = 0.0
+        try:
+            ib = self.ib_client.get_ib()
+            for _ in range(8):
+                await asyncio.sleep(3)
+                for trade in ib.trades():
+                    if trade.order.orderId == order_id:
+                        filled_qty = float(getattr(trade.orderStatus, "filled", 0.0) or 0.0)
+                        st = trade.orderStatus.status
+                        if st == "Filled" or filled_qty > 0:
+                            break
+                        if st in ("Cancelled", "Inactive", "ApiCancelled"):
+                            break
+                else:
+                    continue
+                break
+        except Exception:
+            pass
+        if filled_qty > 0:
+            bracket_qty = max(1, int(round(filled_qty)))
+
+        oca_group = f"oca_{symbol.upper()}_{order_id}"
+        exit_action = 'SELL' if signal == 1 else 'BUY'
         stop_res = await self.ib_client.place_order(
             symbol=symbol,
-            action='SELL' if signal == 1 else 'BUY',
+            action=exit_action,
             quantity=bracket_qty,
             order_type='STP',
             aux_price=stop_loss,
-            parent_id=order_id
+            oca_group=oca_group,
+            protective_exit=True,
         )
         target_res = await self.ib_client.place_order(
             symbol=symbol,
-            action='SELL' if signal == 1 else 'BUY',
+            action=exit_action,
             quantity=bracket_qty,
             order_type='LMT',
             limit_price=target,
-            parent_id=order_id
+            oca_group=oca_group,
+            protective_exit=True,
         )
         stop_order_id = stop_res.order_id if stop_res.ok else None
         target_order_id = target_res.order_id if target_res.ok else None
@@ -374,6 +401,7 @@ class GroqBreakOfStructureStrategy(StrategyBase):
         out = {
             'status': 'success',
             'order_id': order_id,
+            'bracket_qty': bracket_qty,
             'stop_order_id': stop_order_id,
             'target_order_id': target_order_id
         }

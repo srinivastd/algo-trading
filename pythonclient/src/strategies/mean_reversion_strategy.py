@@ -313,40 +313,62 @@ class MeanReversionStrategy(StrategyBase):
                 if parent_res.quantity_submitted is not None
                 else shares
             )
-            await asyncio.sleep(5)
+
+            # Wait briefly for fill; place standalone OCA exits (no parentId).
+            filled_qty = 0.0
+            try:
+                ib = self.ib_client.get_ib()
+                for _ in range(8):
+                    await asyncio.sleep(3)
+                    for trade in ib.trades():
+                        if trade.order.orderId == parent_order_id:
+                            filled_qty = float(getattr(trade.orderStatus, "filled", 0.0) or 0.0)
+                            st = trade.orderStatus.status
+                            if st == "Filled" or filled_qty > 0:
+                                break
+                            if st in ("Cancelled", "Inactive", "ApiCancelled"):
+                                break
+                    else:
+                        continue
+                    break
+            except Exception:
+                pass
+            if filled_qty > 0:
+                bracket_qty = max(1, int(round(filled_qty)))
 
             exit_action = 'SELL' if signal == 1 else 'BUY'
             stop_order_id = None
             target_order_id = None
             stop_res = None
             target_res = None
+            oca_group = f"oca_{symbol.upper()}_{parent_order_id}"
 
             if stop_loss is not None:
-                await asyncio.sleep(2)
                 stop_res = await self.ib_client.place_order(
                     symbol=symbol,
                     action=exit_action,
                     quantity=bracket_qty,
                     order_type='STP',
                     aux_price=stop_loss,
-                    parent_id=parent_order_id,
+                    oca_group=oca_group,
+                    protective_exit=True,
                 )
                 if stop_res.ok and stop_res.order_id:
                     stop_order_id = stop_res.order_id
             if target is not None:
-                await asyncio.sleep(2)
                 target_res = await self.ib_client.place_order(
                     symbol=symbol,
                     action=exit_action,
                     quantity=bracket_qty,
                     order_type='LMT',
                     limit_price=target,
-                    parent_id=parent_order_id,
+                    oca_group=oca_group,
+                    protective_exit=True,
                 )
                 if target_res.ok and target_res.order_id:
                     target_order_id = target_res.order_id
 
-            result = {'status': 'success', 'order_id': parent_order_id}
+            result = {'status': 'success', 'order_id': parent_order_id, 'bracket_qty': bracket_qty}
             if stop_order_id:
                 result['stop_order_id'] = stop_order_id
             elif stop_loss is not None and stop_res is not None:

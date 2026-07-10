@@ -834,6 +834,7 @@ class IBKRConnection:
         quantity: int = 100,
         ref_price: Optional[float] = None,
         parent_id: Optional[int] = None,
+        protective_exit: bool = False,
     ) -> Dict[str, Any]:
         """
         Comprehensive pre-trade gate that makes **paper behave like live**.
@@ -843,13 +844,13 @@ class IBKRConnection:
         - **Settlement**: checks SettledCash for CASH accounts (uses ``ref_price`` when provided).
         - **Buying power**: enforced in ``place_order`` via live ``ref_price`` and
           ``_affordable_max_shares`` (clip/skip), not here.
-        - **Opposite side**: standalone orders (no ``parent_id``) cannot cross through an
-          existing stock position beyond a flatten (prevents orphaned shorts/longs fighting
-          the journal).
+        - **Opposite side**: standalone orders (no ``parent_id`` / not ``protective_exit``) cannot
+          cross through an existing stock position beyond a flatten (prevents orphaned
+          shorts/longs fighting the journal).
         - **--lax-paper** (paper only) bypasses all gates for diagnostics.
 
-        ``parent_id``: when set (bracket children), skips the opposite-side guard so stop
-        and profit targets sized to the intended parent quantity still submit.
+        ``parent_id`` / ``protective_exit``: skip the opposite-side guard so stop and profit
+        targets sized to the entry quantity still submit after a fill (standalone or bracket).
 
         Returns dict with "allowed", "reason", full gates, etc.
         """
@@ -919,6 +920,7 @@ class IBKRConnection:
 
         if (
             parent_id is None
+            and not protective_exit
             and not CryptoUtils.is_crypto(symbol)
             and action.upper() in ("BUY", "SELL")
         ):
@@ -963,8 +965,16 @@ class IBKRConnection:
 
     async def place_order(self, symbol: str, action: str, quantity: int, order_type: str,
                          limit_price: float = None, aux_price: float = None,
-                         parent_id: int = None) -> PlaceOrderResult:
-        """Place a trade order. Inspect ``result.as_dict()`` for IB log lines and error codes."""
+                         parent_id: int = None,
+                         oca_group: Optional[str] = None,
+                         oca_type: int = 3,
+                         protective_exit: bool = False) -> PlaceOrderResult:
+        """Place a trade order. Inspect ``result.as_dict()`` for IB log lines and error codes.
+
+        ``parent_id``: optional IB bracket parent (prefer standalone protective exits after fill).
+        ``oca_group`` / ``oca_type``: link stop+target so one fill cancels the other (default type 3).
+        ``protective_exit``: skip opposite-side / BP sizing clamps (standalone stop/target after fill).
+        """
         try:
             qty_requested = max(0, int(quantity))
             if not self.is_connected():
@@ -1086,7 +1096,14 @@ class IBKRConnection:
 
             requested_price = limit_price if order_type == 'LMT' else aux_price if order_type == 'STP' else None
             if order_type == 'LMT' and limit_price is not None:
-                if market_price and market_price > 0:
+                # Do not pull profit targets toward market — that can fill immediately
+                # (seen on short targets). Entry LMTs still get the near-market clamp.
+                if (
+                    not protective_exit
+                    and parent_id is None
+                    and market_price
+                    and market_price > 0
+                ):
                     limit_price = self._anchor_limit_price_near_market(
                         requested_price=limit_price,
                         market_price=market_price,
@@ -1109,7 +1126,12 @@ class IBKRConnection:
 
             # PDT / settlement (with live ref when available); BP clip happens below.
             precheck = await self.pre_trade_check(
-                symbol, action, qty_requested, ref_price=ref_px, parent_id=parent_id
+                symbol,
+                action,
+                qty_requested,
+                ref_price=ref_px,
+                parent_id=parent_id,
+                protective_exit=protective_exit,
             )
             if not precheck.get("allowed", False):
                 res = PlaceOrderResult(
@@ -1133,9 +1155,14 @@ class IBKRConnection:
 
             qty = qty_requested
             sizing_meta: Optional[Dict[str, Any]] = None
-            # Size only standalone equity orders; bracket legs must match parent quantity.
+            # Size only standalone equity entries; bracket / protective exits must match fill qty.
             # Skip BP-based clamp for SELL that only closes/trims a long (exit liquidity).
-            apply_bp_clip = not is_crypto and parent_id is None and qty > 0
+            apply_bp_clip = (
+                not is_crypto
+                and parent_id is None
+                and not protective_exit
+                and qty > 0
+            )
             if apply_bp_clip and action.upper() == "SELL" and await self._sell_only_closes_or_reduces_long(
                 symbol, qty
             ):
@@ -1210,12 +1237,17 @@ class IBKRConnection:
                 order = StopOrder(action, qty, aux_price, tif=tif, transmit=True)
                 if is_crypto or equity_outside_rth:
                     order.outsideRth = True
-                if parent_id:
-                    order.parentId = parent_id
             else:
                 order = MarketOrder(action, qty, tif=tif, transmit=True)
                 if is_crypto or equity_outside_rth:
                     order.outsideRth = True
+
+            # Bracket parent only when explicitly requested (filled parents reject child STP).
+            if parent_id:
+                order.parentId = parent_id
+            if oca_group:
+                order.ocaGroup = str(oca_group)
+                order.ocaType = int(oca_type)
 
             trade = self.get_ib().placeOrder(contract, order)
             await asyncio.sleep(3)

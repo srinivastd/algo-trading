@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytz
 import random
 import pandas as pd
-from ibkr.connection import IBKRConnection
+from ibkr.connection import IBKRConnection, _affordable_max_shares
 from ibkr.historical_data import HistoricalDataManager
 from strategies.groq_recommendations_strategy import GroqRecommendationsStrategy
 from strategies.adx_rsi_macd_pullback_strategy import AdxRsiMacdTrendPullbackStrategy
@@ -1074,6 +1074,32 @@ async def watch_mode(
                                 symbol_upper,
                             )
                             continue
+
+                        # One position per symbol: journal cache + live IB net position.
+                        if symbol_upper in active_trades:
+                            logger.info(
+                                "SKIP_ENTRY %s: already in active_trades (one-position-per-symbol)",
+                                symbol_upper,
+                            )
+                            continue
+                        try:
+                            net_pos = await connection.net_stk_position_shares(symbol_upper)
+                        except Exception as pos_err:
+                            logger.warning(
+                                "Could not read IB position for %s before entry: %s",
+                                symbol_upper,
+                                pos_err,
+                            )
+                            net_pos = None
+                        if net_pos is not None and abs(float(net_pos)) > 1e-6:
+                            logger.info(
+                                "SKIP_ENTRY %s: IB net position %.4g already open "
+                                "(one-position-per-symbol)",
+                                symbol_upper,
+                                float(net_pos),
+                            )
+                            continue
+
                         signals.append(f"{symbol}: {signal}")
                         logger.debug(f"Generated signal {signal} for {symbol}")
                         trade_id = _next_trade_id()
@@ -1086,6 +1112,50 @@ async def watch_mode(
                         shares = int(strategy.risk_per_trade / risk_per_share) if risk_per_share > 0 else 100
                         if shares <= 0:
                             shares = 100
+
+                        # Pre-entry margin / buying-power check (same caps as place_order).
+                        if not getattr(connection, "_lax_paper", False):
+                            try:
+                                headroom = await connection.get_account_sizing_headroom()
+                                max_q = _affordable_max_shares(entry_price, headroom)
+                                av = headroom.get("available_funds")
+                                bp = headroom.get("buying_power")
+                                ex = headroom.get("excess_liquidity")
+                                if max_q is not None and max_q <= 0:
+                                    logger.warning(
+                                        "SKIP_ENTRY %s: insufficient margin/BP "
+                                        "(available_funds=%s buying_power=%s excess_liq=%s)",
+                                        symbol_upper,
+                                        av,
+                                        bp,
+                                        ex,
+                                    )
+                                    continue
+                                if max_q is not None and max_q < shares:
+                                    logger.warning(
+                                        "ENTRY_SIZE_CLAMPED %s: risk shares=%s -> margin cap=%s "
+                                        "(available_funds=%s buying_power=%s)",
+                                        symbol_upper,
+                                        shares,
+                                        max_q,
+                                        av,
+                                        bp,
+                                    )
+                                    shares = int(max_q)
+                                # Soft floor: require some excess liquidity before opening risk.
+                                if ex is not None and ex < 500:
+                                    logger.warning(
+                                        "SKIP_ENTRY %s: excess_liquidity=$%.0f below $500 floor",
+                                        symbol_upper,
+                                        ex,
+                                    )
+                                    continue
+                            except Exception as margin_err:
+                                logger.warning(
+                                    "Margin pre-check failed for %s (continuing with risk size): %s",
+                                    symbol_upper,
+                                    margin_err,
+                                )
 
                         logger.info(
                             f"Trade parameters for {symbol}: Entry=${entry_price:.2f}, Stop=${stop_loss:.2f} "
@@ -1434,7 +1504,13 @@ def parse_args():
     parser.add_argument(
         "--enable-shorts",
         action="store_true",
-        help="Allow NEW short entries in watch mode (default: off; focus on LONG only).",
+        help="Allow NEW short entries in watch mode. On --paper this is the default; "
+        "pass --disable-shorts to keep paper long-only. Live stays long-only unless this flag is set.",
+    )
+    parser.add_argument(
+        "--disable-shorts",
+        action="store_true",
+        help="Block NEW short entries in watch mode (overrides paper's default of shorts enabled).",
     )
     parser.add_argument(
         "--allow-watchlist-net-short",
@@ -1578,6 +1654,19 @@ async def main():
                    f"risk=${strategy.risk_per_trade}, min_hold={strategy.min_hold_hours}h (extended hours OK)")
     else:
         raise ValueError(f"Unknown strategy: {args.strategy}")
+
+    # Paper watch: shorts ON by default; live stays long-only unless --enable-shorts.
+    # --disable-shorts always blocks new short entries.
+    allow_shorts = bool(args.enable_shorts) or (bool(args.paper) and not bool(args.disable_shorts))
+    if bool(args.disable_shorts):
+        allow_shorts = False
+    logger.info(
+        "Watch short entries: %s (paper=%s enable_shorts=%s disable_shorts=%s)",
+        "ENABLED" if allow_shorts else "DISABLED",
+        bool(args.paper),
+        bool(args.enable_shorts),
+        bool(args.disable_shorts),
+    )
     
     # Determine trading mode
     if args.backtest_only:
@@ -1697,6 +1786,7 @@ async def main():
                                     "strategy_exit_min_unrealized_pct": float(
                                         args.strategy_exit_min_unrealized_pct
                                     ),
+                                    "enable_shorts": bool(allow_shorts),
                                 },
                             )
                     if run_id:
@@ -1726,7 +1816,7 @@ async def main():
                     paper_margin_gates_interval_sec=(
                         args.paper_margin_gates_interval if args.paper else 0
                     ),
-                    allow_shorts=bool(args.enable_shorts),
+                    allow_shorts=bool(allow_shorts),
                     daily_loss_stop_pct=float(args.daily_loss_stop_pct),
                     strategy_exit_signals=bool(args.strategy_exit_signals),
                     strategy_exit_min_unrealized_pct=float(
@@ -1915,6 +2005,7 @@ async def main():
                                     "strategy_exit_min_unrealized_pct": float(
                                         args.strategy_exit_min_unrealized_pct
                                     ),
+                                    "enable_shorts": bool(allow_shorts),
                                 },
                             )
                             if run_id:
@@ -1941,7 +2032,7 @@ async def main():
                             memory=memory,
                             run_id=run_id,
                             snapshot_interval_sec=args.journal_snapshot_interval,
-                            allow_shorts=bool(args.enable_shorts),
+                            allow_shorts=bool(allow_shorts),
                             daily_loss_stop_pct=float(args.daily_loss_stop_pct),
                             strategy_exit_signals=bool(args.strategy_exit_signals),
                             strategy_exit_min_unrealized_pct=float(

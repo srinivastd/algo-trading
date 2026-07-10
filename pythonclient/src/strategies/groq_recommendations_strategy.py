@@ -450,7 +450,7 @@ class GroqRecommendationsStrategy(StrategyBase):
                 return 0, 0.0
 
         confidence = 0.5
-        trend_confirmed = df["sma_20"].iloc[i] > df["sma_50"].iloc[i] or np.random.random() < 0.5
+        trend_confirmed = df["sma_20"].iloc[i] > df["sma_50"].iloc[i]
         if not trend_confirmed:
             return 0, 0.0
         confidence += 0.2
@@ -1159,110 +1159,133 @@ class GroqRecommendationsStrategy(StrategyBase):
                 if parent_res.quantity_submitted is not None
                 else shares
             )
-            
-            logger.info(f"Parent order {parent_order_id} placed successfully")
-            
-            # Wait longer for parent order to be processed by IB
-            await asyncio.sleep(5)  # Increased from 2 to 5 seconds
-            
-            # Check parent order status before placing child orders
+
+            logger.info(f"Entry order {parent_order_id} placed successfully (qty={bracket_qty})")
+
+            # Wait for entry fill (or working state). Do NOT attach STP/LMT as IB bracket
+            # children with parentId — IB rejects those once the parent is already filled
+            # ("Parent order is being cancelled" / Error 201). Place standalone exits instead.
+            parent_trade = None
+            filled_qty = 0.0
             try:
-                # Get order status from IB to ensure it's been accepted
                 ib = self.ib_client.get_ib()
-                trades = ib.trades()
-                parent_trade = None
-                
-                for trade in trades:
-                    if trade.order.orderId == parent_order_id:
-                        parent_trade = trade
+                for _ in range(12):  # ~36s max
+                    await asyncio.sleep(3)
+                    parent_trade = None
+                    for trade in ib.trades():
+                        if trade.order.orderId == parent_order_id:
+                            parent_trade = trade
+                            break
+                    if not parent_trade:
+                        continue
+                    st = parent_trade.orderStatus.status
+                    filled_qty = float(getattr(parent_trade.orderStatus, "filled", 0.0) or 0.0)
+                    if st == "Filled" or filled_qty > 0:
                         break
-                
-                if not parent_trade:
-                    logger.error(f"Parent order {parent_order_id} not found in IB trades")
-                    return {
-                        'status': 'partial_success', 
-                        'order_id': parent_order_id,
-                        'message': 'Parent order placed but not found for bracket setup'
-                    }
-                
-                # Check if parent order is in acceptable state
-                acceptable_states = ['Submitted', 'PreSubmitted', 'PendingSubmit', 'Filled']
-                if parent_trade.orderStatus.status not in acceptable_states:
-                    logger.warning(f"Parent order {parent_order_id} status: {parent_trade.orderStatus.status}")
-                    return {
-                        'status': 'partial_success',
-                        'order_id': parent_order_id,
-                        'message': f'Parent order in state: {parent_trade.orderStatus.status}'
-                    }
-                
-                logger.info(f"Parent order {parent_order_id} confirmed with status: {parent_trade.orderStatus.status}")
-                
+                    if st in ("Cancelled", "Inactive", "ApiCancelled"):
+                        logger.warning(
+                            "Entry order %s ended in %s before protective exits",
+                            parent_order_id,
+                            st,
+                        )
+                        break
+                    logger.info(
+                        "Waiting for entry fill on %s order %s (status=%s filled=%.0f)",
+                        symbol,
+                        parent_order_id,
+                        st,
+                        filled_qty,
+                    )
             except Exception as status_error:
-                logger.warning(f"Could not verify parent order status: {status_error}")
-                # Continue anyway - sometimes the order exists but we can't verify
-            
-            # Only place child orders if we have valid stop_loss and target
+                logger.warning(f"Could not verify entry order status: {status_error}")
+
+            if filled_qty > 0:
+                bracket_qty = max(1, int(round(filled_qty)))
+            elif parent_trade is not None:
+                st = parent_trade.orderStatus.status
+                if st not in ("Submitted", "PreSubmitted", "PendingSubmit", "Filled"):
+                    return {
+                        "status": "partial_success",
+                        "order_id": parent_order_id,
+                        "message": f"Entry order in state: {st}; protective exits not placed",
+                    }
+
             stop_order_id = None
             target_order_id = None
             stop_res = None
             target_res = None
+            exit_action = "SELL" if signal == 1 else "BUY"
+            # OCA so stop fill cancels target (and vice versa) without a bracket parent.
+            oca_group = f"oca_{symbol.upper()}_{parent_order_id}"
 
             if stop_loss is not None:
                 try:
-                    await asyncio.sleep(5)  # Additional delay before stop order
-                    await asyncio.sleep(2)  # Additional delay before stop order
                     stop_res = await self.ib_client.place_order(
                         symbol=symbol,
-                        action='SELL' if signal == 1 else 'BUY',
+                        action=exit_action,
                         quantity=bracket_qty,
-                        order_type='STP',
+                        order_type="STP",
                         aux_price=stop_loss,
-                        parent_id=parent_order_id
+                        oca_group=oca_group,
+                        protective_exit=True,
                     )
                     if stop_res.ok and stop_res.order_id:
                         stop_order_id = stop_res.order_id
-                        logger.info(f"Stop-loss order {stop_order_id} placed successfully")
+                        logger.info(
+                            "Standalone stop-loss %s placed for %s qty=%s @ %s (oca=%s)",
+                            stop_order_id,
+                            symbol,
+                            bracket_qty,
+                            stop_loss,
+                            oca_group,
+                        )
                     else:
                         logger.warning("Failed to place stop-loss order: %s", stop_res.as_dict())
                 except Exception as stop_error:
                     logger.error(f"Error placing stop-loss order: {stop_error}")
-            
+
             if target is not None:
                 try:
-                    await asyncio.sleep(5)  # Additional delay before target order
-                    await asyncio.sleep(2)  # Additional delay before target order
                     target_res = await self.ib_client.place_order(
                         symbol=symbol,
-                        action='SELL' if signal == 1 else 'BUY',
+                        action=exit_action,
                         quantity=bracket_qty,
-                        order_type='LMT',
+                        order_type="LMT",
                         limit_price=target,
-                        parent_id=parent_order_id
+                        oca_group=oca_group,
+                        protective_exit=True,
                     )
                     if target_res.ok and target_res.order_id:
                         target_order_id = target_res.order_id
-                        logger.info(f"Target order {target_order_id} placed successfully")
+                        logger.info(
+                            "Standalone target %s placed for %s qty=%s @ %s (oca=%s)",
+                            target_order_id,
+                            symbol,
+                            bracket_qty,
+                            target,
+                            oca_group,
+                        )
                     else:
                         logger.warning("Failed to place target order: %s", target_res.as_dict())
                 except Exception as target_error:
                     logger.error(f"Error placing target order: {target_error}")
-            
-            # Return success even if child orders failed
+
             result = {
-                'status': 'success',
-                'order_id': parent_order_id
+                "status": "success",
+                "order_id": parent_order_id,
+                "bracket_qty": bracket_qty,
             }
-            
+
             if stop_order_id:
-                result['stop_order_id'] = stop_order_id
+                result["stop_order_id"] = stop_order_id
             elif stop_loss is not None and stop_res is not None:
-                result['stop_order_error'] = stop_res.as_dict()
+                result["stop_order_error"] = stop_res.as_dict()
             if target_order_id:
-                result['target_order_id'] = target_order_id
+                result["target_order_id"] = target_order_id
             elif target is not None and target_res is not None:
-                result['target_order_error'] = target_res.as_dict()
-            
-            trade_type = 'Long' if signal == 1 else 'Short'
+                result["target_order_error"] = target_res.as_dict()
+
+            trade_type = "Long" if signal == 1 else "Short"
             stop_s = f"${stop_loss:.2f}" if stop_loss is not None else "n/a"
             target_s = f"${target:.2f}" if target is not None else "n/a"
             entry_s = f"${live_entry_price:.2f}" if live_entry_price is not None else "n/a"
@@ -1270,12 +1293,12 @@ class GroqRecommendationsStrategy(StrategyBase):
                 f"Placed {'paper' if self.paper_trading else 'live'} trade: "
                 f"{trade_type} {symbol}, Entry: {entry_s}, Stop: {stop_s}, Target: {target_s}"
             )
-            
+
             return result
-            
+
         except Exception as e:
             logger.error(f"Error in execute_trade: {str(e)}")
-            return {'status': 'error', 'message': str(e)}
+            return {"status": "error", "message": str(e)}
 
     async def backtest(
         self,
